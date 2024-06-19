@@ -11,10 +11,10 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-// Describes the IP address ranges that were specified in calls to
-// ProvisionByoipCidr . To describe the address pools that were created when you
-// provisioned the address ranges, use DescribePublicIpv4Pools or DescribeIpv6Pools
-// .
+// Describes the IP address ranges that were specified in calls to ProvisionByoipCidr.
+//
+// To describe the address pools that were created when you provisioned the
+// address ranges, use DescribePublicIpv4Poolsor DescribeIpv6Pools.
 func (c *Client) DescribeByoipCidrs(ctx context.Context, params *DescribeByoipCidrsInput, optFns ...func(*Options)) (*DescribeByoipCidrsOutput, error) {
 	if params == nil {
 		params = &DescribeByoipCidrsInput{}
@@ -118,6 +118,9 @@ func (c *Client) addOperationDescribeByoipCidrsMiddlewares(stack *middleware.Sta
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = addOpDescribeByoipCidrsValidationMiddleware(stack); err != nil {

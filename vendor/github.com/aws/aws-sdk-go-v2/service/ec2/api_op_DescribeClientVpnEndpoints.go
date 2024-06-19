@@ -39,7 +39,9 @@ type DescribeClientVpnEndpointsInput struct {
 	DryRun *bool
 
 	// One or more filters. Filter names and values are case-sensitive.
+	//
 	//   - endpoint-id - The ID of the Client VPN endpoint.
+	//
 	//   - transport-protocol - The transport protocol ( tcp | udp ).
 	Filters []types.Filter
 
@@ -122,6 +124,9 @@ func (c *Client) addOperationDescribeClientVpnEndpointsMiddlewares(stack *middle
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeClientVpnEndpoints(options.Region), middleware.Before); err != nil {

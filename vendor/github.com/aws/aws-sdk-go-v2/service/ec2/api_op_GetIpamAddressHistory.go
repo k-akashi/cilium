@@ -13,8 +13,9 @@ import (
 )
 
 // Retrieve historical information about a CIDR within an IPAM scope. For more
-// information, see View the history of IP addresses (https://docs.aws.amazon.com/vpc/latest/ipam/view-history-cidr-ipam.html)
-// in the Amazon VPC IPAM User Guide.
+// information, see [View the history of IP addresses]in the Amazon VPC IPAM User Guide.
+//
+// [View the history of IP addresses]: https://docs.aws.amazon.com/vpc/latest/ipam/view-history-cidr-ipam.html
 func (c *Client) GetIpamAddressHistory(ctx context.Context, params *GetIpamAddressHistoryInput, optFns ...func(*Options)) (*GetIpamAddressHistoryOutput, error) {
 	if params == nil {
 		params = &GetIpamAddressHistoryInput{}
@@ -141,6 +142,9 @@ func (c *Client) addOperationGetIpamAddressHistoryMiddlewares(stack *middleware.
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = addOpGetIpamAddressHistoryValidationMiddleware(stack); err != nil {

@@ -72,9 +72,9 @@ func TestRoutes(t *testing.T) {
 				assert.NoError(t, err)
 
 				// Install routes and rules the first time.
-				assert.NoError(t, installFromProxyRoutesIPv4(testIPv4, ifName))
+				assert.NoError(t, installFromProxyRoutesIPv4(testIPv4, ifName, true, true))
 
-				rules, err := route.ListRules(netlink.FAMILY_V4, &fromProxyRule)
+				rules, err := route.ListRules(netlink.FAMILY_V4, &fromIngressProxyRule)
 				assert.NoError(t, err)
 				assert.NotEmpty(t, rules)
 
@@ -85,12 +85,12 @@ func TestRoutes(t *testing.T) {
 				assert.Len(t, rt, 2)
 
 				// Ensure idempotence.
-				assert.NoError(t, installFromProxyRoutesIPv4(testIPv4, ifName))
+				assert.NoError(t, installFromProxyRoutesIPv4(testIPv4, ifName, true, true))
 
 				// Remove routes installed before.
 				assert.NoError(t, removeFromProxyRoutesIPv4())
 
-				rules, err = route.ListRules(netlink.FAMILY_V4, &fromProxyRule)
+				rules, err = route.ListRules(netlink.FAMILY_V4, &fromIngressProxyRule)
 				assert.NoError(t, err)
 				assert.Empty(t, rules)
 
@@ -159,9 +159,9 @@ func TestRoutes(t *testing.T) {
 				assert.NoError(t, err)
 
 				// Install routes and rules the first time.
-				assert.NoError(t, installFromProxyRoutesIPv6(testIPv6, ifName))
+				assert.NoError(t, installFromProxyRoutesIPv6(testIPv6, ifName, true, true))
 
-				rules, err := route.ListRules(netlink.FAMILY_V6, &fromProxyRule)
+				rules, err := route.ListRules(netlink.FAMILY_V6, &fromIngressProxyRule)
 				assert.NoError(t, err)
 				assert.NotEmpty(t, rules)
 
@@ -172,12 +172,12 @@ func TestRoutes(t *testing.T) {
 				assert.Len(t, rt, 2)
 
 				// Ensure idempotence.
-				assert.NoError(t, installFromProxyRoutesIPv6(testIPv6, ifName))
+				assert.NoError(t, installFromProxyRoutesIPv6(testIPv6, ifName, true, true))
 
 				// Remove routes installed before.
 				assert.NoError(t, removeFromProxyRoutesIPv6())
 
-				rules, err = route.ListRules(netlink.FAMILY_V6, &fromProxyRule)
+				rules, err = route.ListRules(netlink.FAMILY_V6, &fromIngressProxyRule)
 				assert.NoError(t, err)
 				assert.Empty(t, rules)
 

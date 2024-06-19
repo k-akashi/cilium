@@ -5,16 +5,17 @@ package ciliumenvoyconfig
 
 import (
 	"fmt"
-	"runtime/pprof"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/envoy"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
+	"github.com/cilium/cilium/pkg/k8s"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
+	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
@@ -49,10 +50,10 @@ func (r cecConfig) Flags(flags *pflag.FlagSet) {
 type reconcilerParams struct {
 	cell.In
 
-	Logger      logrus.FieldLogger
-	Lifecycle   cell.Lifecycle
-	JobRegistry job.Registry
-	Scope       cell.Scope
+	Logger    logrus.FieldLogger
+	Lifecycle cell.Lifecycle
+	JobGroup  job.Group
+	Health    cell.Health
 
 	Config  cecConfig
 	Manager ciliumEnvoyConfigManager
@@ -86,24 +87,18 @@ func registerCECK8sReconciler(params reconcilerParams) {
 		},
 	})
 
-	jobGroup := params.JobRegistry.NewGroup(
-		params.Scope,
-		job.WithLogger(params.Logger),
-		job.WithPprofLabels(pprof.Labels("cell", "ciliumenvoyconfig")),
-	)
-	params.Lifecycle.Append(jobGroup)
-
-	jobGroup.Add(job.Observer("cec-resource-events", reconciler.handleCECEvent, params.CECResources))
-	jobGroup.Add(job.Observer("ccec-resource-events", reconciler.handleCCECEvent, params.CCECResources))
+	params.JobGroup.Add(job.Observer("cec-resource-events", reconciler.handleCECEvent, params.CECResources))
+	params.JobGroup.Add(job.Observer("ccec-resource-events", reconciler.handleCCECEvent, params.CCECResources))
 
 	// Observing local node events for changed labels
 	// Note: LocalNodeStore (in comparison to `resource.Resource`) doesn't provide a retry mechanism
-	jobGroup.Add(job.Observer("local-node-events", reconciler.handleLocalNodeEvent, params.LocalNodeStore))
+	params.JobGroup.Add(job.Observer("local-node-events", reconciler.handleLocalNodeEvent, params.LocalNodeStore))
 
 	// TimerJob periodically reconciles all existing configs.
 	// This covers the cases were the reconciliation fails after changing the labels of a node.
 	if params.Config.EnvoyConfigRetryInterval > 0 {
-		jobGroup.Add(job.Timer("reconcile-existing-configs", reconciler.reconcileExistingConfigs, params.Config.EnvoyConfigRetryInterval))
+		params.JobGroup.Add(job.Timer("reconcile-existing-configs", reconciler.reconcileExistingConfigs, params.Config.EnvoyConfigRetryInterval))
+		params.JobGroup.Add(job.Timer("sync-headless-service", reconciler.syncHeadlessService, params.Config.EnvoyConfigRetryInterval))
 	}
 }
 
@@ -120,8 +115,12 @@ type managerParams struct {
 	XdsServer      envoy.XDSServer
 	BackendSyncer  *envoyServiceBackendSyncer
 	ResourceParser *cecResourceParser
+
+	Services  resource.Resource[*slim_corev1.Service]
+	Endpoints resource.Resource[*k8s.Endpoints]
 }
 
 func newCECManager(params managerParams) ciliumEnvoyConfigManager {
-	return newCiliumEnvoyConfigManager(params.Logger, params.PolicyUpdater, params.ServiceManager, params.XdsServer, params.BackendSyncer, params.ResourceParser, params.Config.EnvoyConfigTimeout)
+	return newCiliumEnvoyConfigManager(params.Logger, params.PolicyUpdater, params.ServiceManager, params.XdsServer,
+		params.BackendSyncer, params.ResourceParser, params.Config.EnvoyConfigTimeout, params.Services, params.Endpoints)
 }

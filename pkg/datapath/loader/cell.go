@@ -4,11 +4,10 @@
 package loader
 
 import (
-	loaderTypes "github.com/cilium/cilium/pkg/datapath/loader/types"
-
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
-	"github.com/cilium/cilium/pkg/hive/cell"
+	datapath "github.com/cilium/cilium/pkg/datapath/types"
 )
 
 var Cell = cell.Module(
@@ -17,10 +16,11 @@ var Cell = cell.Module(
 
 	cell.Config(DefaultConfig),
 	cell.Provide(NewLoader),
+	cell.Provide(NewCompilationLock),
 )
 
 // NewLoader returns a new loader.
-func NewLoader(p Params) loaderTypes.Loader {
+func NewLoader(p Params) datapath.Loader {
 	return newLoader(p)
 }
 

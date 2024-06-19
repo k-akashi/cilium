@@ -6,6 +6,7 @@ package endpointslicesync
 import (
 	"fmt"
 
+	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -24,13 +25,14 @@ import (
 type meshPodInformer struct {
 	dummyInformer
 
+	logger             logrus.FieldLogger
 	globalServiceCache *common.GlobalServiceCache
 	handler            cache.ResourceEventHandler
 }
 
-func newMeshPodInformer(globalServiceCache *common.GlobalServiceCache) *meshPodInformer {
+func newMeshPodInformer(logger logrus.FieldLogger, globalServiceCache *common.GlobalServiceCache) *meshPodInformer {
 	return &meshPodInformer{
-		dummyInformer:      dummyInformer{"meshPodInformer"},
+		dummyInformer:      dummyInformer{name: "meshPodInformer", logger: logger},
 		globalServiceCache: globalServiceCache,
 	}
 }
@@ -58,7 +60,6 @@ func podObjectMeta(name string, clusterSvc *store.ClusterService) metav1.ObjectM
 	}
 }
 
-// TODO: handle pod hostname
 func podFromSingleAddr(addr string, portConfig store.PortConfiguration, clusterSvc *store.ClusterService) *v1.Pod {
 	return &v1.Pod{
 		// The custom TypeMeta here is only used in logging inside the endpointslice reconciler
@@ -68,7 +69,9 @@ func podFromSingleAddr(addr string, portConfig store.PortConfiguration, clusterS
 		},
 		ObjectMeta: podObjectMeta("fake-pod-"+addr, clusterSvc),
 		Spec: v1.PodSpec{
-			NodeName: clusterSvc.Cluster,
+			NodeName:  clusterSvc.Cluster,
+			Hostname:  clusterSvc.Hostnames[addr],
+			Subdomain: clusterSvc.Name + "-" + clusterSvc.Cluster,
 			Containers: []v1.Container{{
 				Ports: getContainerPorts(portConfig),
 			}},
@@ -189,10 +192,10 @@ func (i *meshPodInformer) Lister() listersv1.PodLister {
 }
 
 func (i meshPodLister) Get(name string) (*v1.Pod, error) {
-	log.Error("called not implemented function meshPodLister.Get")
+	i.informer.logger.Error("called not implemented function meshPodLister.Get")
 	return nil, nil
 }
 func (i meshPodInformer) List(selector labels.Selector) ([]*v1.Pod, error) {
-	log.Error("called not implemented function meshPodInformer.Get")
+	i.logger.Error("called not implemented function meshPodInformer.Get")
 	return nil, nil
 }

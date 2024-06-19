@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
@@ -76,6 +79,7 @@ func NewEndpointFromChangeModel(ctx context.Context, owner regeneration.Owner, p
 	ep.dockerEndpointID = base.DockerEndpointID
 	ep.K8sPodName = base.K8sPodName
 	ep.K8sNamespace = base.K8sNamespace
+	ep.K8sUID = base.K8sUID
 	ep.disableLegacyIdentifiers = base.DisableLegacyIdentifiers
 
 	if base.Mac != "" {
@@ -92,6 +96,21 @@ func NewEndpointFromChangeModel(ctx context.Context, owner regeneration.Owner, p
 			return nil, err
 		}
 		ep.nodeMAC = m
+	}
+
+	if base.NetnsCookie != "" {
+		cookie64, err := strconv.ParseInt(base.NetnsCookie, 10, 64)
+		if err != nil {
+			// Don't return on error (and block the endpoint creation) as this
+			// is an unusual case where data could have been malformed. Defer error
+			// logging to individual features depending on the metadata.
+			log.WithError(err).WithFields(logrus.Fields{
+				"netns_cookie": base.NetnsCookie,
+				"ep_id":        base.ID,
+			}).Error("unable to parse netns cookie for ep")
+		} else {
+			ep.NetNsCookie = uint64(cookie64)
+		}
 	}
 
 	if base.Addressing != nil {
@@ -533,7 +552,7 @@ func (e *Endpoint) ProcessChangeRequest(newEp *Endpoint, validPatchTransitionSta
 	rev := e.replaceIdentityLabels(labels.LabelSourceAny, newEp.OpLabels.IdentityLabels())
 	if rev != 0 {
 		// Run as a goroutine since the runIdentityResolver needs to get the lock
-		go e.runIdentityResolver(e.aliveCtx, rev, false)
+		go e.runIdentityResolver(e.aliveCtx, false)
 	}
 
 	// If desired state is waiting-for-identity but identity is already
@@ -563,8 +582,8 @@ func (e *Endpoint) ProcessChangeRequest(newEp *Endpoint, validPatchTransitionSta
 		default:
 			// Caller skips regeneration if reason == "". Bump the skipped regeneration level so that next
 			// regeneration will realise endpoint changes.
-			if e.skippedRegenerationLevel < regeneration.RegenerateWithDatapathRewrite {
-				e.skippedRegenerationLevel = regeneration.RegenerateWithDatapathRewrite
+			if e.skippedRegenerationLevel < regeneration.RegenerateWithDatapath {
+				e.skippedRegenerationLevel = regeneration.RegenerateWithDatapath
 			}
 		}
 	}

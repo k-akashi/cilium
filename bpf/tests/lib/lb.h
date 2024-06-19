@@ -36,6 +36,27 @@ lb_v4_add_service(__be32 addr, __be16 port, __u16 backend_count, __u16 rev_nat_i
 }
 
 static __always_inline void
+lb_v4_add_service_with_flags(__be32 addr, __be16 port, __u16 backend_count, __u16 rev_nat_index,
+			     __u8 flags, __u8 flags2)
+{
+	struct lb4_key svc_key = {
+		.address = addr,
+		.dport = port,
+		.scope = LB_LOOKUP_SCOPE_EXT,
+	};
+	struct lb4_service svc_value = {
+		.count = backend_count,
+		.flags = flags,
+		.flags2 = flags2,
+		.rev_nat_index = rev_nat_index,
+	};
+	map_update_elem(&LB4_SERVICES_MAP_V2, &svc_key, &svc_value, BPF_ANY);
+	/* Register with both scopes: */
+	svc_key.scope = LB_LOOKUP_SCOPE_INT;
+	map_update_elem(&LB4_SERVICES_MAP_V2, &svc_key, &svc_value, BPF_ANY);
+}
+
+static __always_inline void
 lb_v4_upsert_backend(__u32 backend_id, __be32 backend_addr, __be16 backend_port,
 		     __u8 backend_proto, __u8 flags, __u8 cluster_id)
 {
@@ -76,16 +97,17 @@ lb_v4_add_backend(__be32 svc_addr, __be16 svc_port, __u16 backend_slot,
 
 #ifdef ENABLE_IPV6
 static __always_inline void
-lb_v6_add_service(const union v6addr *addr, __be16 port, __u16 backend_count,
-		  __u16 rev_nat_index)
+__lb_v6_add_service(const union v6addr *addr, __be16 port, __u16 backend_count, __u16 rev_nat_index,
+		    __u8 flags, __u8 flags2)
 {
-	struct lb6_key svc_key = {
+	struct lb6_key svc_key __align_stack_8 = {
 		.dport = port,
 		.scope = LB_LOOKUP_SCOPE_EXT,
 	};
 	struct lb6_service svc_value = {
 		.count = backend_count,
-		.flags = SVC_FLAG_ROUTABLE,
+		.flags = flags,
+		.flags2 = flags2,
 		.rev_nat_index = rev_nat_index,
 	};
 
@@ -95,7 +117,7 @@ lb_v6_add_service(const union v6addr *addr, __be16 port, __u16 backend_count,
 	map_update_elem(&LB6_SERVICES_MAP_V2, &svc_key, &svc_value, BPF_ANY);
 
 	/* Insert a reverse NAT entry for the above service */
-	struct lb6_reverse_nat revnat_value = {
+	struct lb6_reverse_nat revnat_value __align_stack_8 = {
 		.port = port,
 	};
 
@@ -104,11 +126,25 @@ lb_v6_add_service(const union v6addr *addr, __be16 port, __u16 backend_count,
 }
 
 static __always_inline void
+lb_v6_add_service(const union v6addr *addr, __be16 port, __u16 backend_count,
+		  __u16 rev_nat_index)
+{
+	__lb_v6_add_service(addr, port, backend_count, rev_nat_index, SVC_FLAG_ROUTABLE, 0);
+}
+
+static __always_inline void
+lb_v6_add_service_with_flags(const union v6addr *addr, __be16 port, __u16 backend_count,
+			     __u16 rev_nat_index, __u8 flags, __u8 flags2)
+{
+	__lb_v6_add_service(addr, port, backend_count, rev_nat_index, flags, flags2);
+}
+
+static __always_inline void
 lb_v6_add_backend(const union v6addr *svc_addr, __be16 svc_port, __u16 backend_slot,
 		  __u32 backend_id, const union v6addr *backend_addr,
 		  __be16 backend_port, __u8 backend_proto, __u8 cluster_id)
 {
-	struct lb6_key svc_key = {
+	struct lb6_key svc_key __align_stack_8 = {
 		.dport = svc_port,
 		.backend_slot = backend_slot,
 		.scope = LB_LOOKUP_SCOPE_EXT,
@@ -121,7 +157,7 @@ lb_v6_add_backend(const union v6addr *svc_addr, __be16 svc_port, __u16 backend_s
 	memcpy(&svc_key.address, svc_addr, sizeof(*svc_addr));
 	map_update_elem(&LB6_SERVICES_MAP_V2, &svc_key, &svc_value, BPF_ANY);
 
-	struct lb6_backend backend = {
+	struct lb6_backend backend __align_stack_8 = {
 		.port = backend_port,
 		.proto = backend_proto,
 		.flags = BE_STATE_ACTIVE,

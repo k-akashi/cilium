@@ -8,13 +8,12 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/cilium/hive/cell"
 	"github.com/cilium/stream"
+	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/sirupsen/logrus"
-
 	"github.com/cilium/cilium/pkg/datapath/tables"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/time"
@@ -91,9 +90,8 @@ type reconciliationRequest[T any] struct {
 }
 
 type proxyInfo struct {
-	name        string
-	port        uint16
-	isLocalOnly bool
+	name string
+	port uint16
 }
 
 type noTrackPodInfo struct {
@@ -104,11 +102,11 @@ type noTrackPodInfo struct {
 func reconciliationLoop(
 	ctx context.Context,
 	log logrus.FieldLogger,
-	health cell.HealthReporter,
+	health cell.Health,
 	installIptRules bool,
 	params *reconcilerParams,
 	updateRules func(state desiredState, firstInit bool) error,
-	updateProxyRules func(proxyPort uint16, localOnly bool, name string) error,
+	updateProxyRules func(proxyPort uint16, name string) error,
 	installNoTrackRules func(addr netip.Addr, port uint16) error,
 	removeNoTrackRules func(addr netip.Addr, port uint16) error,
 ) error {
@@ -145,6 +143,17 @@ func reconciliationLoop(
 	stateChanged := true
 
 	firstInit := true
+
+	// Run an initial full reconciliation before listening on partial reconciliation
+	// request channels (like proxies and no track rules).
+	if err := updateRules(state, firstInit); err != nil {
+		health.Degraded("iptables rules update failed", err)
+		// Keep stateChanged=true and firstInit=true to try again on the next tick.
+	} else {
+		health.OK("iptables rules update completed")
+		firstInit = false
+		stateChanged = false
+	}
 
 	// list of pending channels waiting for reconciliation
 	var updatedChs []chan<- struct{}
@@ -184,14 +193,14 @@ stop:
 			// will be deleted by the manager (see Manager.addProxyRules)
 			state.proxies[req.info.name] = req.info
 
-			if !firstInit {
+			if firstInit {
 				// first init not yet completed, proxy rules will be updated as part of that
 				stateChanged = true
 				updatedChs = append(updatedChs, req.updated)
 				continue
 			}
 
-			if err := updateProxyRules(req.info.port, req.info.isLocalOnly, req.info.name); err != nil {
+			if err := updateProxyRules(req.info.port, req.info.name); err != nil {
 				if partialLogLimiter.Allow() {
 					log.WithError(err).Error("iptables proxy rules incremental update failed, will retry a full reconciliation")
 				}
@@ -211,7 +220,7 @@ stop:
 			}
 			state.noTrackPods.Insert(req.info)
 
-			if !firstInit {
+			if firstInit {
 				// first init not yet completed, no track pod rules will be updated as part of that
 				stateChanged = true
 				updatedChs = append(updatedChs, req.updated)
@@ -238,7 +247,7 @@ stop:
 			}
 			state.noTrackPods.Delete(req.info)
 
-			if !firstInit {
+			if firstInit {
 				// first init not yet completed, no track pod rules will be updated as part of that
 				stateChanged = true
 				updatedChs = append(updatedChs, req.updated)

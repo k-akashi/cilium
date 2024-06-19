@@ -50,10 +50,9 @@ SKIP_CUSTOMVET_CHECK ?= "false"
 JOB_BASE_NAME ?= cilium_test
 
 TEST_LDFLAGS=-ldflags "-X github.com/cilium/cilium/pkg/kvstore.consulDummyAddress=https://consul:8443 \
-	-X github.com/cilium/cilium/pkg/kvstore.etcdDummyAddress=http://etcd:4002 \
-	-X github.com/cilium/cilium/pkg/datapath.datapathSHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	-X github.com/cilium/cilium/pkg/kvstore.etcdDummyAddress=http://etcd:4002"
 
-TEST_UNITTEST_LDFLAGS=-ldflags "-X github.com/cilium/cilium/pkg/datapath.datapathSHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+TEST_UNITTEST_LDFLAGS=
 
 build: $(SUBDIRS) ## Builds all the components for Cilium by executing make in the respective sub directories.
 
@@ -83,7 +82,7 @@ $(SUBDIRS): force ## Execute default make target(make all) for the provided subd
 
 tests-privileged: ## Run Go tests including ones that require elevated privileges.
 	@$(ECHO_CHECK) running privileged tests...
-	PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) $(TEST_LDFLAGS) \
+	PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) -p 1 $(TEST_LDFLAGS) \
 		$(TESTPKGS) $(GOTEST_BASE) $(GOTEST_COVER_OPTS) | $(GOTEST_FORMATTER)
 	$(MAKE) generate-cov
 
@@ -224,6 +223,9 @@ install-container-binary-hubble-relay:
 GIT_VERSION: force
 	@if [ "$(GIT_VERSION)" != "`cat 2>/dev/null GIT_VERSION`" ] ; then echo "$(GIT_VERSION)" >GIT_VERSION; fi
 
+check_deps:
+	@$(CILIUM_CLI) --help > /dev/null 2>&1 || ( echo "ERROR: '$(CILIUM_CLI)' not found. Please install it." && exit 1)
+
 include Makefile.kind
 
 -include Makefile.docker
@@ -243,7 +245,8 @@ CRDS_CILIUM_V2 := ciliumnetworkpolicies \
                   ciliumlocalredirectpolicies \
                   ciliumegressgatewaypolicies \
                   ciliumenvoyconfigs \
-                  ciliumclusterwideenvoyconfigs
+                  ciliumclusterwideenvoyconfigs \
+                  ciliumnodeconfigs
 CRDS_CILIUM_V2ALPHA1 := ciliumendpointslices \
                         ciliumbgppeeringpolicies \
                         ciliumbgpclusterconfigs \
@@ -252,7 +255,6 @@ CRDS_CILIUM_V2ALPHA1 := ciliumendpointslices \
                         ciliumbgpnodeconfigs \
                         ciliumbgpnodeconfigoverrides \
                         ciliumloadbalancerippools \
-                        ciliumnodeconfigs \
                         ciliumcidrgroups \
                         ciliuml2announcementpolicies \
                         ciliumpodippools
@@ -318,18 +320,33 @@ generate-operator-api: api/v1/operator/openapi.yaml ## Generate cilium-operator 
 	@# sort goimports automatically
 	-$(QUIET)$(GO) run golang.org/x/tools/cmd/goimports -w ./api/v1/operator
 
+generate-kvstoremesh-api: api/v1/kvstoremesh/openapi.yaml ## Generate kvstoremesh client, model and server code from openapi spec.
+	@$(ECHO_GEN)api/v1/kvstoremesh/openapi.yaml
+	-$(QUIET)$(SWAGGER) generate server -s server -a restapi \
+		-t api/v1 \
+		-t api/v1/kvstoremesh/ \
+		-f api/v1/kvstoremesh/openapi.yaml \
+		--default-scheme=http \
+		-C api/v1/cilium-server.yml \
+		-r hack/spdx-copyright-header.txt
+	-$(QUIET)$(SWAGGER) generate client -a restapi \
+		-t api/v1 \
+		-t api/v1/kvstoremesh/ \
+		-f api/v1/kvstoremesh/openapi.yaml \
+		-r hack/spdx-copyright-header.txt
+	@# sort goimports automatically
+	-$(QUIET)$(GO) run golang.org/x/tools/cmd/goimports -w ./api/v1/kvstoremesh
+
 generate-hubble-api: api/v1/flow/flow.proto api/v1/peer/peer.proto api/v1/observer/observer.proto api/v1/relay/relay.proto ## Generate hubble proto Go sources.
 	$(QUIET) $(MAKE) $(SUBMAKEOPTS) -C api/v1
 
 define generate_deepequal
 	$(GO) run github.com/cilium/deepequal-gen \
 	--input-dirs $(subst $(space),$(comma),$(1)) \
-	--go-header-file "$(PWD)/hack/custom-boilerplate.go.txt" \
+	--go-header-file "$$PWD/hack/custom-boilerplate.go.txt" \
 	--output-file-base zz_generated.deepequal \
 	--output-base $(2)
 endef
-
-PROTOBUF_OUTPUT_DIR := $(subst github.com/cilium/cilium,,$(PWD))
 
 define generate_k8s_protobuf
 	$(GO) install k8s.io/code-generator/cmd/go-to-protobuf/protoc-gen-gogo && \
@@ -342,12 +359,12 @@ define generate_k8s_protobuf
                                 -k8s.io/apimachinery/pkg/apis/meta/v1,$\
                                 -k8s.io/apimachinery/pkg/apis/meta/v1beta1'\
 		--drop-embedded-fields="github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1.TypeMeta" \
-		--proto-import="$(PWD)" \
-		--proto-import="$(PWD)/vendor" \
-		--proto-import="$(PWD)/tools/protobuf" \
+		--proto-import="$$PWD" \
+		--proto-import="$$PWD/vendor" \
+		--proto-import="$$PWD/tools/protobuf" \
 		--packages=$(subst $(newline),$(comma),$(1)) \
-		--go-header-file "$(PWD)/hack/custom-boilerplate.go.txt" \
-		--output-dir="$(PROTOBUF_OUTPUT_DIR)"
+		--go-header-file "$$PWD/hack/custom-boilerplate.go.txt" \
+		--output-dir=$$GOPATH/src
 endef
 
 define K8S_PROTO_PACKAGES
@@ -361,7 +378,8 @@ github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1beta1
 github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/util/intstr
 endef
 
-generate-k8s-api: ## Generate Cilium k8s API client, deepcopy and deepequal Go sources.
+.PHONY: generate-k8s-api-local
+generate-k8s-api-local:
 	$(ASSERT_CILIUM_MODULE)
 
 	$(eval TMPDIR := $(shell mktemp -d -t cilium.tmpXXXXXXXX))
@@ -374,6 +392,11 @@ generate-k8s-api: ## Generate Cilium k8s API client, deepcopy and deepequal Go s
 	$(QUIET) contrib/scripts/k8s-code-gen.sh "$(TMPDIR)"
 
 	$(QUIET) rm -rf "$(TMPDIR)"
+
+.PHONY: generate-k8s-api
+generate-k8s-api: ## Generate Cilium k8s API client, deepcopy and deepequal Go sources.
+	contrib/scripts/builder.sh \
+		$(MAKE) -C /go/src/github.com/cilium/cilium/ generate-k8s-api-local
 
 check-k8s-clusterrole: ## Ensures there is no diff between preflight's clusterrole and runtime's clusterrole.
 	./contrib/scripts/check-preflight-clusterrole.sh
@@ -390,14 +413,7 @@ reload: ## Reload cilium-agent and cilium-docker systemd service after installin
 	cilium status
 
 release: ## Perform a Git release for Cilium.
-	$(eval TAG_VERSION := $(shell git tag | grep v$(VERSION) > /dev/null; echo $$?))
-	$(eval BRANCH := $(shell git rev-parse --abbrev-ref HEAD))
-	$(info Checking if tag $(VERSION) is created '$(TAG_VERSION)' $(BRANCH))
-
-	@if [ "$(TAG_VERSION)" -eq "0" ];then { echo Git tag v$(VERSION) is already created; exit 1; } fi
-	git commit -m "Version $(VERSION)"
-	git tag v$(VERSION)
-	git archive --format tar $(BRANCH) | gzip > ../cilium_$(VERSION).orig.tar.gz
+	@echo "Visit https://github.com/cilium/release/issues/new/choose to initiate the release process."
 
 gofmt: ## Run gofmt on Go source files in the repository.
 	$(QUIET)$(GO) fmt ./...
@@ -453,8 +469,6 @@ endif
 	$(QUIET) contrib/scripts/check-log-newlines.sh
 	@$(ECHO_CHECK) contrib/scripts/check-test-tags.sh
 	$(QUIET) contrib/scripts/check-test-tags.sh
-	@$(ECHO_CHECK) contrib/scripts/check-assert-deep-equals.sh
-	$(QUIET) contrib/scripts/check-assert-deep-equals.sh
 	@$(ECHO_CHECK) contrib/scripts/lock-check.sh
 	$(QUIET) contrib/scripts/lock-check.sh
 	@$(ECHO_CHECK) contrib/scripts/check-viper.sh
@@ -463,14 +477,18 @@ ifeq ($(SKIP_CUSTOMVET_CHECK),"false")
 	@$(ECHO_CHECK) contrib/scripts/custom-vet-check.sh
 	$(QUIET) contrib/scripts/custom-vet-check.sh
 endif
-	@$(ECHO_CHECK) contrib/scripts/rand-check.sh
-	$(QUIET) contrib/scripts/rand-check.sh
 	@$(ECHO_CHECK) contrib/scripts/check-time.sh
 	$(QUIET) contrib/scripts/check-time.sh
 	@$(ECHO_CHECK) contrib/scripts/check-go-testdata.sh
 	$(QUIET) contrib/scripts/check-go-testdata.sh
 	@$(ECHO_CHECK) contrib/scripts/check-source-info.sh
 	$(QUIET) contrib/scripts/check-source-info.sh
+	@$(ECHO_CHECK) contrib/scripts/check-xfrmstate.sh
+	$(QUIET) contrib/scripts/check-xfrmstate.sh
+	@$(ECHO_CHECK) contrib/scripts/check-legacy-header-guard.sh
+	$(QUIET) contrib/scripts/check-legacy-header-guard.sh
+	@$(ECHO_CHECK) contrib/scripts/check-logrus.sh
+	$(QUIET) contrib/scripts/check-logrus.sh
 
 pprof-heap: ## Get Go pprof heap profile.
 	$(QUIET)$(GO) tool pprof http://localhost:6060/debug/pprof/heap
@@ -536,7 +554,7 @@ help: ## Display help for the Makefile, from https://www.thapaliya.com/en/writin
 	$(call print_help_line,"docker-operator-*-image","Build platform specific cilium-operator images(alibabacloud, aws, azure, generic)")
 	$(call print_help_line,"docker-*-image-unstripped","Build unstripped version of above docker images(cilium, hubble-relay, operator etc.)")
 
-.PHONY: help clean clean-container dev-doctor force generate-api generate-health-api generate-operator-api generate-hubble-api install licenses-all veryclean run_bpf_tests run-builder
+.PHONY: help clean clean-container dev-doctor force generate-api generate-health-api generate-operator-api generate-kvstoremesh-api generate-hubble-api install licenses-all veryclean run_bpf_tests run-builder
 force :;
 
 run_bpf_tests: ## Build and run the BPF unit tests using the cilium-builder container image.

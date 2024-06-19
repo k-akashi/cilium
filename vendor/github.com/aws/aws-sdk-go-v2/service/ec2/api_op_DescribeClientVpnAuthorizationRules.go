@@ -41,9 +41,12 @@ type DescribeClientVpnAuthorizationRulesInput struct {
 	DryRun *bool
 
 	// One or more filters. Filter names and values are case-sensitive.
+	//
 	//   - description - The description of the authorization rule.
+	//
 	//   - destination-cidr - The CIDR of the network to which the authorization rule
 	//   applies.
+	//
 	//   - group-id - The ID of the Active Directory group to which the authorization
 	//   rule grants access.
 	Filters []types.Filter
@@ -127,6 +130,9 @@ func (c *Client) addOperationDescribeClientVpnAuthorizationRulesMiddlewares(stac
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = addOpDescribeClientVpnAuthorizationRulesValidationMiddleware(stack); err != nil {

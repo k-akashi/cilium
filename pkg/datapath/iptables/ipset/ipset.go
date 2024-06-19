@@ -9,20 +9,19 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/reconciler"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/datapath/tables"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/statedb"
-	"github.com/cilium/cilium/pkg/statedb/reconciler"
 )
 
 const (
@@ -100,7 +99,7 @@ func (m *manager) AddToIPSet(name string, family Family, addrs ...netip.Addr) {
 			Name: name,
 			Addr: addr,
 		}
-		if _, _, found := m.table.First(txn, tables.IPSetEntryIndex.Query(key)); found {
+		if _, _, found := m.table.Get(txn, tables.IPSetEntryIndex.Query(key)); found {
 			continue
 		}
 		_, _, _ = m.table.Insert(txn, &tables.IPSetEntry{
@@ -128,11 +127,11 @@ func (m *manager) RemoveFromIPSet(name string, addrs ...netip.Addr) {
 			Name: name,
 			Addr: addr,
 		}
-		obj, _, found := m.table.First(txn, tables.IPSetEntryIndex.Query(key))
+		obj, _, found := m.table.Get(txn, tables.IPSetEntryIndex.Query(key))
 		if !found {
 			continue
 		}
-		m.table.Insert(txn, obj.WithStatus(reconciler.StatusPendingDelete()))
+		m.table.Delete(txn, obj)
 	}
 
 	txn.Commit()
@@ -141,8 +140,8 @@ func (m *manager) RemoveFromIPSet(name string, addrs ...netip.Addr) {
 func newIPSetManager(
 	logger logrus.FieldLogger,
 	lc cell.Lifecycle,
-	jobRegistry job.Registry,
-	scope cell.Scope,
+	jg job.Group,
+	health cell.Health,
 	db *statedb.DB,
 	table statedb.RWTable[*tables.IPSetEntry],
 	cfg config,
@@ -179,24 +178,20 @@ func newIPSetManager(
 		},
 	})
 
-	jg := jobRegistry.NewGroup(
-		scope,
-		job.WithLogger(logger),
-		job.WithPprofLabels(pprof.Labels("cell", "ipset")),
-	)
 	jg.Add(job.OneShot("ipset-init-finalizer", mgr.init))
-	lc.Append(jg)
 
 	return mgr
 }
 
-func (m *manager) init(ctx context.Context, _ cell.HealthReporter) error {
+func (m *manager) init(ctx context.Context, _ cell.Health) error {
 	if !m.enabled {
 		// If node ipsets are not needed, clear the Cilium managed ones to remove possible stale entries.
 		for _, ciliumNodeIPSet := range []string{CiliumNodeIPSetV4, CiliumNodeIPSetV6} {
 			if err := m.ipset.remove(ctx, ciliumNodeIPSet); err != nil {
-				m.logger.WithError(err).Infof("Unable to remove stale ipset %s. This is usually due to a stale iptables rule referring to it. "+
-					"The set will not be removed. This is harmless and it will be removed at the next Cilium restart, when the stale iptables rule has been removed.", ciliumNodeIPSet)
+				m.logger.Info("Unable to remove stale ipset. This is usually due to a stale iptables rule referring to it. "+
+					"The set will not be removed. This is harmless and it will be removed at the next Cilium restart, when the stale iptables rule has been removed.",
+					"ipset", ciliumNodeIPSet,
+					"error", err)
 			}
 		}
 		return nil

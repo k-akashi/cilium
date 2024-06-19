@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,11 +18,11 @@ import (
 	"github.com/cilium/cilium/operator/k8s"
 	tu "github.com/cilium/cilium/operator/pkg/ciliumendpointslice/testutils"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	cilium_v2a1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/testutils"
 )
 
@@ -32,11 +34,11 @@ func TestRegisterController(t *testing.T) {
 		// no longer than 0.5s after the workqueue is stopped.
 		goleak.IgnoreTopFunction("k8s.io/client-go/util/workqueue.(*Type).updateUnfinishedWorkLoop"),
 	)
-	var fakeClient k8sClient.FakeClientset
+	var fakeClient k8sClient.Clientset
 	var ciliumEndpoint resource.Resource[*cilium_v2.CiliumEndpoint]
 	var ciliumEndpointSlice resource.Resource[*cilium_v2a1.CiliumEndpointSlice]
 	hive := hive.New(
-		k8sClient.FakeClientCell,
+		k8sClient.FakeClientBuilderCell,
 		k8s.ResourcesCell,
 		cell.Provide(func() Config {
 			return defaultConfig
@@ -46,19 +48,24 @@ func TestRegisterController(t *testing.T) {
 				EnableCiliumEndpointSlice: true,
 			}
 		}),
-		cell.Metric(NewMetrics),
+		metrics.Metric(NewMetrics),
 		cell.Invoke(func(p params) error {
 			registerController(p)
 			return nil
 		}),
-		cell.Invoke(func(c *k8sClient.FakeClientset, cep resource.Resource[*cilium_v2.CiliumEndpoint], ces resource.Resource[*cilium_v2a1.CiliumEndpointSlice]) error {
-			fakeClient = *c
+		cell.Provide(func(f k8sClient.ClientBuilderFunc) k8sClient.Clientset {
+			clientset, _ := f("test-ces-registered")
+			return clientset
+		}),
+		cell.Invoke(func(c k8sClient.Clientset, cep resource.Resource[*cilium_v2.CiliumEndpoint], ces resource.Resource[*cilium_v2a1.CiliumEndpointSlice]) error {
+			fakeClient = c
 			ciliumEndpoint = cep
 			ciliumEndpointSlice = ces
 			return nil
 		}),
 	)
-	if err := hive.Start(context.Background()); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 	cesCreated, err := createCEPandVerifyCESCreated(fakeClient, ciliumEndpoint, ciliumEndpointSlice)
@@ -67,7 +74,7 @@ func TestRegisterController(t *testing.T) {
 	}
 	// Verify CES is created when CES features is enabled
 	assert.Equal(t, true, cesCreated)
-	if err := hive.Stop(context.Background()); err != nil {
+	if err := hive.Stop(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
@@ -80,11 +87,11 @@ func TestNotRegisterControllerWithCESDisabled(t *testing.T) {
 		// no longer than 0.5s after the workqueue is stopped.
 		goleak.IgnoreTopFunction("k8s.io/client-go/util/workqueue.(*Type).updateUnfinishedWorkLoop"),
 	)
-	var fakeClient k8sClient.FakeClientset
+	var fakeClient k8sClient.Clientset
 	var ciliumEndpoint resource.Resource[*cilium_v2.CiliumEndpoint]
 	var ciliumEndpointSlice resource.Resource[*cilium_v2a1.CiliumEndpointSlice]
 	h := hive.New(
-		k8sClient.FakeClientCell,
+		k8sClient.FakeClientBuilderCell,
 		k8s.ResourcesCell,
 		cell.Provide(func() Config {
 			return defaultConfig
@@ -94,19 +101,24 @@ func TestNotRegisterControllerWithCESDisabled(t *testing.T) {
 				EnableCiliumEndpointSlice: false,
 			}
 		}),
-		cell.Metric(NewMetrics),
+		metrics.Metric(NewMetrics),
 		cell.Invoke(func(p params) error {
 			registerController(p)
 			return nil
 		}),
-		cell.Invoke(func(c *k8sClient.FakeClientset, cep resource.Resource[*cilium_v2.CiliumEndpoint], ces resource.Resource[*cilium_v2a1.CiliumEndpointSlice]) error {
-			fakeClient = *c
+		cell.Provide(func(f k8sClient.ClientBuilderFunc) k8sClient.Clientset {
+			clientset, _ := f("test-ces-unregistered")
+			return clientset
+		}),
+		cell.Invoke(func(c k8sClient.Clientset, cep resource.Resource[*cilium_v2.CiliumEndpoint], ces resource.Resource[*cilium_v2a1.CiliumEndpointSlice]) error {
+			fakeClient = c
 			ciliumEndpoint = cep
 			ciliumEndpointSlice = ces
 			return nil
 		}),
 	)
-	if err := h.Start(context.Background()); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := h.Start(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 	cesCreated, err := createCEPandVerifyCESCreated(fakeClient, ciliumEndpoint, ciliumEndpointSlice)
@@ -115,12 +127,12 @@ func TestNotRegisterControllerWithCESDisabled(t *testing.T) {
 	}
 	// Verify CES is NOT created when CES features is disabled
 	assert.Equal(t, false, cesCreated)
-	if err = h.Stop(context.Background()); err != nil {
+	if err = h.Stop(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
 
-func createCEPandVerifyCESCreated(fakeClient k8sClient.FakeClientset, ciliumEndpoint resource.Resource[*cilium_v2.CiliumEndpoint], ciliumEndpointSlice resource.Resource[*cilium_v2a1.CiliumEndpointSlice]) (bool, error) {
+func createCEPandVerifyCESCreated(fakeClient k8sClient.Clientset, ciliumEndpoint resource.Resource[*cilium_v2.CiliumEndpoint], ciliumEndpointSlice resource.Resource[*cilium_v2a1.CiliumEndpointSlice]) (bool, error) {
 	cep := tu.CreateStoreEndpoint("cep1", "ns", 1)
 	fakeClient.CiliumV2().CiliumEndpoints("ns").Create(context.Background(), cep, meta_v1.CreateOptions{})
 	cepStore, _ := ciliumEndpoint.Store(context.Background())

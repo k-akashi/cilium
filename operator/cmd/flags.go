@@ -54,14 +54,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.String(option.ConfigDir, "", `Configuration directory that contains a file for each option`)
 	option.BindEnv(vp, option.ConfigDir)
 
-	flags.Float64(operatorOption.CNPStatusCleanupQPS, operatorOption.CNPStatusCleanupQPSDefault,
-		"Rate used for limiting the clean up of the status nodes updates in CNP, expressed as qps")
-	option.BindEnv(vp, operatorOption.CNPStatusCleanupQPS)
-
-	flags.Int(operatorOption.CNPStatusCleanupBurst, operatorOption.CNPStatusCleanupBurstDefault,
-		"Maximum burst of requests to clean up status nodes updates in CNPs")
-	option.BindEnv(vp, operatorOption.CNPStatusCleanupBurst)
-
 	flags.BoolP(option.DebugArg, "D", false, "Enable debugging mode")
 	option.BindEnv(vp, option.DebugArg)
 
@@ -270,9 +262,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.Bool(operatorOption.SetCiliumIsUpCondition, true, "Set CiliumIsUp Node condition to mark a Kubernetes Node that a Cilium pod is up and running in that node")
 	option.BindEnv(vp, operatorOption.SetCiliumIsUpCondition)
-
-	flags.Uint32(operatorOption.IngressDefaultXffNumTrustedHops, 0, "The number of additional ingress proxy hops from the right side of the HTTP header to trust when determining the origin client's IP address.")
-	option.BindEnv(vp, operatorOption.IngressDefaultXffNumTrustedHops)
 
 	flags.String(operatorOption.PodRestartSelector, "k8s-app=kube-dns", "cilium-operator will delete/restart any pods with these labels if the pod is not managed by Cilium. If this option is empty, then all pods may be restarted")
 	option.BindEnv(vp, operatorOption.PodRestartSelector)

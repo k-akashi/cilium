@@ -4,18 +4,21 @@
 package kvstoremesh
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
+	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/clustermesh-apiserver/syncstate"
 	"github.com/cilium/cilium/pkg/clustermesh/common"
 	"github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/clustermesh/wait"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	identityCache "github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/kvstore"
@@ -100,22 +103,19 @@ type SyncWaiterParams struct {
 	KVStoreMesh *KVStoreMesh
 	SyncState   syncstate.SyncState
 	Lifecycle   cell.Lifecycle
-	JobRegistry job.Registry
-	Scope       cell.Scope
+	JobGroup    job.Group
+	Health      cell.Health
 }
 
 func RegisterSyncWaiter(p SyncWaiterParams) {
 	syncedCallback := p.SyncState.WaitForResource()
 	p.SyncState.Stop()
 
-	jobGroup := p.JobRegistry.NewGroup(p.Scope)
-	jobGroup.Add(
-		job.OneShot("kvstoremesh-sync-waiter", func(ctx context.Context, health cell.HealthReporter) error {
+	p.JobGroup.Add(
+		job.OneShot("kvstoremesh-sync-waiter", func(ctx context.Context, health cell.Health) error {
 			return p.KVStoreMesh.synced(ctx, syncedCallback)
 		}),
 	)
-
-	p.Lifecycle.Append(jobGroup)
 }
 
 func (km *KVStoreMesh) Start(ctx cell.HookContext) error {
@@ -132,7 +132,7 @@ func (km *KVStoreMesh) Stop(cell.HookContext) error {
 	return nil
 }
 
-func (km *KVStoreMesh) newRemoteCluster(name string, _ common.StatusFunc) common.RemoteCluster {
+func (km *KVStoreMesh) newRemoteCluster(name string, status common.StatusFunc) common.RemoteCluster {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	synced := newSynced()
@@ -148,6 +148,7 @@ func (km *KVStoreMesh) newRemoteCluster(name string, _ common.StatusFunc) common
 		services:     newReflector(km.backend, name, serviceStore.ServiceStorePrefix, km.storeFactory, synced.resources),
 		identities:   newReflector(km.backend, name, identityCache.IdentitiesPath, km.storeFactory, synced.resources),
 		ipcache:      newReflector(km.backend, name, ipcache.IPIdentitiesPath, km.storeFactory, synced.resources),
+		status:       status,
 		storeFactory: km.storeFactory,
 		synced:       synced,
 		readyTimeout: km.config.PerClusterReadyTimeout,
@@ -195,4 +196,21 @@ func (km *KVStoreMesh) synced(ctx context.Context, syncCallback func(context.Con
 	}
 
 	return nil
+}
+
+// Status returns the status of the ClusterMesh subsystem
+func (km *KVStoreMesh) status() []*models.RemoteCluster {
+	var clusters []*models.RemoteCluster
+
+	km.common.ForEachRemoteCluster(func(rci common.RemoteCluster) error {
+		rc := rci.(*remoteCluster)
+		clusters = append(clusters, rc.Status())
+		return nil
+	})
+
+	// Sort the remote clusters information to ensure consistent ordering.
+	slices.SortFunc(clusters,
+		func(a, b *models.RemoteCluster) int { return cmp.Compare(a.Name, b.Name) })
+
+	return clusters
 }

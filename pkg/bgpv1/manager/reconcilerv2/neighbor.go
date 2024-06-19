@@ -6,13 +6,14 @@ package reconcilerv2
 import (
 	"context"
 	"fmt"
+	"net/netip"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
@@ -356,4 +357,21 @@ func (r *NeighborReconciler) fetchSecret(name string) (map[string][]byte, bool, 
 		result[k] = []byte(v)
 	}
 	return result, true, nil
+}
+
+func GetPeerAddressFromConfig(conf *v2alpha1.CiliumBGPNodeInstance, peerName string) (netip.Addr, error) {
+	if conf == nil {
+		return netip.Addr{}, fmt.Errorf("passed instance is nil")
+	}
+
+	for _, peer := range conf.Peers {
+		if peer.Name == peerName {
+			if peer.PeerAddress != nil {
+				return netip.ParseAddr(*peer.PeerAddress)
+			} else {
+				return netip.Addr{}, fmt.Errorf("peer %s does not have a PeerAddress", peerName)
+			}
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("peer %s not found in instance %s", peerName, conf.Name)
 }

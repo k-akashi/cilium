@@ -41,9 +41,12 @@ type DescribeClientVpnRoutesInput struct {
 	DryRun *bool
 
 	// One or more filters. Filter names and values are case-sensitive.
+	//
 	//   - destination-cidr - The CIDR of the route destination.
+	//
 	//   - origin - How the route was associated with the Client VPN endpoint (
 	//   associate | add-route ).
+	//
 	//   - target-subnet - The ID of the subnet through which traffic is routed.
 	Filters []types.Filter
 
@@ -126,6 +129,9 @@ func (c *Client) addOperationDescribeClientVpnRoutesMiddlewares(stack *middlewar
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = addOpDescribeClientVpnRoutesValidationMiddleware(stack); err != nil {

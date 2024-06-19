@@ -25,6 +25,9 @@ func (in *Backend) DeepEqual(other *Backend) bool {
 	if in.NodeName != other.NodeName {
 		return false
 	}
+	if in.Hostname != other.Hostname {
+		return false
+	}
 	if in.Terminating != other.Terminating {
 		return false
 	}
@@ -46,6 +49,9 @@ func (in *Backend) DeepEqual(other *Backend) bool {
 	}
 
 	if in.Preferred != other.Preferred {
+		return false
+	}
+	if in.Zone != other.Zone {
 		return false
 	}
 

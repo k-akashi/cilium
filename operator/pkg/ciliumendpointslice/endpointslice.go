@@ -7,12 +7,12 @@ import (
 	"context"
 	"time"
 
+	"github.com/cilium/hive/cell"
 	"github.com/cilium/workerpool"
 	"github.com/sirupsen/logrus"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/util/workqueue"
 
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	capi_v2a1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
@@ -34,10 +34,6 @@ const (
 	maxRetries = 15
 	// CEPs are batched into a CES, based on its Identity
 	cesIdentityBasedSlicing = "cesSliceModeIdentity"
-	// default qps limit value for workqueues, this only for retries.
-	CESControllerWorkQueueQPSLimit = 10
-	// default burst limit value for workqueues.
-	CESControllerWorkQueueBurstLimit = 100
 	// Default CES Synctime, multiple consecutive syncs with k8s-apiserver are
 	// batched and synced together after a short delay.
 	DefaultCESSyncTime = 500 * time.Millisecond
@@ -131,9 +127,7 @@ func (c *Controller) Start(ctx cell.HookContext) error {
 	c.wp = workerpool.New(3)
 	c.wp.Submit("cilium-endpoints-updater", c.runCiliumEndpointsUpdater)
 	c.wp.Submit("cilium-endpoint-slices-updater", c.runCiliumEndpointSliceUpdater)
-	if c.rateLimit.hasDynamicRateLimiting() {
-		c.wp.Submit("cilium-nodes-updater", c.runCiliumNodesUpdater)
-	}
+	c.wp.Submit("cilium-nodes-updater", c.runCiliumNodesUpdater)
 
 	c.logger.Info("Starting CES controller reconciler.")
 	go c.worker()

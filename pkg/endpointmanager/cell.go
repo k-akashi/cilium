@@ -8,9 +8,10 @@ import (
 	"net/netip"
 	"sync"
 
+	"github.com/cilium/hive/cell"
+
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s/client"
@@ -79,11 +80,14 @@ type EndpointsLookup interface {
 
 	// IngressEndpointExists returns true if the ingress endpoint exists.
 	IngressEndpointExists() bool
+
+	// GetEndpointNetnsCookieByIP returns the netns cookie for the passed endpoint with ip address if found.
+	GetEndpointNetnsCookieByIP(ip netip.Addr) (uint64, error)
 }
 
 type EndpointsModify interface {
 	// AddEndpoint takes the prepared endpoint object and starts managing it.
-	AddEndpoint(owner regeneration.Owner, ep *endpoint.Endpoint, reason string) (err error)
+	AddEndpoint(owner regeneration.Owner, ep *endpoint.Endpoint) (err error)
 
 	// AddIngressEndpoint creates an Endpoint representing Cilium Ingress on this node without a
 	// corresponding container necessarily existing. This is needed to be able to ingest and
@@ -95,7 +99,6 @@ type EndpointsModify interface {
 		ipcache *ipcache.IPCache,
 		proxy endpoint.EndpointProxy,
 		allocator cache.IdentityAllocator,
-		reason string,
 	) error
 
 	AddHostEndpoint(
@@ -105,7 +108,6 @@ type EndpointsModify interface {
 		ipcache *ipcache.IPCache,
 		proxy endpoint.EndpointProxy,
 		allocator cache.IdentityAllocator,
-		reason, nodeName string,
 	) error
 
 	// RestoreEndpoint exposes the specified endpoint to other subsystems via the
@@ -168,12 +170,15 @@ type EndpointManager interface {
 	// each endpoint that reaches the desired revision calls 'done' independently.
 	// The provided callback should not block and generally be lightweight.
 	CallbackForEndpointsAtPolicyRev(ctx context.Context, rev uint64, done func(time.Time)) error
+
+	// GetEndpointNetnsCookieByIP returns the netns cookie for the passed endpoint with ip address if found.
+	GetEndpointNetnsCookieByIP(ip netip.Addr) (uint64, error)
 }
 
 // EndpointResourceSynchronizer is an interface which synchronizes CiliumEndpoint
 // resources with Kubernetes.
 type EndpointResourceSynchronizer interface {
-	RunK8sCiliumEndpointSync(ep *endpoint.Endpoint, hr cell.HealthReporter)
+	RunK8sCiliumEndpointSync(ep *endpoint.Endpoint, hr cell.Health)
 	DeleteK8sCiliumEndpointSync(e *endpoint.Endpoint)
 }
 
@@ -190,7 +195,7 @@ type endpointManagerParams struct {
 	Config          EndpointManagerConfig
 	Clientset       client.Clientset
 	MetricsRegistry *metrics.Registry
-	Scope           cell.Scope
+	Health          cell.Health
 	EPSynchronizer  EndpointResourceSynchronizer
 	LocalNodeStore  *node.LocalNodeStore
 }
@@ -206,7 +211,7 @@ type endpointManagerOut struct {
 func newDefaultEndpointManager(p endpointManagerParams) endpointManagerOut {
 	checker := endpoint.CheckHealth
 
-	mgr := New(p.EPSynchronizer, p.LocalNodeStore, p.Scope)
+	mgr := New(p.EPSynchronizer, p.LocalNodeStore, p.Health)
 	if p.Config.EndpointGCInterval > 0 {
 		ctx, cancel := context.WithCancel(context.Background())
 		p.Lifecycle.Append(cell.Hook{

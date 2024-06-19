@@ -37,8 +37,10 @@ type DescribeCoipPoolsInput struct {
 	DryRun *bool
 
 	// One or more filters.
+	//
 	//   - coip-pool.local-gateway-route-table-id - The ID of the local gateway route
 	//   table.
+	//
 	//   - coip-pool.pool-id - The ID of the address pool.
 	Filters []types.Filter
 
@@ -123,6 +125,9 @@ func (c *Client) addOperationDescribeCoipPoolsMiddlewares(stack *middleware.Stac
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeCoipPools(options.Region), middleware.Before); err != nil {

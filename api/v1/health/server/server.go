@@ -28,10 +28,10 @@ import (
 
 	"github.com/cilium/cilium/api/v1/health/server/restapi"
 	"github.com/cilium/cilium/api/v1/health/server/restapi/connectivity"
+	"github.com/cilium/hive/cell"
 
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 )
 
 // Cell implements the cilium health API REST API server when provided
@@ -313,8 +313,6 @@ func (s *Server) Serve() error {
 
 // Start the server
 func (s *Server) Start(cell.HookContext) (err error) {
-	s.ConfigureAPI()
-
 	if !s.hasListeners {
 		if err = s.Listen(); err != nil {
 			return err
@@ -331,6 +329,7 @@ func (s *Server) Start(cell.HookContext) (err error) {
 			return errors.New("can't create the default handler, as no api is set")
 		}
 
+		s.ConfigureAPI()
 		s.SetHandler(s.api.Serve(nil))
 	}
 

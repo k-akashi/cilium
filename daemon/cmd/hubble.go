@@ -6,7 +6,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"github.com/go-openapi/strfmt"
@@ -16,11 +18,9 @@ import (
 	flowpb "github.com/cilium/cilium/api/v1/flow"
 	"github.com/cilium/cilium/api/v1/models"
 	observerpb "github.com/cilium/cilium/api/v1/observer"
-	cgroupManager "github.com/cilium/cilium/pkg/cgroups/manager"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/crypto/certloader"
 	"github.com/cilium/cilium/pkg/datapath/link"
-	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
 	"github.com/cilium/cilium/pkg/hubble/container"
 	"github.com/cilium/cilium/pkg/hubble/dropeventemitter"
 	"github.com/cilium/cilium/pkg/hubble/exporter"
@@ -30,6 +30,7 @@ import (
 	"github.com/cilium/cilium/pkg/hubble/observer"
 	"github.com/cilium/cilium/pkg/hubble/observer/observeroption"
 	"github.com/cilium/cilium/pkg/hubble/parser"
+	hubbleGetters "github.com/cilium/cilium/pkg/hubble/parser/getters"
 	parserOptions "github.com/cilium/cilium/pkg/hubble/parser/options"
 	"github.com/cilium/cilium/pkg/hubble/peer"
 	"github.com/cilium/cilium/pkg/hubble/peer/serviceoption"
@@ -88,6 +89,18 @@ func (d *Daemon) getHubbleStatus(ctx context.Context) *models.HubbleStatus {
 	return hubbleStatus
 }
 
+func getPort(addr string) (int, error) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, fmt.Errorf("parse host address and port: %w", err)
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		return 0, fmt.Errorf("parse port number: %w", err)
+	}
+	return portNum, nil
+}
+
 func (d *Daemon) launchHubble() {
 	logger := logging.DefaultLogger.WithField(logfields.LogSubsys, "hubble")
 	if !option.Config.EnableHubble {
@@ -133,14 +146,48 @@ func (d *Daemon) launchHubble() {
 		)
 	}
 
+	// fill in the local node information after the dropEventEmitter logique,
+	// but before anything else (e.g. metrics).
+	localNodeWatcher := observer.NewLocalNodeWatcher(d.ctx, d.nodeLocalStore)
+	observerOpts = append(observerOpts, observeroption.WithOnDecodedFlow(localNodeWatcher))
+
+	grpcMetrics := grpc_prometheus.NewServerMetrics()
+	var metricsTLSConfig *certloader.WatchedServerConfig
+	if option.Config.HubbleMetricsServerTLSEnabled {
+		metricsTLSConfigChan, err := certloader.FutureWatchedServerConfig(
+			logger.WithField("config", "hubble-metrics-server-tls"),
+			option.Config.HubbleMetricsServerTLSClientCAFiles,
+			option.Config.HubbleMetricsServerTLSCertFile,
+			option.Config.HubbleMetricsServerTLSKeyFile,
+		)
+		if err != nil {
+			logger.WithError(err).Error("Failed to initialize Hubble metrics server TLS configuration")
+			return
+		}
+		waitingMsgTimeout := time.After(30 * time.Second)
+		for metricsTLSConfig == nil {
+			select {
+			case metricsTLSConfig = <-metricsTLSConfigChan:
+			case <-waitingMsgTimeout:
+				logger.Info("Waiting for Hubble metrics server TLS certificate and key files to be created")
+			case <-d.ctx.Done():
+				logger.WithError(d.ctx.Err()).Error("Timeout while waiting for Hubble metrics server TLS certificate and key files to be created")
+				return
+			}
+		}
+		go func() {
+			<-d.ctx.Done()
+			metricsTLSConfig.Stop()
+		}()
+	}
+
 	if option.Config.HubbleMetricsServer != "" {
 		logger.WithFields(logrus.Fields{
 			"address": option.Config.HubbleMetricsServer,
 			"metrics": option.Config.HubbleMetrics,
+			"tls":     option.Config.HubbleMetricsServerTLSEnabled,
 		}).Info("Starting Hubble Metrics server")
-		grpcMetrics := grpc_prometheus.NewServerMetrics()
-
-		if err := metrics.EnableMetrics(log, option.Config.HubbleMetricsServer, option.Config.HubbleMetrics, grpcMetrics, option.Config.EnableHubbleOpenMetrics); err != nil {
+		if err := metrics.EnableMetrics(log, option.Config.HubbleMetricsServer, metricsTLSConfig, option.Config.HubbleMetrics, grpcMetrics, option.Config.EnableHubbleOpenMetrics); err != nil {
 			logger.WithError(err).Warn("Failed to initialize Hubble metrics server")
 			return
 		}
@@ -191,7 +238,6 @@ func (d *Daemon) launchHubble() {
 	observerOpts = append(observerOpts,
 		observeroption.WithMaxFlows(maxFlows),
 		observeroption.WithMonitorBuffer(option.Config.HubbleEventQueueSize),
-		observeroption.WithCiliumDaemon(d),
 	)
 	if option.Config.HubbleExportFilePath != "" {
 		exporterOpts := []exporteroption.Option{
@@ -245,6 +291,14 @@ func (d *Daemon) launchHubble() {
 	}
 	if option.Config.HubblePreferIpv6 {
 		peerServiceOptions = append(peerServiceOptions, serviceoption.WithAddressFamilyPreference(serviceoption.AddressPreferIPv6))
+	}
+	if addr := option.Config.HubbleListenAddress; addr != "" {
+		port, err := getPort(option.Config.HubbleListenAddress)
+		if err != nil {
+			logger.WithError(err).WithField("address", addr).Warn("Hubble server will not pass port information in change notificantions on exposed Hubble peer service")
+		} else {
+			peerServiceOptions = append(peerServiceOptions, serviceoption.WithHubblePort(port))
+		}
 	}
 	peerSvc := peer.NewService(d.nodeDiscovery.Manager, peerServiceOptions...)
 
@@ -329,6 +383,7 @@ func (d *Daemon) launchHubble() {
 				case <-waitingMsgTimeout:
 					logger.Info("Waiting for Hubble server TLS certificate and key files to be created")
 				case <-d.ctx.Done():
+					logger.WithError(d.ctx.Err()).Error("Timeout while waiting for Hubble server TLS certificate and key files to be created")
 					return
 				}
 			}
@@ -344,7 +399,10 @@ func (d *Daemon) launchHubble() {
 			return
 		}
 
-		logger.WithField("address", address).Info("Starting Hubble server")
+		logger.WithFields(logrus.Fields{
+			"address": address,
+			"tls":     !option.Config.HubbleTLSDisabled,
+		}).Info("Starting Hubble server")
 		go func() {
 			if err := srv.Serve(); err != nil {
 				logger.WithError(err).WithField("address", address).Error("Error while serving from Hubble server")
@@ -380,7 +438,7 @@ func (d *Daemon) GetIdentity(securityIdentity uint32) (*identity.Identity, error
 
 // GetEndpointInfo returns endpoint info for a given IP address. Hubble uses this function to populate
 // fields like namespace and pod name for local endpoints.
-func (d *Daemon) GetEndpointInfo(ip netip.Addr) (endpoint v1.EndpointInfo, ok bool) {
+func (d *Daemon) GetEndpointInfo(ip netip.Addr) (endpoint hubbleGetters.EndpointInfo, ok bool) {
 	if !ip.IsValid() {
 		return nil, false
 	}
@@ -392,7 +450,7 @@ func (d *Daemon) GetEndpointInfo(ip netip.Addr) (endpoint v1.EndpointInfo, ok bo
 }
 
 // GetEndpointInfoByID returns endpoint info for a given Cilium endpoint id. Used by Hubble.
-func (d *Daemon) GetEndpointInfoByID(id uint16) (endpoint v1.EndpointInfo, ok bool) {
+func (d *Daemon) GetEndpointInfoByID(id uint16) (endpoint hubbleGetters.EndpointInfo, ok bool) {
 	ep := d.endpointManager.LookupCiliumID(id)
 	if ep == nil {
 		return nil, false
@@ -451,8 +509,4 @@ func (d *Daemon) GetServiceByAddr(ip netip.Addr, port uint16) *flowpb.Service {
 // Hubble's events buffer.
 func getHubbleEventBufferCapacity(logger logrus.FieldLogger) (container.Capacity, error) {
 	return container.NewCapacity(option.Config.HubbleEventBufferCapacity)
-}
-
-func (d *Daemon) GetParentPodMetadata(cgroupId uint64) *cgroupManager.PodMetadata {
-	return d.cgroupManager.GetPodMetadataForContainer(cgroupId)
 }

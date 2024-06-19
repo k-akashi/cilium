@@ -6,31 +6,32 @@ package sysctl
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
+
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/reconciler"
 
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/statedb"
-	"github.com/cilium/cilium/pkg/statedb/reconciler"
 )
 
-func newOps(log logrus.FieldLogger, fs afero.Fs, cfg Config) reconciler.Operations[*tables.Sysctl] {
+func newOps(log *slog.Logger, fs afero.Fs, cfg Config) reconciler.Operations[*tables.Sysctl] {
 	return &ops{log: log, fs: fs, procFs: cfg.ProcFs}
 }
 
 type ops struct {
-	log    logrus.FieldLogger
+	log    *slog.Logger
 	fs     afero.Fs
 	procFs string
 }
 
-func (ops *ops) Update(ctx context.Context, txn statedb.ReadTxn, s *tables.Sysctl, changed *bool) error {
-	log := ops.log.WithFields(logrus.Fields{
-		logfields.SysParamName:  s.Name,
-		logfields.SysParamValue: s.Val,
-	})
+func (ops *ops) Update(ctx context.Context, txn statedb.ReadTxn, s *tables.Sysctl) error {
+	log := ops.log.With(
+		logfields.SysParamName, s.Name,
+		logfields.SysParamValue, s.Val,
+	)
 
 	path, err := parameterPath(ops.procFs, s.Name)
 	if err != nil {
@@ -57,16 +58,11 @@ func (ops *ops) Update(ctx context.Context, txn statedb.ReadTxn, s *tables.Sysct
 			if s.Warn != "" {
 				warn = s.Warn
 			}
-			log.Warning(warn)
+			log.Warn(warn)
 			return nil
 		}
 		return fmt.Errorf("failed to write sysctl setting %s: %w", path, err)
 	}
-
-	if changed != nil {
-		*changed = true
-	}
-
 	return nil
 }
 

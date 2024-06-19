@@ -37,8 +37,11 @@ type DescribeScheduledInstancesInput struct {
 	DryRun *bool
 
 	// The filters.
+	//
 	//   - availability-zone - The Availability Zone (for example, us-west-2a ).
+	//
 	//   - instance-type - The instance type (for example, c4.large ).
+	//
 	//   - platform - The platform ( Linux/UNIX or Windows ).
 	Filters []types.Filter
 
@@ -128,6 +131,9 @@ func (c *Client) addOperationDescribeScheduledInstancesMiddlewares(stack *middle
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeScheduledInstances(options.Region), middleware.Before); err != nil {

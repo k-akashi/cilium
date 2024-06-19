@@ -42,7 +42,9 @@ type DescribeVpcEndpointServicePermissionsInput struct {
 	DryRun *bool
 
 	// The filters.
+	//
 	//   - principal - The ARN of the principal.
+	//
 	//   - principal-type - The principal type ( All | Service | OrganizationUnit |
 	//   Account | User | Role ).
 	Filters []types.Filter
@@ -127,6 +129,9 @@ func (c *Client) addOperationDescribeVpcEndpointServicePermissionsMiddlewares(st
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = addOpDescribeVpcEndpointServicePermissionsValidationMiddleware(stack); err != nil {

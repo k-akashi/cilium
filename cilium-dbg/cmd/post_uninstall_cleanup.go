@@ -9,11 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cilium/ebpf"
 	"github.com/spf13/cobra"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
-
-	"github.com/cilium/ebpf"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/common"
@@ -255,6 +254,7 @@ func (c ciliumCleanup) cleanupFuncs() []cleanupFunc {
 		cleanupTCFilters,
 		cleanupXDPs,
 		removeSocketLBPrograms,
+		removeCiliumBPFFS,
 	}
 	if !c.bpfOnly {
 		funcs = append(funcs, cleanupRoutesAndLinks)
@@ -555,7 +555,7 @@ func removeXDPAttachments(links []netlink.Link) error {
 	})
 
 	for _, link := range links {
-		if err := loader.DetachXDP(link, bpf.CiliumPath(), "cil_xdp_entry"); err != nil {
+		if err := loader.DetachXDP(link.Attrs().Name, bpf.CiliumPath(), "cil_xdp_entry"); err != nil {
 			return err
 		}
 		fmt.Printf("removed cilium xdp of %s\n", link.Attrs().Name)
@@ -594,4 +594,15 @@ func isCiliumXDP(progId uint32) (bool, error) {
 
 	return false, nil
 
+}
+
+func removeCiliumBPFFS() error {
+	path := bpf.CiliumPath()
+
+	if err := bpf.Remove(path); err != nil {
+		return err
+	}
+
+	fmt.Printf("removed all cilium bpffs objects under %s\n", path)
+	return nil
 }

@@ -6,9 +6,11 @@ package cmd
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"path"
 	"time"
 
+	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -16,7 +18,6 @@ import (
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/allocator"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	cacheKey "github.com/cilium/cilium/pkg/identity/key"
@@ -61,7 +62,6 @@ func migrateIdentityCmd() *cobra.Command {
 			})
 		}),
 	)
-	hive.SetTimeouts(opTimeout, opTimeout)
 	hive.RegisterFlags(cmd.Flags())
 
 	cmd.Run = func(cmd *cobra.Command, args []string) {
@@ -69,7 +69,7 @@ func migrateIdentityCmd() *cobra.Command {
 		// the CLI tool.
 		logging.DefaultLogger.SetFormatter(log.Formatter)
 
-		if err := hive.Run(); err != nil {
+		if err := hive.Run(slog.Default()); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -230,8 +230,8 @@ func initK8s(ctx context.Context, clientset k8sClient.Clientset, resources agent
 	//
 	// FIXME: add options to handle clustermesh with this constructor parameter:
 	//    allocator.WithPrefixMask(idpool.ID(option.Config.ClusterID<<identity.ClusterIDShift)))
-	minID := idpool.ID(identity.GetMinimalAllocationIdentity())
-	maxID := idpool.ID(identity.GetMaximumAllocationIdentity())
+	minID := idpool.ID(identity.GetMinimalAllocationIdentity(option.Config.ClusterID))
+	maxID := idpool.ID(identity.GetMaximumAllocationIdentity(option.Config.ClusterID))
 	crdAllocator, err = allocator.NewAllocator(&cacheKey.GlobalIdentity{}, crdBackend,
 		allocator.WithMax(maxID), allocator.WithMin(minID))
 	if err != nil {
@@ -268,7 +268,7 @@ func getKVStoreIdentities(ctx context.Context, kvstoreBackend allocator.Backend)
 	stopChan := make(chan struct{})
 
 	go kvstoreBackend.ListAndWatch(ctx, kvstoreListHandler{
-		onAdd: func(id idpool.ID, key allocator.AllocatorKey) {
+		onUpsert: func(id idpool.ID, key allocator.AllocatorKey) {
 			log.Debugf("kvstore listed ID: %+v -> %+v", id, key)
 			identities[id] = key
 		},
@@ -293,11 +293,10 @@ func getKVStoreIdentities(ctx context.Context, kvstoreBackend allocator.Backend)
 
 // kvstoreListHandler is a dummy type to receive callbacks from the kvstore subsystem
 type kvstoreListHandler struct {
-	onAdd      func(id idpool.ID, key allocator.AllocatorKey)
+	onUpsert   func(id idpool.ID, key allocator.AllocatorKey)
 	onListDone func()
 }
 
 func (h kvstoreListHandler) OnListDone()                                       { h.onListDone() }
-func (h kvstoreListHandler) OnAdd(id idpool.ID, key allocator.AllocatorKey)    { h.onAdd(id, key) }
-func (h kvstoreListHandler) OnModify(id idpool.ID, key allocator.AllocatorKey) {}
+func (h kvstoreListHandler) OnUpsert(id idpool.ID, key allocator.AllocatorKey) { h.onUpsert(id, key) }
 func (h kvstoreListHandler) OnDelete(id idpool.ID, key allocator.AllocatorKey) {}

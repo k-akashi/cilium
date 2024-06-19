@@ -260,12 +260,25 @@ func Test_translator_Translate(t *testing.T) {
 			want:          hostNetworkListenersCiliumEnvoyConfig("0.0.0.0", 55555, &slim_metav1.LabelSelector{MatchLabels: map[string]slim_metav1.MatchLabelsValue{"a": "b"}}),
 			wantLBSvcType: corev1.ServiceTypeClusterIP,
 		},
+		{
+			name: "ComplexNodePortIngress",
+			args: args{
+				m: &model.Model{
+					HTTP: complexNodePortIngressListeners,
+				},
+				hostNetworkEnabled:           true,
+				hostNetworkNodeLabelSelector: &slim_metav1.LabelSelector{MatchLabels: map[string]slim_metav1.MatchLabelsValue{"a": "b"}},
+				ipv4Enabled:                  true,
+			},
+			want:          complexNodePortIngressCiliumEnvoyConfig,
+			wantLBSvcType: corev1.ServiceTypeNodePort,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			trans := &dedicatedIngressTranslator{
-				cecTranslator:      translation.NewCECTranslator("cilium-secrets", tt.args.useProxyProtocol, false, 60, tt.args.hostNetworkEnabled, tt.args.hostNetworkNodeLabelSelector, tt.args.ipv4Enabled, tt.args.ipv6Enabled, 0),
+				cecTranslator:      translation.NewCECTranslator("cilium-secrets", tt.args.useProxyProtocol, false, false, 60, tt.args.hostNetworkEnabled, tt.args.hostNetworkNodeLabelSelector, tt.args.ipv4Enabled, tt.args.ipv6Enabled, 0),
 				hostNetworkEnabled: tt.args.hostNetworkEnabled,
 			}
 

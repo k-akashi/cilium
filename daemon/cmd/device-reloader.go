@@ -7,12 +7,14 @@ import (
 	"context"
 	"slices"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
+
 	"github.com/cilium/cilium/pkg/datapath/tables"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/promise"
-	"github.com/cilium/cilium/pkg/statedb"
+	"github.com/cilium/cilium/pkg/rate"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -20,7 +22,7 @@ type deviceReloaderParams struct {
 	cell.In
 
 	Jobs          job.Registry
-	Scope         cell.Scope
+	Health        cell.Health
 	DB            *statedb.DB
 	Daemon        promise.Promise[*Daemon]
 	Config        *option.DaemonConfig
@@ -34,6 +36,7 @@ type deviceReloader struct {
 	devsChanged  <-chan struct{}
 	prevDevices  []string
 	jg           job.Group
+	limiter      *rate.Limiter
 }
 
 // registerDeviceReloader provides the device reloader to the hive. The device reloader reloads the
@@ -45,26 +48,19 @@ type deviceReloader struct {
 // changes have not yet propagated to the NodeAddress changes. Components which depend on both need
 // to live with this fact and come up with component-specific strategies to deal with it.
 func registerDeviceReloader(lc cell.Lifecycle, p deviceReloaderParams) {
-	if !p.Config.EnableRuntimeDeviceDetection {
-		return
-	}
-
 	lc.Append(&deviceReloader{params: p})
 }
 
 // Start listening to changed devices if requested.
 func (d *deviceReloader) Start(ctx cell.HookContext) error {
-	if !d.params.Config.AreDevicesRequired() {
-		log.Info("Runtime device detection requested, but no feature requires it. Disabling detection.")
-		return nil
-	}
-
 	// Force an initial reload by supplying a closed channel.
 	c := make(chan struct{})
 	close(c)
 	d.addrsChanged = c
 
-	jg := d.params.Jobs.NewGroup(d.params.Scope)
+	d.limiter = rate.NewLimiter(time.Millisecond*500, 1)
+
+	jg := d.params.Jobs.NewGroup(d.params.Health)
 	jg.Add(job.Timer("device-reloader", d.reload, time.Second))
 	d.jg = jg
 	return jg.Start(ctx)
@@ -93,6 +89,12 @@ func (d *deviceReloader) reload(ctx context.Context) error {
 		return ctx.Err()
 	}
 
+	// Rate-limit to avoid reinitializing too often and to allow NodeAddress table
+	// to update.
+	if err := d.limiter.Wait(ctx); err != nil {
+		return err
+	}
+
 	// Note that the consumers may see inconsistent state in between updates to
 	// the devices and the node addresses, but that we are eventually
 	// consistent.
@@ -113,12 +115,9 @@ func (d *deviceReloader) reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if daemon.l2announcer != nil {
-		daemon.l2announcer.DevicesChanged(devices)
-	}
 
 	// Reload the datapath.
-	wg, err := daemon.TriggerReloadWithoutCompile("devices changed")
+	wg, err := daemon.TriggerReload("devices changed")
 	if err != nil {
 		log.WithError(err).Warn("Failed to reload datapath")
 	} else {

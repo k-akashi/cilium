@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_PROXY_H_
-#define __LIB_PROXY_H_
+#pragma once
 
 #include "conntrack.h"
 
@@ -28,7 +27,7 @@ assign_socket_tcp(struct __ctx_buff *ctx,
 	if (established && sk->state == BPF_TCP_LISTEN)
 		goto release;
 
-	dbg_ctx = sk->family << 16 | ctx->protocol;
+	dbg_ctx = READ_ONCE(sk)->family << 16 | ctx->protocol;
 	result = sk_assign(ctx, sk, 0);
 	cilium_dbg(ctx, DBG_SK_ASSIGN, -result, dbg_ctx);
 	if (result == 0)
@@ -54,7 +53,7 @@ assign_socket_udp(struct __ctx_buff *ctx,
 	if (!sk)
 		goto out;
 
-	dbg_ctx = sk->family << 16 | ctx->protocol;
+	dbg_ctx = READ_ONCE(sk)->family << 16 | ctx->protocol;
 	result = sk_assign(ctx, sk, 0);
 	cilium_dbg(ctx, DBG_SK_ASSIGN, -result, dbg_ctx);
 	if (result == 0)
@@ -385,4 +384,3 @@ static __always_inline bool tc_index_from_egress_proxy(struct __ctx_buff *ctx)
 
 	return tc_index & TC_INDEX_F_FROM_EGRESS_PROXY;
 }
-#endif /* __LIB_PROXY_H_ */

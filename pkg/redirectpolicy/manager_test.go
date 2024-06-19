@@ -5,46 +5,105 @@ package redirectpolicy
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"net/netip"
+	"sync"
 	"testing"
 
-	. "github.com/cilium/checkmate"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/cilium/cilium/pkg/checker"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/k8s"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slimcorev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/k8s/utils"
 	lb "github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/testutils"
 )
 
-// Hook up gocheck into the "go test" runner.
-func Test(t *testing.T) { TestingT(t) }
-
 type ManagerSuite struct {
 	rpm *Manager
 	svc svcManager
+	epM endpointManager
 }
 
-var _ = Suite(&ManagerSuite{})
+func setupManagerSuite(tb testing.TB) *ManagerSuite {
+	testutils.PrivilegedTest(tb)
 
-func (s *ManagerSuite) SetUpSuite(c *C) {
-	testutils.PrivilegedTest(c)
+	m := &ManagerSuite{}
+	m.svc = &fakeSvcManager{}
+	fpr := &fakePodResource{
+		fakePodStore{},
+	}
+	m.epM = &fakeEpManager{}
+	m.rpm = NewRedirectPolicyManager(m.svc, nil, fpr, m.epM)
+	configAddrType = LRPConfig{
+		id: k8s.ServiceID{
+			Name:      "test-foo",
+			Namespace: "ns1",
+		},
+		lrpType:      lrpConfigTypeAddr,
+		frontendType: addrFrontendSinglePort,
+		frontendMappings: []*feMapping{{
+			feAddr:      fe1,
+			podBackends: nil,
+			fePort:      portName1,
+		}},
+		backendSelector: api.EndpointSelector{
+			LabelSelector: &slim_metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"test": "foo",
+				},
+			},
+		},
+		backendPorts: []bePortInfo{beP1},
+	}
+	configSvcType = LRPConfig{
+		id: k8s.ServiceID{
+			Name:      "test-foo",
+			Namespace: "ns1",
+		},
+		lrpType: lrpConfigTypeSvc,
+		backendSelector: api.EndpointSelector{
+			LabelSelector: &slim_metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"test": "foo",
+				},
+			},
+		},
+	}
+
+	return m
 }
 
 type fakeSvcManager struct {
+	upsertEvents            chan *lb.SVC
+	destroyConnectionEvents chan lb.L3n4Addr
 }
 
 func (f *fakeSvcManager) DeleteService(lb.L3n4Addr) (bool, error) {
 	return true, nil
 }
 
-func (f *fakeSvcManager) UpsertService(*lb.SVC) (bool, lb.ID, error) {
+func (f *fakeSvcManager) UpsertService(s *lb.SVC) (bool, lb.ID, error) {
+	if f.upsertEvents != nil {
+		f.upsertEvents <- s
+	}
 	return true, 1, nil
+}
+
+func (f *fakeSvcManager) TerminateUDPConnectionsToBackend(l3n4Addr *lb.L3n4Addr) {
+	if f.destroyConnectionEvents != nil {
+		f.destroyConnectionEvents <- *l3n4Addr
+	}
 }
 
 type fakePodResource struct {
@@ -63,6 +122,7 @@ func (fpr *fakePodResource) Store(context.Context) (resource.Store[*slimcorev1.P
 
 type fakePodStore struct {
 	OnList func() []*slimcorev1.Pod
+	Pods   map[resource.Key]*slimcorev1.Pod
 }
 
 func (ps *fakePodStore) List() []*slimcorev1.Pod {
@@ -78,6 +138,9 @@ func (ps *fakePodStore) Get(obj *slimcorev1.Pod) (item *slimcorev1.Pod, exists b
 	return nil, false, nil
 }
 func (ps *fakePodStore) GetByKey(key resource.Key) (item *slimcorev1.Pod, exists bool, err error) {
+	if len(ps.Pods) != 0 {
+		return ps.Pods[key], true, nil
+	}
 	return nil, false, nil
 }
 func (ps *fakePodStore) CacheStore() cache.Store { return nil }
@@ -87,6 +150,68 @@ func (ps *fakePodStore) ByIndex(indexName, indexedValue string) ([]*slimcorev1.P
 	return nil, nil
 }
 func (ps *fakePodStore) Release() {
+}
+
+type fakeEpManager struct {
+	cookies map[netip.Addr]uint64
+}
+
+func (ps *fakeEpManager) Subscribe(s endpointmanager.Subscriber) {
+}
+
+func (ps *fakeEpManager) GetEndpointNetnsCookieByIP(ip netip.Addr) (uint64, error) {
+	c, ok := ps.cookies[ip]
+	if !ok {
+		return 0, fmt.Errorf("endpoint not found")
+	}
+	return c, nil
+}
+
+type fakeSkipLBMap struct {
+	lb4Events chan skipLBParams
+	lb6Events chan skipLBParams
+}
+
+type skipLBParams struct {
+	cookie uint64
+	ip     net.IP
+	port   uint16
+}
+
+func (f fakeSkipLBMap) AddLB4(netnsCookie uint64, ip net.IP, port uint16) error {
+	f.lb4Events <- skipLBParams{
+		cookie: netnsCookie,
+		ip:     ip,
+		port:   port,
+	}
+
+	return nil
+}
+
+func (f fakeSkipLBMap) AddLB6(netnsCookie uint64, ip net.IP, port uint16) error {
+	f.lb6Events <- skipLBParams{
+		cookie: netnsCookie,
+		ip:     ip,
+		port:   port,
+	}
+
+	return nil
+}
+
+func (f fakeSkipLBMap) DeleteLB4ByAddrPort(ip net.IP, port uint16) {
+	panic("implement me")
+}
+
+func (f fakeSkipLBMap) DeleteLB6ByAddrPort(ip net.IP, port uint16) {
+	panic("implement me")
+}
+
+func (f fakeSkipLBMap) DeleteLB4ByNetnsCookie(cookie uint64) {
+	panic("implement me")
+}
+
+func (f fakeSkipLBMap) DeleteLB6ByNetnsCookie(cookie uint64) {
+	panic("implement me")
 }
 
 var (
@@ -228,51 +353,10 @@ var (
 	}
 )
 
-func (m *ManagerSuite) SetUpTest(c *C) {
-	m.svc = &fakeSvcManager{}
-	fpr := &fakePodResource{
-		fakePodStore{},
-	}
-	m.rpm = NewRedirectPolicyManager(m.svc, fpr)
-	configAddrType = LRPConfig{
-		id: k8s.ServiceID{
-			Name:      "test-foo",
-			Namespace: "ns1",
-		},
-		lrpType:      lrpConfigTypeAddr,
-		frontendType: addrFrontendSinglePort,
-		frontendMappings: []*feMapping{{
-			feAddr:      fe1,
-			podBackends: nil,
-			fePort:      portName1,
-		}},
-		backendSelector: api.EndpointSelector{
-			LabelSelector: &slim_metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"test": "foo",
-				},
-			},
-		},
-		backendPorts: []bePortInfo{beP1},
-	}
-	configSvcType = LRPConfig{
-		id: k8s.ServiceID{
-			Name:      "test-foo",
-			Namespace: "ns1",
-		},
-		lrpType: lrpConfigTypeSvc,
-		backendSelector: api.EndpointSelector{
-			LabelSelector: &slim_metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"test": "foo",
-				},
-			},
-		},
-	}
-}
-
 // Tests if duplicate addressMatcher configs are not added.
-func (m *ManagerSuite) TestManager_AddRedirectPolicy_AddrMatcherDuplicateConfig(c *C) {
+func TestManager_AddRedirectPolicy_AddrMatcherDuplicateConfig(t *testing.T) {
+	m := setupManagerSuite(t)
+
 	configFe := configAddrType
 	m.rpm.policyFrontendsByHash[fe1.Hash()] = configFe.id
 	dupConfigFe := configFe
@@ -280,12 +364,14 @@ func (m *ManagerSuite) TestManager_AddRedirectPolicy_AddrMatcherDuplicateConfig(
 
 	added, err := m.rpm.AddRedirectPolicy(dupConfigFe)
 
-	c.Assert(added, Equals, false)
-	c.Assert(err, NotNil)
+	require.Equal(t, false, added)
+	require.Error(t, err)
 }
 
 // Tests if duplicate svcMatcher configs are not added.
-func (m *ManagerSuite) TestManager_AddRedirectPolicy_SvcMatcherDuplicateConfig(c *C) {
+func TestManager_AddRedirectPolicy_SvcMatcherDuplicateConfig(t *testing.T) {
+	m := setupManagerSuite(t)
+
 	configSvc := configSvcType
 	configSvc.serviceID = &k8s.ServiceID{
 		Name:      "foo",
@@ -298,13 +384,15 @@ func (m *ManagerSuite) TestManager_AddRedirectPolicy_SvcMatcherDuplicateConfig(c
 
 	added, err := m.rpm.AddRedirectPolicy(invalidConfigSvc)
 
-	c.Assert(added, Equals, false)
-	c.Assert(err, NotNil)
+	require.Equal(t, false, added)
+	require.Error(t, err)
 }
 
 // Tests add redirect policy, add pod, delete pod and delete redirect policy events
 // for an addressMatcher config with a frontend having single port.
-func (m *ManagerSuite) TestManager_AddrMatcherConfigSinglePort(c *C) {
+func TestManager_AddrMatcherConfigSinglePort(t *testing.T) {
+	m := setupManagerSuite(t)
+
 	// Add an addressMatcher type LRP with single port. The policy config
 	// frontend should have 2 pod backends with each of the podIPs.
 	podIPs := utils.ValidIPs(pod1.Status)
@@ -318,21 +406,20 @@ func (m *ManagerSuite) TestManager_AddrMatcherConfigSinglePort(c *C) {
 
 	added, err := m.rpm.AddRedirectPolicy(configAddrType)
 
-	c.Assert(added, Equals, true)
-	c.Assert(err, IsNil)
-	c.Assert(len(m.rpm.policyConfigs), Equals, 1)
-	c.Assert(m.rpm.policyConfigs[configAddrType.id].id.Name, Equals, configAddrType.id.Name)
-	c.Assert(m.rpm.policyConfigs[configAddrType.id].id.Namespace, Equals, configAddrType.id.Namespace)
-	c.Assert(len(m.rpm.policyFrontendsByHash), Equals, 1)
-	c.Assert(m.rpm.policyFrontendsByHash[configAddrType.frontendMappings[0].feAddr.Hash()],
-		Equals, configAddrType.id)
-	c.Assert(len(configAddrType.frontendMappings[0].podBackends), Equals, 2)
+	require.Equal(t, true, added)
+	require.Nil(t, err)
+	require.Equal(t, 1, len(m.rpm.policyConfigs))
+	require.Equal(t, configAddrType.id.Name, m.rpm.policyConfigs[configAddrType.id].id.Name)
+	require.Equal(t, configAddrType.id.Namespace, m.rpm.policyConfigs[configAddrType.id].id.Namespace)
+	require.Equal(t, 1, len(m.rpm.policyFrontendsByHash))
+	require.Equal(t, configAddrType.id, m.rpm.policyFrontendsByHash[configAddrType.frontendMappings[0].feAddr.Hash()])
+	require.Equal(t, 2, len(configAddrType.frontendMappings[0].podBackends))
 	for i := range configAddrType.frontendMappings[0].podBackends {
-		c.Assert(configAddrType.frontendMappings[0].podBackends[i], checker.Equals, expectedbes[i])
+		require.Equal(t, expectedbes[i], configAddrType.frontendMappings[0].podBackends[i])
 	}
-	c.Assert(len(m.rpm.policyPods), Equals, 1)
-	c.Assert(len(m.rpm.policyPods[pod1ID]), Equals, 1)
-	c.Assert(m.rpm.policyPods[pod1ID][0], Equals, configAddrType.id)
+	require.Equal(t, 1, len(m.rpm.policyPods))
+	require.Equal(t, 1, len(m.rpm.policyPods[pod1ID]))
+	require.Equal(t, configAddrType.id, m.rpm.policyPods[pod1ID][0])
 
 	// Add a new backend pod, this will add 2 more pod backends with each of the podIPs.
 	pod3 := pod2.DeepCopy()
@@ -350,60 +437,62 @@ func (m *ManagerSuite) TestManager_AddrMatcherConfigSinglePort(c *C) {
 
 	m.rpm.OnAddPod(pod3)
 
-	c.Assert(len(m.rpm.policyPods), Equals, 2)
-	c.Assert(len(m.rpm.policyPods[pod3ID]), Equals, 1)
-	c.Assert(m.rpm.policyPods[pod1ID][0], Equals, configAddrType.id)
-	c.Assert(len(configAddrType.frontendMappings[0].podBackends), Equals, 4)
+	require.Equal(t, 2, len(m.rpm.policyPods))
+	require.Equal(t, 1, len(m.rpm.policyPods[pod3ID]))
+	require.Equal(t, configAddrType.id, m.rpm.policyPods[pod1ID][0])
+	require.Equal(t, 4, len(configAddrType.frontendMappings[0].podBackends))
 	for i := range configAddrType.frontendMappings[0].podBackends {
-		c.Assert(configAddrType.frontendMappings[0].podBackends[i], checker.Equals, expectedbes2[i])
+		require.Equal(t, expectedbes2[i], configAddrType.frontendMappings[0].podBackends[i])
 	}
 
 	// When pod becomes un-ready
 	pod3.Status.Conditions = []slimcorev1.PodCondition{podNotReady}
 	m.rpm.OnUpdatePod(pod3, false, false)
 
-	c.Assert(len(m.rpm.policyPods), Equals, 2)
-	c.Assert(len(m.rpm.policyPods[pod3ID]), Equals, 1)
-	c.Assert(len(configAddrType.frontendMappings[0].podBackends), Equals, 2)
+	require.Equal(t, 2, len(m.rpm.policyPods))
+	require.Equal(t, 1, len(m.rpm.policyPods[pod3ID]))
+	require.Equal(t, 2, len(configAddrType.frontendMappings[0].podBackends))
 	for i := range configAddrType.frontendMappings[0].podBackends {
-		c.Assert(configAddrType.frontendMappings[0].podBackends[i], checker.Equals, expectedbes[i])
+		require.Equal(t, expectedbes[i], configAddrType.frontendMappings[0].podBackends[i])
 	}
 
 	// When pod becomes ready
 	pod3.Status.Conditions = []slimcorev1.PodCondition{podReady}
 	m.rpm.OnUpdatePod(pod3, false, true)
 
-	c.Assert(len(m.rpm.policyPods), Equals, 2)
-	c.Assert(len(m.rpm.policyPods[pod3ID]), Equals, 1)
-	c.Assert(m.rpm.policyPods[pod1ID][0], Equals, configAddrType.id)
-	c.Assert(len(configAddrType.frontendMappings[0].podBackends), Equals, 4)
+	require.Equal(t, 2, len(m.rpm.policyPods))
+	require.Equal(t, 1, len(m.rpm.policyPods[pod3ID]))
+	require.Equal(t, configAddrType.id, m.rpm.policyPods[pod1ID][0])
+	require.Equal(t, 4, len(configAddrType.frontendMappings[0].podBackends))
 	for i := range configAddrType.frontendMappings[0].podBackends {
-		c.Assert(configAddrType.frontendMappings[0].podBackends[i], checker.Equals, expectedbes2[i])
+		require.Equal(t, expectedbes2[i], configAddrType.frontendMappings[0].podBackends[i])
 	}
 
 	// Delete the pod. This should delete the pod's backends.
 	m.rpm.OnDeletePod(pod3)
 
-	c.Assert(len(m.rpm.policyPods), Equals, 1)
+	require.Equal(t, 1, len(m.rpm.policyPods))
 	_, found := m.rpm.policyPods[pod3ID]
-	c.Assert(found, Equals, false)
-	c.Assert(len(configAddrType.frontendMappings[0].podBackends), Equals, 2)
+	require.Equal(t, false, found)
+	require.Equal(t, 2, len(configAddrType.frontendMappings[0].podBackends))
 	for i := range configAddrType.frontendMappings[0].podBackends {
-		c.Assert(configAddrType.frontendMappings[0].podBackends[i], checker.Equals, expectedbes[i])
+		require.Equal(t, expectedbes[i], configAddrType.frontendMappings[0].podBackends[i])
 	}
 
 	// Delete the LRP.
 	err = m.rpm.DeleteRedirectPolicy(configAddrType)
 
-	c.Assert(err, IsNil)
-	c.Assert(len(m.rpm.policyFrontendsByHash), Equals, 0)
-	c.Assert(len(m.rpm.policyPods), Equals, 0)
-	c.Assert(len(m.rpm.policyConfigs), Equals, 0)
+	require.Nil(t, err)
+	require.Equal(t, 0, len(m.rpm.policyFrontendsByHash))
+	require.Equal(t, 0, len(m.rpm.policyPods))
+	require.Equal(t, 0, len(m.rpm.policyConfigs))
 }
 
 // Tests add redirect policy, add pod, delete pod and delete redirect policy events
 // for an addressMatcher config with a frontend having multiple named ports.
-func (m *ManagerSuite) TestManager_AddrMatcherConfigMultiplePorts(c *C) {
+func TestManager_AddrMatcherConfigMultiplePorts(t *testing.T) {
+	m := setupManagerSuite(t)
+
 	// Add an addressMatcher type LRP with multiple named ports.
 	configAddrType.frontendType = addrFrontendNamedPorts
 	configAddrType.frontendMappings = append(configAddrType.frontendMappings, &feMapping{
@@ -428,20 +517,20 @@ func (m *ManagerSuite) TestManager_AddrMatcherConfigMultiplePorts(c *C) {
 
 	added, err := m.rpm.AddRedirectPolicy(configAddrType)
 
-	c.Assert(added, Equals, true)
-	c.Assert(err, IsNil)
-	c.Assert(len(m.rpm.policyConfigs), Equals, 1)
-	c.Assert(m.rpm.policyConfigs[configAddrType.id].id.Name, Equals, configAddrType.id.Name)
-	c.Assert(m.rpm.policyConfigs[configAddrType.id].id.Namespace, Equals, configAddrType.id.Namespace)
-	c.Assert(len(m.rpm.policyFrontendsByHash), Equals, 2)
+	require.Equal(t, true, added)
+	require.Nil(t, err)
+	require.Equal(t, 1, len(m.rpm.policyConfigs))
+	require.Equal(t, configAddrType.id.Name, m.rpm.policyConfigs[configAddrType.id].id.Name)
+	require.Equal(t, configAddrType.id.Namespace, m.rpm.policyConfigs[configAddrType.id].id.Namespace)
+	require.Equal(t, 2, len(m.rpm.policyFrontendsByHash))
 	for _, id := range m.rpm.policyFrontendsByHash {
-		c.Assert(id, Equals, configAddrType.id)
+		require.Equal(t, configAddrType.id, id)
 	}
 	// Frontend ports should be mapped to the corresponding backend ports.
 	for _, feM := range configAddrType.frontendMappings {
 		switch feM.fePort {
 		case "test1":
-			c.Assert(len(feM.podBackends), Equals, 2)
+			require.Equal(t, 2, len(feM.podBackends))
 			for i := range podIPs {
 				expectedbes[i] = backend{
 					L3n4Addr: lb.L3n4Addr{AddrCluster: cmtypes.MustParseAddrCluster(podIPs[i]), L4Addr: beP1.l4Addr},
@@ -449,10 +538,10 @@ func (m *ManagerSuite) TestManager_AddrMatcherConfigMultiplePorts(c *C) {
 				}
 			}
 			for i := range feM.podBackends {
-				c.Assert(feM.podBackends[i], checker.Equals, expectedbes[i])
+				require.Equal(t, expectedbes[i], feM.podBackends[i])
 			}
 		case "test2":
-			c.Assert(len(feM.podBackends), Equals, 2)
+			require.Equal(t, 2, len(feM.podBackends))
 			for i := range podIPs {
 				expectedbes[i] = backend{
 					L3n4Addr: lb.L3n4Addr{AddrCluster: cmtypes.MustParseAddrCluster(podIPs[i]), L4Addr: beP2.l4Addr},
@@ -460,28 +549,30 @@ func (m *ManagerSuite) TestManager_AddrMatcherConfigMultiplePorts(c *C) {
 				}
 			}
 			for i := range feM.podBackends {
-				c.Assert(feM.podBackends[i], checker.Equals, expectedbes[i])
+				require.Equal(t, expectedbes[i], feM.podBackends[i])
 			}
 		default:
 			log.Errorf("Unknown port %s", feM.fePort)
 		}
 	}
-	c.Assert(len(m.rpm.policyPods), Equals, 1)
-	c.Assert(len(m.rpm.policyPods[pod1ID]), Equals, 1)
-	c.Assert(m.rpm.policyPods[pod1ID][0], Equals, configAddrType.id)
+	require.Equal(t, 1, len(m.rpm.policyPods))
+	require.Equal(t, 1, len(m.rpm.policyPods[pod1ID]))
+	require.Equal(t, configAddrType.id, m.rpm.policyPods[pod1ID][0])
 
 	// Delete the LRP.
 	err = m.rpm.DeleteRedirectPolicy(configAddrType)
 
-	c.Assert(err, IsNil)
-	c.Assert(len(m.rpm.policyFrontendsByHash), Equals, 0)
-	c.Assert(len(m.rpm.policyPods), Equals, 0)
-	c.Assert(len(m.rpm.policyConfigs), Equals, 0)
+	require.Nil(t, err)
+	require.Equal(t, 0, len(m.rpm.policyFrontendsByHash))
+	require.Equal(t, 0, len(m.rpm.policyPods))
+	require.Equal(t, 0, len(m.rpm.policyConfigs))
 }
 
 // Tests if frontend ipv4 and ipv6 addresses are mapped to the ipv4 and ipv6
 // backends, respectively.
-func (m *ManagerSuite) TestManager_AddrMatcherConfigDualStack(c *C) {
+func TestManager_AddrMatcherConfigDualStack(t *testing.T) {
+	m := setupManagerSuite(t)
+
 	// Only ipv4 backend(s) for ipv4 frontend
 	pod3 := pod1.DeepCopy()
 	pod3ID := pod1ID
@@ -510,13 +601,11 @@ func (m *ManagerSuite) TestManager_AddrMatcherConfigDualStack(c *C) {
 
 	added, err := m.rpm.AddRedirectPolicy(configAddrType)
 
-	c.Assert(added, Equals, true)
-	c.Assert(err, IsNil)
-	c.Assert(len(configAddrType.frontendMappings[0].podBackends), Equals,
-		len(expectedbes4))
+	require.Equal(t, true, added)
+	require.Nil(t, err)
+	require.Equal(t, len(expectedbes4), len(configAddrType.frontendMappings[0].podBackends))
 	for i := range configAddrType.frontendMappings[0].podBackends {
-		c.Assert(configAddrType.frontendMappings[0].podBackends[i], checker.Equals,
-			expectedbes4[i])
+		require.Equal(t, expectedbes4[i], configAddrType.frontendMappings[0].podBackends[i])
 	}
 
 	// Only ipv6 backend(s) for ipv6 frontend
@@ -529,18 +618,19 @@ func (m *ManagerSuite) TestManager_AddrMatcherConfigDualStack(c *C) {
 
 	added, err = m.rpm.AddRedirectPolicy(configAddrType)
 
-	c.Assert(added, Equals, true)
-	c.Assert(err, IsNil)
-	c.Assert(len(configAddrType.frontendMappings[0].podBackends), Equals,
-		len(expectedbes6))
+	require.Equal(t, true, added)
+	require.Nil(t, err)
+	require.Equal(t, len(expectedbes6), len(configAddrType.frontendMappings[0].podBackends))
+
 	for i := range configAddrType.frontendMappings[0].podBackends {
-		c.Assert(configAddrType.frontendMappings[0].podBackends[i], checker.Equals,
-			expectedbes6[i])
+		require.Equal(t, expectedbes6[i], configAddrType.frontendMappings[0].podBackends[i])
 	}
 }
 
 // Tests add and update pod operations with namespace mismatched pods.
-func (m *ManagerSuite) TestManager_OnAddandUpdatePod(c *C) {
+func TestManager_OnAddandUpdatePod(t *testing.T) {
+	m := setupManagerSuite(t)
+
 	configFe := configAddrType
 	m.rpm.policyFrontendsByHash[fe1.Hash()] = configFe.id
 	configSvc := configSvcType
@@ -555,14 +645,335 @@ func (m *ManagerSuite) TestManager_OnAddandUpdatePod(c *C) {
 	m.rpm.OnAddPod(pod)
 
 	// Namespace mismatched pod not selected.
-	c.Assert(len(m.rpm.policyPods), Equals, 0)
+	require.Equal(t, 0, len(m.rpm.policyPods))
 	_, found := m.rpm.policyPods[podID]
-	c.Assert(found, Equals, false)
+	require.Equal(t, false, found)
 
 	m.rpm.OnUpdatePod(pod, true, true)
 
 	// Namespace mismatched pod not selected.
-	c.Assert(len(m.rpm.policyPods), Equals, 0)
+	require.Equal(t, 0, len(m.rpm.policyPods))
 	_, found = m.rpm.policyPods[podID]
-	c.Assert(found, Equals, false)
+	require.Equal(t, false, found)
+}
+
+// Tests policies with skipRedirectFromBackend flag set.
+func TestManager_OnAddRedirectPolicy(t *testing.T) {
+	m := setupManagerSuite(t)
+
+	// Sequence of events: Pods -> RedirectPolicy -> Endpoint
+	sMgr := &fakeSvcManager{}
+	sMgr.upsertEvents = make(chan *lb.SVC)
+	m.svc = sMgr
+	lbEvents := make(chan skipLBParams)
+	pc := configAddrType
+	pc.skipRedirectFromBackend = true
+	pods := make(map[resource.Key]*slimcorev1.Pod)
+	pk1 := resource.Key{
+		Name:      pod1.Name,
+		Namespace: pod1.Namespace,
+	}
+	pod := pod1.DeepCopy()
+	pod.Status.PodIPs = []slimcorev1.PodIP{pod1IP1}
+	pods[pk1] = pod
+	fps := &fakePodResource{
+		fakePodStore{
+			Pods: pods,
+		},
+	}
+	m.rpm.localPods = fps
+	ep := &endpoint.Endpoint{
+		K8sPodName:   pod.Name,
+		K8sNamespace: pod.Namespace,
+		NetNsCookie:  1234,
+	}
+	m.rpm = NewRedirectPolicyManager(m.svc, nil, fps, m.epM)
+	m.rpm.skipLBMap = &fakeSkipLBMap{lb4Events: lbEvents}
+
+	added, err := m.rpm.AddRedirectPolicy(pc)
+
+	require.Equal(t, true, added)
+	require.Nil(t, err)
+
+	wg := sync.WaitGroup{}
+	// Asserts skipLBMap events
+	wg.Add(1)
+	go func() {
+		ev := <-lbEvents
+
+		require.Equal(t, ep.NetNsCookie, ev.cookie)
+		require.Equal(t, fe1.AddrCluster.Addr().String(), ev.ip.String())
+		require.Equal(t, fe1.L4Addr.Port, ev.port)
+
+		wg.Done()
+	}()
+	// Asserts UpsertService events
+	wg.Add(1)
+	go func() {
+		ev := <-sMgr.upsertEvents
+
+		require.Equal(t, lb.SVCTypeLocalRedirect, ev.Type)
+		require.Equal(t, configAddrType.frontendMappings[0].feAddr.String(), ev.Frontend.String())
+		require.Equal(t, 1, len(ev.Backends))
+		require.Equal(t, backend{
+			L3n4Addr: lb.L3n4Addr{AddrCluster: cmtypes.MustParseAddrCluster(pod1.Status.PodIP), L4Addr: beP1.l4Addr},
+			podID:    pod1ID,
+		}.Hash(), ev.Backends[0].Hash())
+
+		wg.Done()
+	}()
+
+	// Add an endpoint for the policy selected pod.
+	m.rpm.EndpointCreated(ep)
+
+	// Wait for the skipLBMap and Upsert service events
+	wg.Wait()
+
+	// Sequence of events: Pod -> Endpoint -> RedirectPolicy
+	sMgr = &fakeSvcManager{}
+	sMgr.upsertEvents = make(chan *lb.SVC)
+	m.svc = sMgr
+	pod = pod1.DeepCopy()
+	pod.Status.PodIPs = []slimcorev1.PodIP{pod1IP1}
+	cookie := uint64(1235)
+	ep = &endpoint.Endpoint{
+		K8sPodName:   pod1.Name,
+		K8sNamespace: pod1.Namespace,
+		NetNsCookie:  cookie,
+	}
+	cookies := map[netip.Addr]uint64{}
+	addr, _ := netip.ParseAddr(pod.Status.PodIP)
+	cookies[addr] = cookie
+	m.epM = &fakeEpManager{cookies: cookies}
+	fps = &fakePodResource{
+		fakePodStore{
+			OnList: func() []*slimcorev1.Pod {
+				return []*slimcorev1.Pod{pod}
+			},
+		},
+	}
+	m.rpm = NewRedirectPolicyManager(m.svc, nil, fps, m.epM)
+	lbEvents = make(chan skipLBParams)
+	m.rpm.skipLBMap = &fakeSkipLBMap{lb4Events: lbEvents}
+
+	wg = sync.WaitGroup{}
+	// Asserts skipLBMap events
+	wg.Add(1)
+	go func() {
+		ev := <-lbEvents
+
+		require.Equal(t, cookie, ev.cookie)
+		require.Equal(t, fe1.AddrCluster.Addr().String(), ev.ip.String())
+		require.Equal(t, fe1.L4Addr.Port, ev.port)
+
+		wg.Done()
+	}()
+	// Asserts UpsertService events
+	wg.Add(1)
+	go func() {
+		ev := <-sMgr.upsertEvents
+
+		require.Equal(t, lb.SVCTypeLocalRedirect, ev.Type)
+		require.Equal(t, configAddrType.frontendMappings[0].feAddr.String(), ev.Frontend.String())
+		require.Equal(t, 1, len(ev.Backends))
+		require.Equal(t, backend{
+			L3n4Addr: lb.L3n4Addr{AddrCluster: cmtypes.MustParseAddrCluster(pod.Status.PodIP), L4Addr: beP1.l4Addr},
+			podID:    pod1ID,
+		}.Hash(), ev.Backends[0].Hash())
+
+		wg.Done()
+	}()
+
+	// Policy is added.
+	added, err = m.rpm.AddRedirectPolicy(pc)
+
+	require.Equal(t, true, added)
+	require.Nil(t, err)
+
+	wg.Wait()
+
+	// Sequence of events: RedirectPolicy -> Pod -> Endpoint
+	sMgr = &fakeSvcManager{}
+	sMgr.upsertEvents = make(chan *lb.SVC)
+	m.svc = sMgr
+	pod = pod1.DeepCopy()
+	pod.Status.PodIPs = []slimcorev1.PodIP{pod1IP1}
+	cookie = uint64(1235)
+	ep = &endpoint.Endpoint{
+		K8sPodName:   pod1.Name,
+		K8sNamespace: pod1.Namespace,
+		NetNsCookie:  cookie,
+	}
+	m.epM = &fakeEpManager{}
+	pods = make(map[resource.Key]*slimcorev1.Pod)
+	pk1 = resource.Key{
+		Name:      pod1.Name,
+		Namespace: pod1.Namespace,
+	}
+	pods[pk1] = pod
+	fps = &fakePodResource{
+		fakePodStore{
+			Pods: pods,
+		},
+	}
+	m.rpm = NewRedirectPolicyManager(m.svc, nil, fps, m.epM)
+	lbEvents = make(chan skipLBParams)
+	m.rpm.skipLBMap = &fakeSkipLBMap{lb4Events: lbEvents}
+
+	wg = sync.WaitGroup{}
+	// Asserts skipLBMap events
+	wg.Add(1)
+	go func() {
+		ev := <-lbEvents
+
+		require.Equal(t, cookie, ev.cookie)
+		require.Equal(t, fe1.AddrCluster.Addr().String(), ev.ip.String())
+		require.Equal(t, fe1.L4Addr.Port, ev.port)
+
+		wg.Done()
+	}()
+	// Asserts UpsertService events
+	wg.Add(1)
+	go func() {
+		ev := <-sMgr.upsertEvents
+
+		require.Equal(t, lb.SVCTypeLocalRedirect, ev.Type)
+		require.Equal(t, configAddrType.frontendMappings[0].feAddr.String(), ev.Frontend.String())
+		require.Equal(t, 1, len(ev.Backends))
+		require.Equal(t, backend{
+			L3n4Addr: lb.L3n4Addr{AddrCluster: cmtypes.MustParseAddrCluster(pod.Status.PodIP), L4Addr: beP1.l4Addr},
+			podID:    pod1ID,
+		}.Hash(), ev.Backends[0].Hash())
+
+		wg.Done()
+	}()
+
+	// Policy is added.
+	added, err = m.rpm.AddRedirectPolicy(pc)
+	require.Equal(t, true, added)
+	require.Nil(t, err)
+
+	// Pod selected by the policy added.
+	m.rpm.OnAddPod(pod)
+
+	// Add an endpoint for the policy selected pod.
+	m.rpm.EndpointCreated(ep)
+
+	wg.Wait()
+}
+
+// Tests connections to deleted LRP backend pods getting terminated.
+func TestManager_OnDeletePod(t *testing.T) {
+	m := setupManagerSuite(t)
+
+	option.Config.EnableSocketLB = true
+	// Create an unbuffered channel so that the test blocks on unexpected events.
+	events := make(chan lb.L3n4Addr)
+	m.rpm.svcManager = &fakeSvcManager{destroyConnectionEvents: events}
+	labels := map[string]string{"test": "foo-bar-term"}
+	podUDP := &slimcorev1.Pod{
+		ObjectMeta: slim_metav1.ObjectMeta{
+			Name:      "foo-be",
+			Namespace: "ns1",
+			Labels:    labels,
+		},
+		Spec: slimcorev1.PodSpec{
+			Containers: []slimcorev1.Container{
+				{
+					Ports: []slimcorev1.ContainerPort{
+						{
+							Name:          portName1,
+							ContainerPort: pod2Port1,
+							Protocol:      pod2Proto2,
+						},
+						{
+							Name:          portName2,
+							ContainerPort: pod2Port2,
+							Protocol:      pod2Proto2,
+						},
+					},
+				},
+			},
+		},
+		Status: slimcorev1.PodStatus{
+			PodIP:      pod2IP1.IP,
+			PodIPs:     []slimcorev1.PodIP{pod2IP1},
+			Conditions: []slimcorev1.PodCondition{podReady},
+		},
+	}
+	beUDPP1 := bePortInfo{
+		l4Addr: lb.L4Addr{
+			Protocol: udpStr,
+			Port:     uint16(podUDP.Spec.Containers[0].Ports[0].ContainerPort),
+		},
+		name: portName1,
+	}
+	beUDPP2 := bePortInfo{
+		l4Addr: lb.L4Addr{
+			Protocol: udpStr,
+			Port:     uint16(podUDP.Spec.Containers[0].Ports[1].ContainerPort),
+		},
+		name: portName2,
+	}
+	beAddrs := sets.New[lb.L3n4Addr]()
+	beAddrs.Insert(lb.L3n4Addr{
+		AddrCluster: cmtypes.MustParseAddrCluster(podUDP.Status.PodIP), L4Addr: beUDPP1.l4Addr})
+	beAddrs.Insert(lb.L3n4Addr{
+		AddrCluster: cmtypes.MustParseAddrCluster(podUDP.Status.PodIP), L4Addr: beUDPP2.l4Addr})
+	pc := LRPConfig{
+		id: k8s.ServiceID{
+			Name:      "test-foo",
+			Namespace: "ns1",
+		},
+		lrpType:      lrpConfigTypeAddr,
+		frontendType: addrFrontendNamedPorts,
+		frontendMappings: []*feMapping{{
+			feAddr:      fe2,
+			podBackends: nil,
+			fePort:      beUDPP1.name,
+		}, {
+			feAddr:      fe2,
+			podBackends: nil,
+			fePort:      beUDPP2.name,
+		}},
+		backendSelector: api.EndpointSelector{
+			LabelSelector: &slim_metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+		},
+		backendPorts: []bePortInfo{beUDPP1, beUDPP2},
+		backendPortsByPortName: map[string]*bePortInfo{
+			beUDPP1.name: &beUDPP1,
+			beUDPP2.name: &beUDPP2,
+		},
+	}
+
+	// Add an LRP.
+	added, err := m.rpm.AddRedirectPolicy(pc)
+
+	require.True(t, added)
+	require.NoError(t, err)
+
+	// Add LRP selected pod with UDP ports.
+	m.rpm.OnAddPod(podUDP)
+	// Assert connection termination events asynchronously.
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	got := 0
+	go func() {
+		for {
+			addr := <-events
+			if beAddrs.Has(addr) {
+				got++
+			}
+			if got == beAddrs.Len() {
+				wg.Done()
+				break
+			}
+		}
+	}()
+	// Delete the pod.
+	m.rpm.OnDeletePod(podUDP)
+
+	wg.Wait()
 }

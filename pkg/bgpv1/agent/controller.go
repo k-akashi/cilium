@@ -6,16 +6,16 @@ package agent
 import (
 	"context"
 	"fmt"
-	"runtime/pprof"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
 	"github.com/sirupsen/logrus"
-	"k8s.io/client-go/util/workqueue"
 
 	daemon_k8s "github.com/cilium/cilium/daemon/k8s"
+	"github.com/cilium/cilium/pkg/bgpv1/agent/mode"
 	"github.com/cilium/cilium/pkg/bgpv1/agent/signaler"
+	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	v2_api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
@@ -24,6 +24,7 @@ import (
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 var (
@@ -64,6 +65,9 @@ type Controller struct {
 	// PolicyLister is an interface which allows for the listing of all known policies
 	PolicyLister policyLister
 
+	// BGP v2 node store
+	BGPNodeConfigStore store.BGPCPResourceStore[*v2alpha1api.CiliumBGPNodeConfig]
+
 	// Sig informs the Controller that a Kubernetes
 	// event of interest has occurred.
 	//
@@ -75,8 +79,9 @@ type Controller struct {
 	// BGPMgr is an implementation of the BGPRouterManager interface
 	// and provides a declarative API for configuring BGP peers.
 	BGPMgr BGPRouterManager
-	// PolicyApplied indicates whether the policy is applied to the node or not
-	policyApplied bool
+
+	// current configuration state
+	ConfigMode *mode.ConfigMode
 }
 
 // ControllerParams contains all parameters needed to construct a Controller
@@ -84,12 +89,14 @@ type ControllerParams struct {
 	cell.In
 
 	Lifecycle               cell.Lifecycle
-	Scope                   cell.Scope
-	JobRegistry             job.Registry
+	Health                  cell.Health
+	JobGroup                job.Group
 	Shutdowner              hive.Shutdowner
 	Sig                     *signaler.BGPCPSignaler
+	ConfigMode              *mode.ConfigMode
 	RouteMgr                BGPRouterManager
 	PolicyResource          resource.Resource[*v2alpha1api.CiliumBGPPeeringPolicy]
+	BGPNodeConfigStore      store.BGPCPResourceStore[*v2alpha1api.CiliumBGPNodeConfig]
 	DaemonConfig            *option.DaemonConfig
 	LocalCiliumNodeResource daemon_k8s.LocalCiliumNodeResource
 }
@@ -111,19 +118,15 @@ func NewController(params ControllerParams) (*Controller, error) {
 
 	c := &Controller{
 		Sig:                params.Sig,
+		ConfigMode:         params.ConfigMode,
 		BGPMgr:             params.RouteMgr,
 		PolicyResource:     params.PolicyResource,
+		BGPNodeConfigStore: params.BGPNodeConfigStore,
 		CiliumNodeResource: params.LocalCiliumNodeResource,
 	}
 
-	jobGroup := params.JobRegistry.NewGroup(
-		params.Scope,
-		job.WithLogger(log),
-		job.WithPprofLabels(pprof.Labels("cell", "bgp-cp")),
-	)
-
-	jobGroup.Add(
-		job.OneShot("bgp-policy-observer", func(ctx context.Context, health cell.HealthReporter) (err error) {
+	params.JobGroup.Add(
+		job.OneShot("bgp-policy-observer", func(ctx context.Context, health cell.Health) (err error) {
 			for ev := range c.PolicyResource.Events(ctx) {
 				switch ev.Kind {
 				case resource.Upsert, resource.Delete:
@@ -135,7 +138,7 @@ func NewController(params ControllerParams) (*Controller, error) {
 			return nil
 		}),
 
-		job.OneShot("cilium-node-observer", func(ctx context.Context, health cell.HealthReporter) (err error) {
+		job.OneShot("cilium-node-observer", func(ctx context.Context, health cell.Health) (err error) {
 			for ev := range c.CiliumNodeResource.Events(ctx) {
 				switch ev.Kind {
 				case resource.Upsert:
@@ -149,22 +152,25 @@ func NewController(params ControllerParams) (*Controller, error) {
 			return nil
 		}),
 
-		job.OneShot("bgp-controller", func(ctx context.Context, health cell.HealthReporter) (err error) {
-			// initialize PolicyLister used in the controller
-			policyStore, err := c.PolicyResource.Store(ctx)
-			if err != nil {
-				return fmt.Errorf("error creating CiliumBGPPeeringPolicy resource store: %w", err)
-			}
-			c.PolicyLister = policyListerFunc(func() ([]*v2alpha1api.CiliumBGPPeeringPolicy, error) {
-				return policyStore.List(), nil
-			})
-			// run the controller
-			c.Run(ctx)
-			return nil
-		}, job.WithRetry(3, workqueue.DefaultControllerRateLimiter()), job.WithShutdown()),
+		job.OneShot("bgp-controller",
+			func(ctx context.Context, health cell.Health) (err error) {
+				// initialize PolicyLister used in the controller
+				policyStore, err := c.PolicyResource.Store(ctx)
+				if err != nil {
+					return fmt.Errorf("error creating CiliumBGPPeeringPolicy resource store: %w", err)
+				}
+				c.PolicyLister = policyListerFunc(func() ([]*v2alpha1api.CiliumBGPPeeringPolicy, error) {
+					return policyStore.List(), nil
+				})
+
+				// run the controller
+				c.Run(ctx)
+				return nil
+			},
+			job.WithRetry(3, &job.ExponentialBackoff{Min: 100 * time.Millisecond, Max: time.Second}),
+			job.WithShutdown()),
 	)
 
-	params.Lifecycle.Append(jobGroup)
 	return c, nil
 }
 
@@ -200,6 +206,132 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
+// Reconcile is the main reconciliation loop for the BGP Control Plane Controller.
+// It is responsible for determining the current mode of BGP control plane, which can be disabled, bgpv1 or bgpv2.
+// Based on presence of BGP peering policy and BGP node config, it will apply the appropriate configuration.
+// Following is the state transition table for the controller:
+// Initial state         | BGPPP exists | BGPNC exists | Action	                    | Next state
+// ----------------------|--------------|--------------|----------------------------|-----------
+// disabled              | true         | don't care   | Apply BGPv1                | bgpv1
+// disabled              | false        | true         | Apply BGPv2                | bgpv2
+// disabled              | false        | false        | Do nothing                 | disabled
+// bgpv1                 | true         | don't care   | Apply BGPv1                | bgpv1
+// bgpv1                 | false        | true         | Delete BGPv1, Apply BGPv2  | bgpv2
+// bgpv1                 | false        | false        | Delete BGPv1               | disabled
+// bgpv2                 | true         | don't care   | Delete BGPv2, Apply BGPv1  | bgpv1
+// bgpv2                 | false        | true         | Apply BGPv2                | bgpv2
+// bgpv2                 | false        | false        | Delete BGPv2               | disabled
+func (c *Controller) Reconcile(ctx context.Context) error {
+	bgpp, err := c.bgppSelection()
+	if err != nil {
+		log.WithError(err).Error("bgp peering policy selection failed")
+		return err
+	}
+	bgppExists := bgpp != nil
+
+	bgpnc, bgpncExists, err := c.BGPNodeConfigStore.GetByKey(resource.Key{
+		Name: c.LocalCiliumNode.Name,
+	})
+	if err != nil {
+		log.WithError(err).Error("failed to get BGPNodeConfig")
+		return err
+	}
+
+	switch c.ConfigMode.Get() {
+	case mode.Disabled:
+		if bgppExists {
+			err = c.reconcileBGPP(ctx, bgpp)
+		} else if bgpncExists {
+			err = c.reconcileBGPNC(ctx, bgpnc)
+		}
+
+	case mode.BGPv1:
+		if bgppExists {
+			err = c.reconcileBGPP(ctx, bgpp)
+		} else {
+			c.cleanupBGPP(ctx)
+
+			// check if we need to reconcile bgpv2
+			if bgpncExists {
+				err = c.reconcileBGPNC(ctx, bgpnc)
+			}
+		}
+
+	case mode.BGPv2:
+		if bgppExists {
+			// delete bgpv2 and apply bgpv1
+			c.cleanupBGPNC(ctx)
+			err = c.reconcileBGPP(ctx, bgpp)
+		} else if bgpncExists {
+			err = c.reconcileBGPNC(ctx, bgpnc)
+		} else {
+			c.cleanupBGPNC(ctx)
+		}
+	}
+	return err
+}
+
+func (c *Controller) reconcileBGPP(ctx context.Context, policy *v2alpha1api.CiliumBGPPeeringPolicy) error {
+	// apply policy defaults to have consistent default config across sub-systems
+	policy = policy.DeepCopy() // deepcopy to not modify the policy object in store
+	policy.SetDefaults()
+
+	err := c.validatePolicy(policy)
+	if err != nil {
+		return fmt.Errorf("invalid BGP peering policy %s: %w", policy.Name, err)
+	}
+
+	// call bgp sub-systems required to apply this policy's BGP topology.
+	if err := c.BGPMgr.ConfigurePeers(ctx, policy, c.LocalCiliumNode); err != nil {
+		return fmt.Errorf("failed to configure BGP peers, cannot apply BGP peering policy: %w", err)
+	}
+
+	c.ConfigMode.Set(mode.BGPv1)
+	return nil
+}
+
+func (c *Controller) cleanupBGPP(ctx context.Context) {
+	err := c.BGPMgr.ConfigurePeers(ctx, nil, nil)
+	if err != nil {
+		// log cleanup error
+		log.WithError(err).Error("failed to cleanup BGP peering policy peers")
+	}
+
+	c.ConfigMode.Set(mode.Disabled)
+}
+
+func (c *Controller) reconcileBGPNC(ctx context.Context, bgpnc *v2alpha1api.CiliumBGPNodeConfig) error {
+	err := c.BGPMgr.ReconcileInstances(ctx, bgpnc, c.LocalCiliumNode)
+	if err != nil {
+		return fmt.Errorf("failed to reconcile BGPNodeConfig: %w", err)
+	}
+
+	c.ConfigMode.Set(mode.BGPv2)
+	return nil
+}
+
+func (c *Controller) cleanupBGPNC(ctx context.Context) {
+	err := c.BGPMgr.ReconcileInstances(ctx, nil, c.LocalCiliumNode)
+	if err != nil {
+		log.WithError(err).Error("failed to cleanup BGPNodeConfig")
+	}
+
+	c.ConfigMode.Set(mode.Disabled)
+}
+
+func (c *Controller) bgppSelection() (*v2alpha1api.CiliumBGPPeeringPolicy, error) {
+	// retrieve all CiliumBGPPeeringPolicies
+	policies, err := c.PolicyLister.List()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list CiliumBGPPeeringPolicies")
+	}
+
+	// perform policy selection based on node.
+	labels := c.LocalCiliumNode.Labels
+
+	return PolicySelection(labels, policies)
+}
+
 // PolicySelection returns a CiliumBGPPeeringPolicy which applies to the provided
 // *corev1.Node, enforced by a set of policy selection rules.
 //
@@ -210,7 +342,7 @@ func (c *Controller) Run(ctx context.Context) {
 //   - If (N > 1) policies match the provided *corev1.Node an error is returned.
 //     only a single policy may apply to a node to avoid ambiguity at this stage
 //     of development.
-func PolicySelection(ctx context.Context, labels map[string]string, policies []*v2alpha1api.CiliumBGPPeeringPolicy) (*v2alpha1api.CiliumBGPPeeringPolicy, error) {
+func PolicySelection(labels map[string]string, policies []*v2alpha1api.CiliumBGPPeeringPolicy) (*v2alpha1api.CiliumBGPPeeringPolicy, error) {
 	var (
 		l = log.WithFields(logrus.Fields{
 			"component": "PolicySelection",
@@ -257,78 +389,6 @@ func PolicySelection(ctx context.Context, labels map[string]string, policies []*
 	}
 
 	return selectedPolicy, nil
-}
-
-// Reconcile is the control loop for the Controller.
-//
-// Reconcile will be invoked when one or more event sources trigger a signal
-// via the Controller's Signaler structure.
-//
-// On signal, Reconcile will obtain the state of the world necessary to drive
-// the BGP control plane toward any new BGP peering policies.
-//
-// Reconcile will only allow a single CiliumBGPPeeringPolicy to apply to the
-// node its running on.
-func (c *Controller) Reconcile(ctx context.Context) error {
-	var (
-		l = log.WithFields(logrus.Fields{
-			"component": "Controller.Reconcile",
-		})
-	)
-
-	if c.LocalCiliumNode == nil {
-		return fmt.Errorf("attempted reconciliation with nil local CiliumNode")
-	}
-	if c.PolicyLister == nil {
-		return fmt.Errorf("attempted reconciliation with nil PolicyLister")
-	}
-
-	// retrieve all CiliumBGPPeeringPolicies
-	policies, err := c.PolicyLister.List()
-	if err != nil {
-		return fmt.Errorf("failed to list CiliumBGPPeeringPolicies")
-	}
-
-	// perform policy selection based on node.
-	labels := c.LocalCiliumNode.Labels
-	policy, err := PolicySelection(ctx, labels, policies)
-	if err != nil {
-		l.WithError(err).Error("Policy selection failed")
-		c.FullWithdrawal(ctx)
-		return err
-	}
-	if policy == nil {
-		if c.policyApplied {
-			l.Info("No CiliumBGPPeeringPolicy applies to this node anymore. Removing all virtual router instances.")
-			c.FullWithdrawal(ctx)
-			c.policyApplied = false
-		}
-		return nil
-	}
-
-	// apply policy defaults to have consistent default config across sub-systems
-	policy = policy.DeepCopy() // deepcopy to not modify the policy object in store
-	policy.SetDefaults()
-
-	err = c.validatePolicy(policy)
-	if err != nil {
-		return fmt.Errorf("invalid BGP peering policy %s: %w", policy.Name, err)
-	}
-
-	// call bgp sub-systems required to apply this policy's BGP topology.
-	if err := c.BGPMgr.ConfigurePeers(ctx, policy, c.LocalCiliumNode); err != nil {
-		return fmt.Errorf("failed to configure BGP peers, cannot apply BGP peering policy: %w", err)
-	}
-
-	c.policyApplied = true
-
-	return nil
-}
-
-// FullWithdrawal will instruct the configured BGPRouterManager to withdraw all
-// BGP servers and peers.
-func (c *Controller) FullWithdrawal(ctx context.Context) {
-	_ = c.BGPMgr.ConfigurePeers(ctx, nil, nil) // cannot fail, no need for error handling
 }
 
 // validatePolicy validates the CiliumBGPPeeringPolicy.

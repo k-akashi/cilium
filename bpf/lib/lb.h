@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LB_H_
-#define __LB_H_
+#pragma once
 
 #include "bpf/compiler.h"
 #include "csum.h"
@@ -194,6 +193,10 @@ struct {
 #define cilium_dbg_lb(a, b, c, d)
 #endif
 
+#ifdef ENABLE_ACTIVE_CONNECTION_TRACKING
+#include "act.h"
+#endif
+
 static __always_inline bool lb_is_svc_proto(__u8 proto)
 {
 	switch (proto) {
@@ -348,6 +351,12 @@ bool lb4_svc_is_localredirect(const struct lb4_service *svc)
 {
 	return svc->flags2 & SVC_FLAG_LOCALREDIRECT;
 }
+
+static __always_inline
+bool lb6_svc_is_localredirect(const struct lb6_service *svc)
+{
+	return svc->flags2 & SVC_FLAG_LOCALREDIRECT;
+}
 #endif /* ENABLE_LOCAL_REDIRECT_POLICY */
 
 static __always_inline
@@ -441,7 +450,7 @@ static __always_inline int __lb6_rev_nat(struct __ctx_buff *ctx, int l4_off,
 					 struct lb6_reverse_nat *nat)
 {
 	struct csum_offset csum_off = {};
-	union v6addr old_saddr;
+	union v6addr old_saddr __align_stack_8;
 	__be32 sum;
 	int ret;
 
@@ -876,6 +885,9 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 	/* See lb4_local comments re svc endpoint lookup process */
 	ret = ct_lazy_lookup6(map, tuple, ctx, l4_off, CT_SERVICE,
 			      SCOPE_REVERSE, CT_ENTRY_SVC, state, &monitor);
+	if (ret < 0)
+		goto drop_err;
+
 	switch (ret) {
 	case CT_NEW:
 		if (unlikely(svc->count == 0))
@@ -907,6 +919,10 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 		if (IS_ERR(ret))
 			goto drop_err;
 
+#ifdef ENABLE_ACTIVE_CONNECTION_TRACKING
+		_lb_act_conn_open(ct_state->rev_nat_index, backend->zone);
+#endif
+
 		break;
 	case CT_REPLY:
 		backend_id = state->backend_id;
@@ -916,6 +932,10 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 		 * session we are likely to get a TCP RST.
 		 */
 		backend = lb6_lookup_backend(ctx, backend_id);
+#ifdef ENABLE_ACTIVE_CONNECTION_TRACKING
+		if (state->closing && backend)
+			_lb_act_conn_closed(svc->rev_nat_index, backend->zone);
+#endif
 		if (unlikely(!backend || backend->flags != BE_STATE_ACTIVE)) {
 			/* Drain existing connections, but redirect new ones to only
 			 * active backends.
@@ -1518,6 +1538,9 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 
 	ret = ct_lazy_lookup4(map, tuple, ctx, is_fragment, l4_off, has_l4_header,
 			      CT_SERVICE, SCOPE_REVERSE, CT_ENTRY_SVC, state, &monitor);
+	if (ret < 0)
+		goto drop_err;
+
 	switch (ret) {
 	case CT_NEW:
 		if (unlikely(svc->count == 0))
@@ -1550,6 +1573,10 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 		if (IS_ERR(ret))
 			goto drop_err;
 
+#ifdef ENABLE_ACTIVE_CONNECTION_TRACKING
+		_lb_act_conn_open(state->rev_nat_index, backend->zone);
+#endif
+
 		break;
 	case CT_REPLY:
 		backend_id = state->backend_id;
@@ -1559,6 +1586,10 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 		 * session we are likely to get a TCP RST.
 		 */
 		backend = lb4_lookup_backend(ctx, backend_id);
+#ifdef ENABLE_ACTIVE_CONNECTION_TRACKING
+		if (state->closing && backend)
+			_lb_act_conn_closed(svc->rev_nat_index, backend->zone);
+#endif
 		if (unlikely(!backend || backend->flags != BE_STATE_ACTIVE)) {
 			/* Drain existing connections, but redirect new ones to only
 			 * active backends.
@@ -2057,4 +2088,3 @@ __sock_cookie sock_local_cookie(struct bpf_sock_addr *ctx)
        return ctx->protocol == IPPROTO_TCP ? get_prandom_u32() : 0;
 #endif
 }
-#endif /* __LB_H_ */

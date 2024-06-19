@@ -5,12 +5,11 @@ package policy
 
 import (
 	"sync"
+	"testing"
 
-	. "github.com/cilium/checkmate"
+	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/checker"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/option"
@@ -105,8 +104,10 @@ func GenerateCIDRDenyRules(numRules int) api.Rules {
 	return rules
 }
 
-func (ds *PolicyTestSuite) TestL3WithIngressDenyWildcard(c *C) {
-	repo := bootstrapRepo(GenerateL3IngressDenyRules, 1000, c)
+func TestL3WithIngressDenyWildcard(t *testing.T) {
+	td := newTestData()
+	repo := td.repo
+	td.bootstrapRepo(GenerateL3IngressDenyRules, 1000, t)
 
 	idFooSelectLabelArray := labels.ParseSelectLabelArray("id=foo")
 	idFooSelectLabels := labels.Labels{}
@@ -114,6 +115,7 @@ func (ds *PolicyTestSuite) TestL3WithIngressDenyWildcard(c *C) {
 		idFooSelectLabels[lbl.Key] = lbl
 	}
 	fooIdentity := identity.NewIdentity(12345, idFooSelectLabels)
+	td.addIdentity(fooIdentity)
 
 	selFoo := api.NewESFromLabels(labels.ParseSelectLabel("id=foo"))
 	rule1 := api.Rule{
@@ -130,13 +132,13 @@ func (ds *PolicyTestSuite) TestL3WithIngressDenyWildcard(c *C) {
 	}
 
 	rule1.Sanitize()
-	_, _, err := repo.Add(rule1)
-	c.Assert(err, IsNil)
+	_, _, err := repo.mustAdd(rule1)
+	require.NoError(t, err)
 
 	repo.Mutex.RLock()
 	defer repo.Mutex.RUnlock()
 	selPolicy, err := repo.resolvePolicyLocked(fooIdentity)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	policy := selPolicy.DistillPolicy(DummyOwner{}, false)
 
 	expectedEndpointPolicy := EndpointPolicy{
@@ -150,13 +152,13 @@ func (ds *PolicyTestSuite) TestL3WithIngressDenyWildcard(c *C) {
 						Port:     80,
 						Protocol: api.ProtoTCP,
 						U8Proto:  0x6,
-						wildcard: wildcardCachedSelector,
+						wildcard: td.wildcardCachedSelector,
 						L7Parser: ParserTypeNone,
 						Ingress:  true,
 						PerSelectorPolicies: L7DataMap{
-							wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
+							td.wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
 						},
-						RuleOrigin: map[CachedSelector]labels.LabelArrayList{wildcardCachedSelector: {nil}},
+						RuleOrigin: map[CachedSelector]labels.LabelArrayList{td.wildcardCachedSelector: {nil}},
 					},
 				},
 					features: denyRules,
@@ -177,11 +179,18 @@ func (ds *PolicyTestSuite) TestL3WithIngressDenyWildcard(c *C) {
 	// Assign an empty mutex so that checker.Equal does not complain about the
 	// difference of the internal time.Time from the lock_debug.go.
 	policy.selectorPolicy.L4Policy.mutex = lock.RWMutex{}
-	c.Assert(policy, checker.DeepEquals, &expectedEndpointPolicy)
+	// policyMapState cannot be compared via DeepEqual
+	require.Truef(t, policy.policyMapState.Equals(expectedEndpointPolicy.policyMapState),
+		policy.policyMapState.Diff(nil, expectedEndpointPolicy.policyMapState))
+	policy.policyMapState = nil
+	expectedEndpointPolicy.policyMapState = nil
+	require.Equal(t, policy, &expectedEndpointPolicy)
 }
 
-func (ds *PolicyTestSuite) TestL3WithLocalHostWildcardd(c *C) {
-	repo := bootstrapRepo(GenerateL3IngressDenyRules, 1000, c)
+func TestL3WithLocalHostWildcardd(t *testing.T) {
+	td := newTestData()
+	repo := td.repo
+	td.bootstrapRepo(GenerateL3IngressDenyRules, 1000, t)
 
 	idFooSelectLabelArray := labels.ParseSelectLabelArray("id=foo")
 	idFooSelectLabels := labels.Labels{}
@@ -190,6 +199,7 @@ func (ds *PolicyTestSuite) TestL3WithLocalHostWildcardd(c *C) {
 	}
 
 	fooIdentity := identity.NewIdentity(12345, idFooSelectLabels)
+	td.addIdentity(fooIdentity)
 
 	// Emulate Kubernetes mode with allow from localhost
 	oldLocalhostOpt := option.Config.AllowLocalhost
@@ -211,18 +221,18 @@ func (ds *PolicyTestSuite) TestL3WithLocalHostWildcardd(c *C) {
 	}
 
 	rule1.Sanitize()
-	_, _, err := repo.Add(rule1)
-	c.Assert(err, IsNil)
+	_, _, err := repo.mustAdd(rule1)
+	require.NoError(t, err)
 
 	repo.Mutex.RLock()
 	defer repo.Mutex.RUnlock()
 
 	selPolicy, err := repo.resolvePolicyLocked(fooIdentity)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	policy := selPolicy.DistillPolicy(DummyOwner{}, false)
 
-	cachedSelectorHost := testSelectorCache.FindCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameHost])
-	c.Assert(cachedSelectorHost, Not(IsNil))
+	cachedSelectorHost := td.sc.FindCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameHost])
+	require.NotNil(t, cachedSelectorHost)
 
 	expectedEndpointPolicy := EndpointPolicy{
 		selectorPolicy: &selectorPolicy{
@@ -235,13 +245,13 @@ func (ds *PolicyTestSuite) TestL3WithLocalHostWildcardd(c *C) {
 						Port:     80,
 						Protocol: api.ProtoTCP,
 						U8Proto:  0x6,
-						wildcard: wildcardCachedSelector,
+						wildcard: td.wildcardCachedSelector,
 						L7Parser: ParserTypeNone,
 						Ingress:  true,
 						PerSelectorPolicies: L7DataMap{
-							wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
+							td.wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
 						},
-						RuleOrigin: map[CachedSelector]labels.LabelArrayList{wildcardCachedSelector: {nil}},
+						RuleOrigin: map[CachedSelector]labels.LabelArrayList{td.wildcardCachedSelector: {nil}},
 					},
 				},
 					features: denyRules,
@@ -262,11 +272,18 @@ func (ds *PolicyTestSuite) TestL3WithLocalHostWildcardd(c *C) {
 	// Assign an empty mutex so that checker.Equal does not complain about the
 	// difference of the internal time.Time from the lock_debug.go.
 	policy.selectorPolicy.L4Policy.mutex = lock.RWMutex{}
-	c.Assert(policy, checker.DeepEquals, &expectedEndpointPolicy)
+	// policyMapState cannot be compared via DeepEqual
+	require.Truef(t, policy.policyMapState.Equals(expectedEndpointPolicy.policyMapState),
+		policy.policyMapState.Diff(nil, expectedEndpointPolicy.policyMapState))
+	policy.policyMapState = nil
+	expectedEndpointPolicy.policyMapState = nil
+	require.Equal(t, policy, &expectedEndpointPolicy)
 }
 
-func (ds *PolicyTestSuite) TestMapStateWithIngressDenyWildcard(c *C) {
-	repo := bootstrapRepo(GenerateL3IngressDenyRules, 1000, c)
+func TestMapStateWithIngressDenyWildcard(t *testing.T) {
+	td := newTestData()
+	repo := td.repo
+	td.bootstrapRepo(GenerateL3IngressDenyRules, 1000, t)
 
 	ruleLabel := labels.ParseLabelArray("rule-foo-allow-port-80")
 	ruleLabelAllowAnyEgress := labels.LabelArray{
@@ -279,6 +296,7 @@ func (ds *PolicyTestSuite) TestMapStateWithIngressDenyWildcard(c *C) {
 		idFooSelectLabels[lbl.Key] = lbl
 	}
 	fooIdentity := identity.NewIdentity(12345, idFooSelectLabels)
+	td.addIdentity(fooIdentity)
 
 	selFoo := api.NewESFromLabels(labels.ParseSelectLabel("id=foo"))
 	rule1 := api.Rule{
@@ -296,16 +314,16 @@ func (ds *PolicyTestSuite) TestMapStateWithIngressDenyWildcard(c *C) {
 	}
 
 	rule1.Sanitize()
-	_, _, err := repo.Add(rule1)
-	c.Assert(err, IsNil)
+	_, _, err := repo.mustAdd(rule1)
+	require.NoError(t, err)
 
 	repo.Mutex.RLock()
 	defer repo.Mutex.RUnlock()
 	selPolicy, err := repo.resolvePolicyLocked(fooIdentity)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	policy := selPolicy.DistillPolicy(DummyOwner{}, false)
 
-	rule1MapStateEntry := NewMapStateEntry(wildcardCachedSelector, labels.LabelArrayList{ruleLabel}, 0, "", 0, true, DefaultAuthType, AuthTypeDisabled)
+	rule1MapStateEntry := NewMapStateEntry(td.wildcardCachedSelector, labels.LabelArrayList{ruleLabel}, 0, "", 0, true, DefaultAuthType, AuthTypeDisabled)
 	allowEgressMapStateEntry := NewMapStateEntry(nil, labels.LabelArrayList{ruleLabelAllowAnyEgress}, 0, "", 0, false, ExplicitAuthType, AuthTypeDisabled)
 
 	expectedEndpointPolicy := EndpointPolicy{
@@ -319,13 +337,13 @@ func (ds *PolicyTestSuite) TestMapStateWithIngressDenyWildcard(c *C) {
 						Port:     80,
 						Protocol: api.ProtoTCP,
 						U8Proto:  0x6,
-						wildcard: wildcardCachedSelector,
+						wildcard: td.wildcardCachedSelector,
 						L7Parser: ParserTypeNone,
 						Ingress:  true,
 						PerSelectorPolicies: L7DataMap{
-							wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
+							td.wildcardCachedSelector: &PerSelectorPolicy{IsDeny: true},
 						},
-						RuleOrigin: map[CachedSelector]labels.LabelArrayList{wildcardCachedSelector: {ruleLabel}},
+						RuleOrigin: map[CachedSelector]labels.LabelArrayList{td.wildcardCachedSelector: {ruleLabel}},
 					},
 				},
 					features: denyRules,
@@ -338,19 +356,21 @@ func (ds *PolicyTestSuite) TestMapStateWithIngressDenyWildcard(c *C) {
 		policyMapState: newMapState(map[Key]MapStateEntry{
 			// Although we have calculated deny policies, the overall policy
 			// will still allow egress to world.
-			{TrafficDirection: trafficdirection.Egress.Uint8()}: allowEgressMapStateEntry,
-			{DestPort: 80, Nexthdr: 6}:                          rule1MapStateEntry,
+			{TrafficDirection: trafficdirection.Egress.Uint8(), InvertedPortMask: 0xffff /* This is a wildcard */}: allowEgressMapStateEntry,
+			{DestPort: 80, Nexthdr: 6}: rule1MapStateEntry,
 		}),
 	}
 
 	// Add new identity to test accumulation of MapChanges
-	added1 := cache.IdentityCache{
+	added1 := identity.IdentityMap{
 		identity.NumericIdentity(192): labels.ParseSelectLabelArray("id=resolve_test_1"),
 	}
 	wg := &sync.WaitGroup{}
-	testSelectorCache.UpdateIdentities(added1, nil, wg)
+	td.sc.UpdateIdentities(added1, nil, wg)
+	// Cleanup the identities from the testSelectorCache
+	defer td.sc.UpdateIdentities(nil, added1, wg)
 	wg.Wait()
-	c.Assert(policy.policyMapChanges.changes, HasLen, 0)
+	require.Equal(t, 0, len(policy.policyMapChanges.changes))
 
 	// Have to remove circular reference before testing to avoid an infinite loop
 	policy.selectorPolicy.Detach()
@@ -358,11 +378,18 @@ func (ds *PolicyTestSuite) TestMapStateWithIngressDenyWildcard(c *C) {
 	// Assign an empty mutex so that checker.Equal does not complain about the
 	// difference of the internal time.Time from the lock_debug.go.
 	policy.selectorPolicy.L4Policy.mutex = lock.RWMutex{}
-	c.Assert(policy, checker.DeepEquals, &expectedEndpointPolicy)
+	// policyMapState cannot be compared via DeepEqual
+	require.Truef(t, policy.policyMapState.Equals(expectedEndpointPolicy.policyMapState),
+		policy.policyMapState.Diff(nil, expectedEndpointPolicy.policyMapState))
+	policy.policyMapState = nil
+	expectedEndpointPolicy.policyMapState = nil
+	require.Equal(t, policy, &expectedEndpointPolicy)
 }
 
-func (ds *PolicyTestSuite) TestMapStateWithIngressDeny(c *C) {
-	repo := bootstrapRepo(GenerateL3IngressDenyRules, 1000, c)
+func TestMapStateWithIngressDeny(t *testing.T) {
+	td := newTestData()
+	repo := td.repo
+	td.bootstrapRepo(GenerateL3IngressDenyRules, 1000, t)
 
 	ruleLabel := labels.ParseLabelArray("rule-deny-port-80-world-and-test")
 	ruleLabelAllowAnyEgress := labels.LabelArray{
@@ -375,6 +402,7 @@ func (ds *PolicyTestSuite) TestMapStateWithIngressDeny(c *C) {
 		idFooSelectLabels[lbl.Key] = lbl
 	}
 	fooIdentity := identity.NewIdentity(12345, idFooSelectLabels)
+	td.addIdentity(fooIdentity)
 
 	lblTest := labels.ParseLabel("id=resolve_test_1")
 
@@ -409,47 +437,45 @@ func (ds *PolicyTestSuite) TestMapStateWithIngressDeny(c *C) {
 	}
 
 	rule1.Sanitize()
-	_, _, err := repo.Add(rule1)
-	c.Assert(err, IsNil)
+	_, _, err := repo.mustAdd(rule1)
+	require.NoError(t, err)
 
 	repo.Mutex.RLock()
 	defer repo.Mutex.RUnlock()
 	selPolicy, err := repo.resolvePolicyLocked(fooIdentity)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 	policy := selPolicy.DistillPolicy(DummyOwner{}, false)
 
 	// Add new identity to test accumulation of MapChanges
-	added1 := cache.IdentityCache{
+	added1 := identity.IdentityMap{
 		identity.NumericIdentity(192): labels.ParseSelectLabelArray("id=resolve_test_1", "num=1"),
 		identity.NumericIdentity(193): labels.ParseSelectLabelArray("id=resolve_test_1", "num=2"),
 		identity.NumericIdentity(194): labels.ParseSelectLabelArray("id=resolve_test_1", "num=3"),
 	}
 	wg := &sync.WaitGroup{}
-	testSelectorCache.UpdateIdentities(added1, nil, wg)
-	// Cleanup the identities from the testSelectorCache
-	defer testSelectorCache.UpdateIdentities(nil, added1, wg)
+	td.sc.UpdateIdentities(added1, nil, wg)
 	wg.Wait()
-	c.Assert(policy.policyMapChanges.changes, HasLen, 3)
+	require.Len(t, policy.policyMapChanges.changes, 3)
 
-	deleted1 := cache.IdentityCache{
+	deleted1 := identity.IdentityMap{
 		identity.NumericIdentity(193): labels.ParseSelectLabelArray("id=resolve_test_1", "num=2"),
 	}
 	wg = &sync.WaitGroup{}
-	testSelectorCache.UpdateIdentities(nil, deleted1, wg)
+	td.sc.UpdateIdentities(nil, deleted1, wg)
 	wg.Wait()
-	c.Assert(policy.policyMapChanges.changes, HasLen, 4)
+	require.Len(t, policy.policyMapChanges.changes, 4)
 
-	cachedSelectorWorld := testSelectorCache.FindCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameWorld])
-	c.Assert(cachedSelectorWorld, Not(IsNil))
+	cachedSelectorWorld := td.sc.FindCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameWorld])
+	require.NotNil(t, cachedSelectorWorld)
 
-	cachedSelectorWorldV4 := testSelectorCache.FindCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameWorldIPv4])
-	c.Assert(cachedSelectorWorldV4, Not(IsNil))
+	cachedSelectorWorldV4 := td.sc.FindCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameWorldIPv4])
+	require.NotNil(t, cachedSelectorWorldV4)
 
-	cachedSelectorWorldV6 := testSelectorCache.FindCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameWorldIPv6])
-	c.Assert(cachedSelectorWorldV6, Not(IsNil))
+	cachedSelectorWorldV6 := td.sc.FindCachedIdentitySelector(api.ReservedEndpointSelectors[labels.IDNameWorldIPv6])
+	require.NotNil(t, cachedSelectorWorldV6)
 
-	cachedSelectorTest := testSelectorCache.FindCachedIdentitySelector(api.NewESFromLabels(lblTest))
-	c.Assert(cachedSelectorTest, Not(IsNil))
+	cachedSelectorTest := td.sc.FindCachedIdentitySelector(api.NewESFromLabels(lblTest))
+	require.NotNil(t, cachedSelectorTest)
 
 	rule1MapStateEntry := NewMapStateEntry(cachedSelectorTest, labels.LabelArrayList{ruleLabel}, 0, "", 0, true, DefaultAuthType, AuthTypeDisabled)
 	allowEgressMapStateEntry := NewMapStateEntry(nil, labels.LabelArrayList{ruleLabelAllowAnyEgress}, 0, "", 0, false, ExplicitAuthType, AuthTypeDisabled)
@@ -491,36 +517,41 @@ func (ds *PolicyTestSuite) TestMapStateWithIngressDeny(c *C) {
 		policyMapState: newMapState(map[Key]MapStateEntry{
 			// Although we have calculated deny policies, the overall policy
 			// will still allow egress to world.
-			{TrafficDirection: trafficdirection.Egress.Uint8()}:                              allowEgressMapStateEntry,
-			{Identity: uint32(identity.ReservedIdentityWorld), DestPort: 80, Nexthdr: 6}:     rule1MapStateEntry.WithOwners(cachedSelectorWorld),
-			{Identity: uint32(identity.ReservedIdentityWorldIPv4), DestPort: 80, Nexthdr: 6}: rule1MapStateEntry.WithOwners(cachedSelectorWorldV4, cachedSelectorWorld),
-			{Identity: uint32(identity.ReservedIdentityWorldIPv6), DestPort: 80, Nexthdr: 6}: rule1MapStateEntry.WithOwners(cachedSelectorWorldV6, cachedSelectorWorld),
-			{Identity: 192, DestPort: 80, Nexthdr: 6}:                                        rule1MapStateEntry,
-			{Identity: 194, DestPort: 80, Nexthdr: 6}:                                        rule1MapStateEntry,
+			{TrafficDirection: trafficdirection.Egress.Uint8(), InvertedPortMask: 0xffff /* This is a wildcard */}: allowEgressMapStateEntry,
+			{Identity: uint32(identity.ReservedIdentityWorld), DestPort: 80, Nexthdr: 6}:                           rule1MapStateEntry.WithOwners(cachedSelectorWorld),
+			{Identity: uint32(identity.ReservedIdentityWorldIPv4), DestPort: 80, Nexthdr: 6}:                       rule1MapStateEntry.WithOwners(cachedSelectorWorldV4, cachedSelectorWorld),
+			{Identity: uint32(identity.ReservedIdentityWorldIPv6), DestPort: 80, Nexthdr: 6}:                       rule1MapStateEntry.WithOwners(cachedSelectorWorldV6, cachedSelectorWorld),
+			{Identity: 192, DestPort: 80, Nexthdr: 6}:                                                              rule1MapStateEntry,
+			{Identity: 194, DestPort: 80, Nexthdr: 6}:                                                              rule1MapStateEntry,
 		}),
 	}
 
 	adds, deletes := policy.ConsumeMapChanges()
 	// maps on the policy got cleared
 
-	c.Assert(adds, checker.Equals, Keys{
+	require.Equal(t, Keys{
 		{Identity: 192, DestPort: 80, Nexthdr: 6}: {},
 		{Identity: 194, DestPort: 80, Nexthdr: 6}: {},
-	})
-	c.Assert(deletes, checker.Equals, Keys{
+	}, adds)
+	require.Equal(t, Keys{
 		{Identity: 193, DestPort: 80, Nexthdr: 6}: {},
-	})
+	}, deletes)
 
 	// Have to remove circular reference before testing for Equality to avoid an infinite loop
 	policy.selectorPolicy.Detach()
 	// Verify that cached selector is not found after Detach().
 	// Note that this depends on the other tests NOT using the same selector concurrently!
-	cachedSelectorTest = testSelectorCache.FindCachedIdentitySelector(api.NewESFromLabels(lblTest))
-	c.Assert(cachedSelectorTest, IsNil)
+	cachedSelectorTest = td.sc.FindCachedIdentitySelector(api.NewESFromLabels(lblTest))
+	require.Nil(t, cachedSelectorTest)
 
 	// Assign an empty mutex so that checker.Equal does not complain about the
 	// difference of the internal time.Time from the lock_debug.go.
 	policy.selectorPolicy.L4Policy.mutex = lock.RWMutex{}
 	policy.policyMapChanges.mutex = lock.Mutex{}
-	c.Assert(policy, checker.DeepEquals, &expectedEndpointPolicy)
+	// policyMapState cannot be compared via DeepEqual
+	require.Truef(t, policy.policyMapState.Equals(expectedEndpointPolicy.policyMapState),
+		policy.policyMapState.Diff(nil, expectedEndpointPolicy.policyMapState))
+	policy.policyMapState = nil
+	expectedEndpointPolicy.policyMapState = nil
+	require.Equal(t, policy, &expectedEndpointPolicy)
 }

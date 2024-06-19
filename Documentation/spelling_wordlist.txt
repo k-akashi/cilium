@@ -36,6 +36,7 @@ Dockerfile
 Dockerfiles
 Donenfeld
 ECMP
+EKS
 ENI
 Efx
 Engleder
@@ -151,6 +152,7 @@ api
 apiKey
 apiKeys
 apiserver
+appProtocol
 ariane
 arithmetics
 artii
@@ -181,6 +183,7 @@ bcc
 behaviour
 benchmarking
 bgp
+blackholing
 blockedConfigOverrides
 bnxt
 bookinfo
@@ -293,6 +296,7 @@ eBGP
 eBPF
 eXpress
 ebpf
+edts
 effectful
 egressing
 elfutils
@@ -383,6 +387,7 @@ impactful
 ingressing
 init
 initContainer
+initContainers
 initialDelaySeconds
 inlined
 inlines
@@ -400,6 +405,7 @@ ipcache
 ipmasq
 iproute
 ipsec
+ipsets
 iptables
 ipv
 istio
@@ -503,6 +509,7 @@ memcd
 microservice
 microservices
 minikube
+misconfiguration
 misconfigures
 mitigations
 mlx
@@ -534,6 +541,7 @@ netdevices
 netdevsim
 netfilter
 netfront
+netkit
 netns
 netperf
 netsec
@@ -594,6 +602,7 @@ prerequirement
 prestop
 printf
 priori
+proc
 profiler
 programmability
 prometheus
@@ -608,6 +617,7 @@ qede
 qemu
 queryable
 queueing
+rST
 rc
 reStructuredText
 reachability
@@ -616,6 +626,7 @@ rebased
 rebasing
 recompiles
 reconfigurations
+reconnections
 recv
 regenerations
 regexes
@@ -626,6 +637,7 @@ repo
 repos
 reproducibility
 requireIPv
+resync
 retpoline
 retransmission
 retransmissions
@@ -635,7 +647,6 @@ roadmap
 rollout
 routable
 routingMode
-rST
 runnable
 runtimes
 sandboxing
@@ -699,6 +710,7 @@ tcpdump
 tcplife
 tcptop
 tcptracer
+tcx
 templating
 terminatingTLS
 terminationGracePeriodSeconds
@@ -778,6 +790,7 @@ webservice
 whitespace
 wildcarded
 workqueue
+workstream
 www
 xDS
 xdp

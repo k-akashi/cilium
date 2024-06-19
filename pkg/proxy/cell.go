@@ -4,15 +4,17 @@
 package proxy
 
 import (
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/datapath/iptables"
 	"github.com/cilium/cilium/pkg/envoy"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	monitoragent "github.com/cilium/cilium/pkg/monitor/agent"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/proxy/logger"
 	"github.com/cilium/cilium/pkg/proxy/logger/endpoint"
+	"github.com/cilium/cilium/pkg/time"
+	"github.com/cilium/cilium/pkg/trigger"
 )
 
 // Cell provides the L7 Proxy which provides support for L7 network policies.
@@ -42,8 +44,9 @@ func (r ProxyConfig) Flags(flags *pflag.FlagSet) {
 type proxyParams struct {
 	cell.In
 
+	Lifecycle             cell.Lifecycle
 	Config                ProxyConfig
-	Datapath              datapath.Datapath
+	IPTablesManager       *iptables.Manager
 	EndpointInfoRegistry  logger.EndpointInfoRegistry
 	MonitorAgent          monitoragent.Agent
 	EnvoyProxyIntegration *envoyProxyIntegration
@@ -61,15 +64,35 @@ func newProxy(params proxyParams) *Proxy {
 
 	configureProxyLogger(params.EndpointInfoRegistry, params.MonitorAgent, option.Config.AgentLabels)
 
-	return createProxy(params.Config.ProxyPortrangeMin, params.Config.ProxyPortrangeMax, params.Datapath, params.EnvoyProxyIntegration, params.DNSProxyIntegration)
+	p := createProxy(params.Config.ProxyPortrangeMin, params.Config.ProxyPortrangeMax, params.IPTablesManager, params.EnvoyProxyIntegration, params.DNSProxyIntegration)
+
+	triggerDone := make(chan struct{})
+
+	params.Lifecycle.Append(cell.Hook{
+		OnStart: func(cell.HookContext) (err error) {
+			p.proxyPortsTrigger, err = trigger.NewTrigger(trigger.Parameters{
+				MinInterval:  10 * time.Second,
+				TriggerFunc:  p.storeProxyPorts,
+				ShutdownFunc: func() { close(triggerDone) },
+			})
+			return err
+		},
+		OnStop: func(cell.HookContext) error {
+			p.proxyPortsTrigger.Shutdown()
+			<-triggerDone
+			return nil
+		},
+	})
+
+	return p
 }
 
 type envoyProxyIntegrationParams struct {
 	cell.In
 
-	Datapath    datapath.Datapath
-	XdsServer   envoy.XDSServer
-	AdminClient *envoy.EnvoyAdminClient
+	IPTablesManager *iptables.Manager
+	XdsServer       envoy.XDSServer
+	AdminClient     *envoy.EnvoyAdminClient
 }
 
 func newEnvoyProxyIntegration(params envoyProxyIntegrationParams) *envoyProxyIntegration {
@@ -78,9 +101,9 @@ func newEnvoyProxyIntegration(params envoyProxyIntegrationParams) *envoyProxyInt
 	}
 
 	return &envoyProxyIntegration{
-		xdsServer:   params.XdsServer,
-		datapath:    params.Datapath,
-		adminClient: params.AdminClient,
+		xdsServer:       params.XdsServer,
+		iptablesManager: params.IPTablesManager,
+		adminClient:     params.AdminClient,
 	}
 }
 

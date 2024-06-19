@@ -53,6 +53,7 @@ spec:
         cilium.io/cilium-configmap-checksum: {{ include (print $.Template.BasePath "/cilium-configmap.yaml") . | sha256sum | quote }}
         {{- end }}
         {{- if not .Values.securityContext.privileged }}
+        {{- if semverCompare "<1.30.0" (printf "%d.%d.0" (semver .Capabilities.KubeVersion.Version).Major (semver .Capabilities.KubeVersion.Version).Minor) }}
         # Set app AppArmor's profile to "unconfined". The value of this annotation
         # can be modified as long users know which profiles they have available
         # in AppArmor.
@@ -61,6 +62,7 @@ spec:
         {{- if .Values.cgroup.autoMount.enabled }}
         container.apparmor.security.beta.kubernetes.io/mount-cgroup: "unconfined"
         container.apparmor.security.beta.kubernetes.io/apply-sysctl-overwrites: "unconfined"
+        {{- end }}
         {{- end }}
         {{- end }}
         {{- with .Values.podAnnotations }}
@@ -80,6 +82,11 @@ spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* K8s version lower than 1.30.0 don't support the "appArmorProfile" field, */}}
+      {{- /* thus we have to remove it. */}}
+      {{- if semverCompare "<1.30.0" (printf "%d.%d.0" (semver .Capabilities.KubeVersion.Version).Major (semver .Capabilities.KubeVersion.Version).Minor) }}
+        {{- $_ := unset .Values.podSecurityContext "appArmorProfile" }}
       {{- end }}
       {{- with .Values.podSecurityContext }}
       securityContext:
@@ -313,7 +320,7 @@ spec:
         - name: etcd-config-path
           mountPath: /var/lib/etcd-config
           readOnly: true
-        {{- if or .Values.etcd.ssl .Values.etcd.managed }}
+        {{- if .Values.etcd.ssl }}
         - name: etcd-secrets
           mountPath: /var/lib/etcd-secrets
           readOnly: true
@@ -350,6 +357,11 @@ spec:
         {{- if .Values.bgp.enabled }}
         - name: bgp-config-path
           mountPath: /var/lib/cilium/bgp
+          readOnly: true
+        {{- end }}
+        {{- if and .Values.hubble.enabled .Values.hubble.metrics.enabled .Values.hubble.metrics.tls.enabled }}
+        - name: hubble-metrics-tls
+          mountPath: /var/lib/cilium/tls/hubble-metrics
           readOnly: true
         {{- end }}
         {{- if and .Values.hubble.enabled .Values.hubble.tls.enabled (hasKey .Values.hubble "listenAddress") }}
@@ -507,6 +519,8 @@ spec:
             drop:
               - ALL
           {{- end}}
+      {{- end }}
+      {{- if .Values.sysctlfix.enabled }}
       - name: apply-sysctl-overwrites
         image: {{ include "cilium.image" .Values.image | quote }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -733,17 +747,16 @@ spec:
           - name: cni-path
             mountPath: /host/opt/cni/bin
       {{- end }} # .Values.cni.install
+      {{- if .Values.extraInitContainers }}
+      {{- toYaml .Values.extraInitContainers | nindent 6 }}
+      {{- end }}
       restartPolicy: Always
       priorityClassName: {{ include "cilium.priorityClass" (list $ .Values.priorityClassName "system-node-critical") }}
       serviceAccountName: {{ .Values.serviceAccounts.cilium.name | quote }}
       automountServiceAccountToken: {{ .Values.serviceAccounts.cilium.automount }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       hostNetwork: true
-      {{- if and .Values.etcd.managed (not .Values.etcd.k8sService) }}
-      # In managed etcd mode, Cilium must be able to resolve the DNS name of
-      # the etcd service
-      dnsPolicy: ClusterFirstWithHostNet
-      {{- else if .Values.dnsPolicy }}
+      {{- if .Values.dnsPolicy }}
       dnsPolicy: {{ .Values.dnsPolicy }}
       {{- end }}
       {{- with .Values.affinity }}
@@ -783,8 +796,8 @@ spec:
           path: /sys/fs/bpf
           type: DirectoryOrCreate
       {{- end }}
-      {{- if .Values.cgroup.autoMount.enabled }}
-      # To mount cgroup2 filesystem on the host
+      {{- if or .Values.cgroup.autoMount.enabled .Values.sysctlfix.enabled }}
+      # To mount cgroup2 filesystem on the host or apply sysctlfix
       - name: hostproc
         hostPath:
           path: /proc
@@ -850,7 +863,7 @@ spec:
           - key: etcd-config
             path: etcd.config
         # To read the k8s etcd secrets in case the user might want to use TLS
-      {{- if or .Values.etcd.ssl .Values.etcd.managed }}
+      {{- if .Values.etcd.ssl }}
       - name: etcd-secrets
         secret:
           secretName: cilium-etcd-secrets
@@ -890,6 +903,29 @@ spec:
               items:
               - key: {{ .Values.tls.caBundle.key }}
                 path: common-etcd-client-ca.crt
+          {{- end }}
+          # note: we configure the volume for the kvstoremesh-specific certificate
+          # regardless of whether KVStoreMesh is enabled or not, so that it can be
+          # automatically mounted in case KVStoreMesh gets subsequently enabled,
+          # without requiring an agent restart.
+          - secret:
+              name: clustermesh-apiserver-local-cert
+              optional: true
+              items:
+              - key: tls.key
+                path: local-etcd-client.key
+              - key: tls.crt
+                path: local-etcd-client.crt
+          {{- if not .Values.tls.caBundle.enabled }}
+              - key: ca.crt
+                path: local-etcd-client-ca.crt
+          {{- else }}
+          - {{ .Values.tls.caBundle.useSecret | ternary "secret" "configMap" }}:
+              name: {{ .Values.tls.caBundle.name }}
+              optional: true
+              items:
+              - key: {{ .Values.tls.caBundle.key }}
+                path: local-etcd-client-ca.crt
           {{- end }}
       {{- if and .Values.ipMasqAgent .Values.ipMasqAgent.enabled }}
       - name: ip-masq-agent
@@ -950,6 +986,45 @@ spec:
               - key: {{ .Values.tls.caBundle.key }}
                 path: client-ca.crt
           {{- end }}
+      {{- end }}
+      {{- if and .Values.hubble.enabled .Values.hubble.metrics.enabled .Values.hubble.metrics.tls.enabled }}
+      - name: hubble-metrics-tls
+        projected:
+          # note: the leading zero means this number is in octal representation: do not remove it
+          defaultMode: 0400
+          sources:
+          - secret:
+              name: hubble-metrics-server-certs
+              optional: true
+              items:
+              - key: tls.crt
+                path: server.crt
+              - key: tls.key
+                path: server.key
+          {{- if .Values.hubble.metrics.tls.server.mtls.enabled }}
+          {{- if .Values.hubble.metrics.tls.server.mtls.name }}
+          {{/* Use the client CA specified by the user if they configured one */}}
+          - {{ .Values.hubble.metrics.tls.server.mtls.useSecret | ternary "secret" "configMap" }}:
+              name: {{ .Values.hubble.metrics.tls.server.mtls.name }}
+              optional: false
+              items:
+              - key: {{ .Values.hubble.metrics.tls.server.mtls.key }}
+                path: client-ca.crt
+          {{/* If the CA bundle isn't configured use the server CA as the client CA */}}
+          {{- else if not .Values.tls.caBundle.enabled }}
+              - key: ca.crt
+                path: client-ca.crt
+          {{/* Fall back to the caBundle CA if it's been configured */}}
+          {{- else }}
+          - {{ .Values.tls.caBundle.useSecret | ternary "secret" "configMap" }}:
+              name: {{ .Values.tls.caBundle.name }}
+              optional: true
+              items:
+              - key: {{ .Values.tls.caBundle.key }}
+                path: client-ca.crt
+          {{- end }}
+          {{- end }}
+
       {{- end }}
       {{- if .Values.hubble.export.dynamic.enabled }}
       - name: hubble-flowlog-config

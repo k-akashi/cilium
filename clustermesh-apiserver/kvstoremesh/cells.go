@@ -4,6 +4,8 @@
 package kvstoremesh
 
 import (
+	"github.com/cilium/hive/cell"
+
 	"github.com/cilium/cilium/clustermesh-apiserver/health"
 	cmmetrics "github.com/cilium/cilium/clustermesh-apiserver/metrics"
 	"github.com/cilium/cilium/clustermesh-apiserver/option"
@@ -13,8 +15,6 @@ import (
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/gops"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/pprof"
 )
@@ -42,6 +42,8 @@ var Cell = cell.Module(
 	HealthAPIEndpointsCell,
 	health.HealthAPIServerCell,
 
+	APIServerCell,
+
 	kvstore.Cell(kvstore.EtcdBackendName),
 	cell.Provide(func(ss syncstate.SyncState) *kvstore.ExtraOptions {
 		return &kvstore.ExtraOptions{
@@ -50,7 +52,6 @@ var Cell = cell.Module(
 	}),
 	kvstoremesh.Cell,
 
-	job.Cell,
 	cell.Invoke(kvstoremesh.RegisterSyncWaiter),
 
 	cell.Invoke(func(*kvstoremesh.KVStoreMesh) {}),

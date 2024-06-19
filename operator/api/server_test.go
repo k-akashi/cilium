@@ -10,11 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
+	"github.com/go-openapi/runtime/middleware"
 	"go.uber.org/goleak"
 
 	operatorApi "github.com/cilium/cilium/api/v1/operator/server"
+	clrestapi "github.com/cilium/cilium/api/v1/operator/server/restapi/cluster"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 )
 
@@ -41,6 +44,9 @@ func TestAPIServerK8sDisabled(t *testing.T) {
 				return true
 			},
 		),
+		cell.Provide(func() clrestapi.GetClusterHandler {
+			return clrestapi.GetClusterHandlerFunc(clustersHandlerMock)
+		}),
 		cell.Provide(func() Config {
 			return Config{
 				OperatorAPIServeAddr: "localhost:0",
@@ -55,7 +61,8 @@ func TestAPIServerK8sDisabled(t *testing.T) {
 		}),
 	)
 
-	if err := hive.Start(context.Background()); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 
@@ -73,8 +80,11 @@ func TestAPIServerK8sDisabled(t *testing.T) {
 	if err := testEndpoint(t, port, "/healthz", http.StatusNotImplemented); err != nil {
 		t.Fatalf("failed to query endpoint: %s", err)
 	}
+	if err := testEndpoint(t, port, "/v1/cluster", http.StatusOK); err != nil {
+		t.Fatalf("failed to query endpoint: %s", err)
+	}
 
-	if err := hive.Stop(context.Background()); err != nil {
+	if err := hive.Stop(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
@@ -99,6 +109,9 @@ func TestAPIServerK8sEnabled(t *testing.T) {
 				return true
 			},
 		),
+		cell.Provide(func() clrestapi.GetClusterHandler {
+			return clrestapi.GetClusterHandlerFunc(clustersHandlerMock)
+		}),
 		cell.Provide(func() Config {
 			return Config{
 				OperatorAPIServeAddr: "localhost:0",
@@ -113,7 +126,8 @@ func TestAPIServerK8sEnabled(t *testing.T) {
 		}),
 	)
 
-	if err := hive.Start(context.Background()); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 
@@ -131,8 +145,11 @@ func TestAPIServerK8sEnabled(t *testing.T) {
 	if err := testEndpoint(t, port, "/healthz", http.StatusOK); err != nil {
 		t.Fatalf("failed to query endpoint: %s", err)
 	}
+	if err := testEndpoint(t, port, "/v1/cluster", http.StatusOK); err != nil {
+		t.Fatalf("failed to query endpoint: %s", err)
+	}
 
-	if err := hive.Stop(context.Background()); err != nil {
+	if err := hive.Stop(tlog, context.Background()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
@@ -162,4 +179,8 @@ func testEndpoint(t *testing.T, port int, path string, statusCode int) error {
 	}
 
 	return nil
+}
+
+func clustersHandlerMock(params clrestapi.GetClusterParams) middleware.Responder {
+	return clrestapi.NewGetClusterOK()
 }

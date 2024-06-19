@@ -25,9 +25,10 @@ jobs:
     steps:
       - name: Checkout code
         if: ${{ !github.event.pull_request }}
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Check code changes
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
         id: docs-tree
@@ -57,11 +58,11 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
         with:
           persist-credentials: false
       - name: Build HTML
-        uses: docker://quay.io/cilium/docs-builder:f85fa1ae0c3dff1f29f210c13cb5ac1b88006111@sha256:ba5876ceda1bb6dd4c14871bcc60ce7b325fd0714ace8bfd7a0bf9adc8af98cb
+        uses: docker://quay.io/cilium/docs-builder:9ccbdd04a50d599e9e699face6231e59c0036a51@sha256:6d1a0eaeb32ba98b60df52c69e7c8031a38e8aa6a0d4738bef35bd48a3bfbc0e
         with:
           entrypoint: ./Documentation/check-build.sh
           args: html
@@ -72,14 +73,14 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
         with:
           persist-credentials: false
       - name: Install Go
-        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        uses: actions/setup-go@cdcb36043654635271a94b9a6d1392de5bb323a7 # v5.0.1
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.22.2
+          go-version: 1.22.4
 
       # Building Cilium as precondition to generate documentation artifacts.
       - name: Build Cilium

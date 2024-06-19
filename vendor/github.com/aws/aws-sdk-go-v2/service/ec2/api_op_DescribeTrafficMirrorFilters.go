@@ -36,7 +36,9 @@ type DescribeTrafficMirrorFiltersInput struct {
 	DryRun *bool
 
 	// One or more filters. The possible values are:
+	//
 	//   - description : The Traffic Mirror filter description.
+	//
 	//   - traffic-mirror-filter-id : The ID of the Traffic Mirror filter.
 	Filters []types.Filter
 
@@ -121,6 +123,9 @@ func (c *Client) addOperationDescribeTrafficMirrorFiltersMiddlewares(stack *midd
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeTrafficMirrorFilters(options.Region), middleware.Before); err != nil {

@@ -12,6 +12,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/statedb"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -19,12 +22,10 @@ import (
 	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/node/addressing"
 	"github.com/cilium/cilium/pkg/node/types"
-	"github.com/cilium/cilium/pkg/statedb"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -35,7 +36,7 @@ func TestReconciliationLoop(t *testing.T) {
 		db      *statedb.DB
 		devices statedb.RWTable[*tables.Device]
 		store   *node.LocalNodeStore
-		health  cell.HealthReporter
+		health  cell.Health
 		params  *reconcilerParams
 	)
 	h := hive.New(
@@ -43,7 +44,6 @@ func TestReconciliationLoop(t *testing.T) {
 			"iptables-reconciler-test",
 			"iptables-reconciler-test",
 
-			statedb.Cell,
 			cell.Provide(
 				tables.NewDeviceTable,
 				statedb.RWTable[*tables.Device].ToTable,
@@ -53,13 +53,13 @@ func TestReconciliationLoop(t *testing.T) {
 				db_ *statedb.DB,
 				devices_ statedb.RWTable[*tables.Device],
 				store_ *node.LocalNodeStore,
-				scope cell.Scope,
+				health_ cell.Health,
 			) {
 				db = db_
 				devices = devices_
 				store = store_
 				db.RegisterTable(devices_)
-				health = cell.GetHealthReporter(scope, "iptables-reconciler-test")
+				health = health_.NewScope("iptables-reconciler-test")
 				params = &reconcilerParams{
 					localNodeStore: store_,
 					db:             db_,
@@ -87,13 +87,12 @@ func TestReconciliationLoop(t *testing.T) {
 
 		return nil
 	}
-	updateProxyFunc := func(proxyPort uint16, localOnly bool, name string) error {
+	updateProxyFunc := func(proxyPort uint16, name string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		state.proxies[name] = proxyInfo{
-			name:        name,
-			port:        proxyPort,
-			isLocalOnly: localOnly,
+			name: name,
+			port: proxyPort,
 		}
 		return nil
 	}
@@ -205,9 +204,8 @@ func TestReconciliationLoop(t *testing.T) {
 			action: func() {
 				params.proxies <- reconciliationRequest[proxyInfo]{
 					info: proxyInfo{
-						name:        "proxy-test-1",
-						port:        9090,
-						isLocalOnly: true,
+						name: "proxy-test-1",
+						port: 9090,
 					},
 					updated: make(chan struct{}),
 				}
@@ -222,9 +220,8 @@ func TestReconciliationLoop(t *testing.T) {
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
-						name:        "proxy-test-1",
-						port:        9090,
-						isLocalOnly: true,
+						name: "proxy-test-1",
+						port: 9090,
 					},
 				},
 			},
@@ -234,9 +231,8 @@ func TestReconciliationLoop(t *testing.T) {
 			action: func() {
 				params.proxies <- reconciliationRequest[proxyInfo]{
 					info: proxyInfo{
-						name:        "proxy-test-2",
-						port:        9091,
-						isLocalOnly: false,
+						name: "proxy-test-2",
+						port: 9091,
 					},
 					updated: make(chan struct{}),
 				}
@@ -251,14 +247,12 @@ func TestReconciliationLoop(t *testing.T) {
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
-						name:        "proxy-test-1",
-						port:        9090,
-						isLocalOnly: true,
+						name: "proxy-test-1",
+						port: 9090,
 					},
 					"proxy-test-2": {
-						name:        "proxy-test-2",
-						port:        9091,
-						isLocalOnly: false,
+						name: "proxy-test-2",
+						port: 9091,
 					},
 				},
 			},
@@ -291,14 +285,12 @@ func TestReconciliationLoop(t *testing.T) {
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
-						name:        "proxy-test-1",
-						port:        9090,
-						isLocalOnly: true,
+						name: "proxy-test-1",
+						port: 9090,
 					},
 					"proxy-test-2": {
-						name:        "proxy-test-2",
-						port:        9091,
-						isLocalOnly: false,
+						name: "proxy-test-2",
+						port: 9091,
 					},
 				},
 				noTrackPods: sets.New(
@@ -328,14 +320,12 @@ func TestReconciliationLoop(t *testing.T) {
 				},
 				proxies: map[string]proxyInfo{
 					"proxy-test-1": {
-						name:        "proxy-test-1",
-						port:        9090,
-						isLocalOnly: true,
+						name: "proxy-test-1",
+						port: 9090,
 					},
 					"proxy-test-2": {
-						name:        "proxy-test-2",
-						port:        9091,
-						isLocalOnly: false,
+						name: "proxy-test-2",
+						port: 9091,
 					},
 				},
 				noTrackPods: sets.New(
@@ -348,7 +338,8 @@ func TestReconciliationLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	assert.NoError(t, h.Start(ctx))
+	tlog := hivetest.Logger(t)
+	assert.NoError(t, h.Start(tlog, ctx))
 
 	// apply initial state
 	testCases[0].action()
@@ -390,7 +381,7 @@ func TestReconciliationLoop(t *testing.T) {
 		})
 	}
 
-	assert.NoError(t, h.Stop(ctx))
+	assert.NoError(t, h.Stop(tlog, ctx))
 
 	close(params.proxies)
 	close(params.addNoTrackPod)

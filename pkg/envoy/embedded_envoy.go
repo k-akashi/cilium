@@ -87,6 +87,7 @@ type embeddedEnvoyConfig struct {
 	runDir                   string
 	logPath                  string
 	baseID                   uint64
+	keepCapNetBindService    bool
 	connectTimeout           int64
 	maxRequestsPerConnection uint32
 	maxConnectionDuration    time.Duration
@@ -150,9 +151,15 @@ func startEmbeddedEnvoy(config embeddedEnvoyConfig) (*EmbeddedEnvoy, error) {
 		}
 		defer logWriter.Close()
 
+		envoyArgs := []string{"-l", mapLogLevel(logging.GetLevel(logging.DefaultLogger)), "-c", bootstrapFilePath, "--base-id", strconv.FormatUint(config.baseID, 10), "--log-format", logFormat}
+		envoyStarterArgs := []string{}
+		if config.keepCapNetBindService {
+			envoyStarterArgs = append(envoyStarterArgs, "--keep-cap-net-bind-service", "--")
+		}
+		envoyStarterArgs = append(envoyStarterArgs, envoyArgs...)
+
 		for {
-			logLevel := logging.GetLevel(logging.DefaultLogger)
-			cmd := exec.Command(ciliumEnvoyStarter, "-l", mapLogLevel(logLevel), "-c", bootstrapFilePath, "--base-id", strconv.FormatUint(config.baseID, 10), "--log-format", logFormat)
+			cmd := exec.Command(ciliumEnvoyStarter, envoyStarterArgs...)
 			cmd.Stderr = logWriter
 			cmd.Stdout = logWriter
 
@@ -263,10 +270,6 @@ func newEnvoyLogPiper() io.WriteCloser {
 			case "off", "critical", "error":
 				scopedLog.Error(msg)
 			case "warning":
-				if !tracing && (strings.Contains(msg, "Usage of the deprecated runtime key overload.global_downstream_max_connections, consider switching to `envoy.resource_monitors.downstream_connections` instead.This runtime key will be removed in future.") ||
-					strings.Contains(msg, "There is no configured limit to the number of allowed active downstream connections. Configure a limit in `envoy.resource_monitors.downstream_connections` resource monitor.")) {
-					continue
-				}
 				scopedLog.Warn(msg)
 			case "info":
 				scopedLog.Info(msg)

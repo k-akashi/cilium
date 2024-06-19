@@ -4,6 +4,10 @@
 package cmd
 
 import (
+	"net/http"
+
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/statedb"
 	"github.com/sirupsen/logrus"
 
 	healthApi "github.com/cilium/cilium/api/v1/health/server"
@@ -13,7 +17,9 @@ import (
 	"github.com/cilium/cilium/daemon/restapi"
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/auth"
+	"github.com/cilium/cilium/pkg/bgp/speaker"
 	"github.com/cilium/cilium/pkg/bgpv1"
+	cgroup "github.com/cilium/cilium/pkg/cgroups/manager"
 	"github.com/cilium/cilium/pkg/ciliumenvoyconfig"
 	"github.com/cilium/cilium/pkg/clustermesh"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
@@ -21,37 +27,36 @@ import (
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	"github.com/cilium/cilium/pkg/datapath"
 	"github.com/cilium/cilium/pkg/defaults"
+	"github.com/cilium/cilium/pkg/dial"
 	"github.com/cilium/cilium/pkg/egressgateway"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpointcleanup"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/envoy"
 	"github.com/cilium/cilium/pkg/gops"
-	"github.com/cilium/cilium/pkg/healthv2"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
-	ipamMetadata "github.com/cilium/cilium/pkg/ipam/metadata"
+	ipamcell "github.com/cilium/cilium/pkg/ipam/cell"
 	"github.com/cilium/cilium/pkg/k8s"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
+	"github.com/cilium/cilium/pkg/k8s/watchers"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/l2announcer"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/metricsmap"
+	natStats "github.com/cilium/cilium/pkg/maps/nat/stats"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/node"
 	nodeManager "github.com/cilium/cilium/pkg/node/manager"
 	"github.com/cilium/cilium/pkg/nodediscovery"
 	"github.com/cilium/cilium/pkg/option"
+	policyDirectory "github.com/cilium/cilium/pkg/policy/directory"
 	policyK8s "github.com/cilium/cilium/pkg/policy/k8s"
 	"github.com/cilium/cilium/pkg/pprof"
-	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/proxy"
+	"github.com/cilium/cilium/pkg/recorder"
 	"github.com/cilium/cilium/pkg/redirectpolicy"
 	"github.com/cilium/cilium/pkg/service"
 	"github.com/cilium/cilium/pkg/signal"
-	"github.com/cilium/cilium/pkg/statedb"
-	"github.com/cilium/cilium/pkg/statedb/reconciler"
 )
 
 var (
@@ -95,9 +100,6 @@ var (
 		// Provide option.Config via hive so cells can depend on the agent config.
 		cell.Provide(func() *option.DaemonConfig { return option.Config }),
 
-		// Provides a global job registry which cells can use to spawn job groups.
-		job.Cell,
-
 		// Cilium API served over UNIX sockets. Accessed by the 'cilium' utility (not cilium-cli).
 		server.Cell,
 		cell.Invoke(configureAPIServer),
@@ -110,21 +112,9 @@ var (
 		// the 'deletionQueue' provided by this cell.
 		deletionQueueCell,
 
-		// DB provides an extendable in-memory database with rich transactions
-		// and multi-version concurrency control through immutable radix trees.
-		statedb.Cell,
-
-		// Reconciler provides a general utility for reconciling a statedb table
-		// with a target defined via set of operations. This cell provides the
-		// common objects used by all reconcilers such as the shared metrics.
-		reconciler.Cell,
-
 		// Store cell provides factory for creating watchStore/syncStore/storeManager
 		// useful for synchronizing data from/to kvstore.
 		store.Cell,
-
-		// Reconciler cell provides the shared metrics for all the reconcilers.
-		reconciler.Cell,
 	)
 
 	// ControlPlane implement the per-node control functions. These are pure
@@ -134,8 +124,6 @@ var (
 	ControlPlane = cell.Module(
 		"controlplane",
 		"Control Plane",
-
-		healthv2.Cell,
 
 		// LocalNodeStore holds onto the information about the local node and allows
 		// observing changes to it.
@@ -205,6 +193,9 @@ var (
 		// The BGP Control Plane which enables various BGP related interop.
 		bgpv1.Cell,
 
+		// The MetalLB BGP speaker enables support for MetalLB BGP.
+		speaker.Cell,
+
 		// Brokers datapath signals from signalmap
 		signal.Cell,
 
@@ -214,8 +205,8 @@ var (
 		// IPCache, policy.Repository and CachingIdentityAllocator.
 		cell.Provide(newPolicyTrifecta),
 
-		// IPAM metadata manager, determines which IPAM pool a pod should allocate from
-		ipamMetadata.Cell,
+		// IPAM provides IP address management.
+		ipamcell.Cell,
 
 		// Egress Gateway allows originating traffic from specific IPv4 addresses.
 		egressgateway.Cell,
@@ -223,14 +214,11 @@ var (
 		// ServiceCache holds the list of known services correlated with the matching endpoints.
 		k8s.ServiceCacheCell,
 
-		// K8s policy resource watcher cell. It depends on the daemon which we cast into
-		// the interface type here to avoid a circular package import
-		cell.Provide(func(p promise.Promise[*Daemon]) promise.Promise[policyK8s.PolicyManager] {
-			return promise.Map(p, func(d *Daemon) policyK8s.PolicyManager {
-				return d
-			})
-		}),
+		// K8s policy resource watcher cell.
 		policyK8s.Cell,
+
+		// Directory policy watcher cell.
+		policyDirectory.Cell,
 
 		// ClusterMesh is the Cilium's multicluster implementation.
 		cell.Config(cmtypes.DefaultClusterInfo),
@@ -252,10 +240,28 @@ var (
 		// The node discovery cell provides the local node configuration and node discovery
 		// which communicate changes in local node information to the API server or KVStore.
 		nodediscovery.Cell,
+
+		// Cgroup manager maintains Kubernetes and low-level metadata (cgroup path and
+		// cgroup id) for local pods and their containers.
+		cgroup.Cell,
+
+		// NAT stats provides stat computation and tables for NAT map bpf maps.
+		natStats.Cell,
+
+		// Provide the logic to map DNS names matching Kubernetes services to the
+		// corresponding ClusterIP, without depending on CoreDNS. Leveraged by etcd
+		// and clustermesh.
+		dial.ServiceResolverCell,
+
+		// K8s Watcher provides the core k8s watchers
+		watchers.Cell,
+
+		// Provide pcap recorder
+		recorder.Cell,
 	)
 )
 
-func configureAPIServer(cfg *option.DaemonConfig, s *server.Server, swaggerSpec *server.Spec) {
+func configureAPIServer(cfg *option.DaemonConfig, s *server.Server, db *statedb.DB, swaggerSpec *server.Spec) {
 	s.EnabledListeners = []string{"unix"}
 	s.SocketPath = cfg.SocketPath
 	s.ReadTimeout = apiTimeout
@@ -279,4 +285,12 @@ func configureAPIServer(cfg *option.DaemonConfig, s *server.Server, swaggerSpec 
 		}
 	}
 	api.DisableAPIs(swaggerSpec.DeniedAPIs, s.GetAPI().AddMiddlewareFor)
+
+	s.ConfigureAPI()
+
+	// Add the /statedb HTTP handler
+	mux := http.NewServeMux()
+	mux.Handle("/", s.GetHandler())
+	mux.Handle("/statedb/", http.StripPrefix("/statedb", db.HTTPHandler()))
+	s.SetHandler(mux)
 }

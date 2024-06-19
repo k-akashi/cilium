@@ -17,11 +17,9 @@ import (
 
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/datapath/alignchecker"
-	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/linux/ethtool"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
-	"github.com/cilium/cilium/pkg/datapath/prefilter"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
@@ -30,15 +28,10 @@ import (
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/mac"
-	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/socketlb"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
-
-// firstInitialization is true when Reinitialize() is called for the first
-// time. It can only be accessed when GetCompilationLock() is being held.
-var firstInitialization = true
 
 const (
 	// netdevHeaderFileName is the name of the header file used for bpf_host.c and bpf_overlay.c.
@@ -47,7 +40,7 @@ const (
 	preFilterHeaderFileName = "filter_config.h"
 )
 
-func (l *loader) writeNetdevHeader(dir string, o datapath.BaseProgramOwner) error {
+func (l *loader) writeNetdevHeader(dir string) error {
 	headerPath := filepath.Join(dir, netdevHeaderFileName)
 	log.WithField(logfields.Path, headerPath).Debug("writing configuration")
 
@@ -58,13 +51,13 @@ func (l *loader) writeNetdevHeader(dir string, o datapath.BaseProgramOwner) erro
 	}
 	defer f.Close()
 
-	if err := l.templateCache.WriteNetdevConfig(f, o); err != nil {
+	if err := l.templateCache.WriteNetdevConfig(f, option.Config.Opts); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (l *loader) writeNodeConfigHeader(o datapath.BaseProgramOwner) error {
+func (l *loader) writeNodeConfigHeader(cfg *datapath.LocalNodeConfiguration) error {
 	nodeConfigPath := option.Config.GetNodeConfigPath()
 	f, err := os.Create(nodeConfigPath)
 	if err != nil {
@@ -72,14 +65,14 @@ func (l *loader) writeNodeConfigHeader(o datapath.BaseProgramOwner) error {
 	}
 	defer f.Close()
 
-	if err = l.templateCache.WriteNodeConfig(f, o.LocalConfig()); err != nil {
+	if err = l.templateCache.WriteNodeConfig(f, cfg); err != nil {
 		return fmt.Errorf("failed to write node configuration file at %s: %w", nodeConfigPath, err)
 	}
 	return nil
 }
 
 // Must be called with option.Config.EnablePolicyMU locked.
-func writePreFilterHeader(preFilter *prefilter.PreFilter, dir string, devices []string) error {
+func writePreFilterHeader(preFilter datapath.PreFilter, dir string, devices []string) error {
 	headerPath := filepath.Join(dir, preFilterHeaderFileName)
 	log.WithField(logfields.Path, headerPath).Debug("writing configuration")
 
@@ -169,7 +162,7 @@ func cleanIngressQdisc(devices []string) error {
 }
 
 // reinitializeIPSec is used to recompile and load encryption network programs.
-func (l *loader) reinitializeIPSec(ctx context.Context) error {
+func (l *loader) reinitializeIPSec() error {
 	// We need to take care not to load bpf_network and bpf_host onto the same
 	// device. If devices are required, we load bpf_host and hence don't need
 	// the code below, specific to EncryptInterface. Specifically, we will load
@@ -205,39 +198,42 @@ func (l *loader) reinitializeIPSec(ctx context.Context) error {
 		return nil
 	}
 
-	progs := []progDefinition{{progName: symbolFromNetwork, direction: dirIngress}}
+	spec, err := bpf.LoadCollectionSpec(networkObj)
+	if err != nil {
+		return fmt.Errorf("loading eBPF ELF %s: %w", networkObj, err)
+	}
+
+	coll, commit, err := loadDatapath(spec, nil, nil)
+	if err != nil {
+		return fmt.Errorf("loading %s: %w", networkObj, err)
+	}
+	defer coll.Close()
+
 	var errs error
 	for _, iface := range interfaces {
-		if err := connector.DisableRpFilter(l.sysctl, iface); err != nil {
-			log.WithError(err).WithField(logfields.Interface, iface).Warn("Rpfilter could not be disabled, node to node encryption may fail")
-		}
-
 		device, err := netlink.LinkByName(iface)
 		if err != nil {
-			return fmt.Errorf("retrieving device %s: %w", iface, err)
+			errs = errors.Join(errs, fmt.Errorf("retrieving device %s: %w", iface, err))
+			continue
 		}
 
-		finalize, err := replaceDatapath(ctx,
-			replaceDatapathOptions{
-				device:   iface,
-				elf:      networkObj,
-				programs: progs,
-				linkDir:  bpffsDeviceLinksDir(bpf.CiliumPath(), device),
-			},
-		)
-		if err != nil {
-			log.WithField(logfields.Interface, iface).WithError(err).Error("Load encryption network failed")
-			// collect errors, but keep trying replacing other interfaces.
-			errs = errors.Join(errs, err)
-		} else {
-			log.WithField(logfields.Interface, iface).Info("Encryption network program (re)loaded")
-			// Defer map removal until all interfaces' progs have been replaced.
-			defer finalize()
+		if err := attachSKBProgram(device, coll.Programs[symbolFromNetwork], symbolFromNetwork,
+			bpffsDeviceLinksDir(bpf.CiliumPath(), device), netlink.HANDLE_MIN_INGRESS, option.Config.EnableTCX); err != nil {
+
+			// Collect errors, keep attaching to other interfaces.
+			errs = errors.Join(errs, fmt.Errorf("interface %s: %w", iface, err))
+			continue
 		}
+
+		log.WithField(logfields.Interface, iface).Info("Encryption network program (re)loaded")
 	}
 
 	if errs != nil {
 		return fmt.Errorf("failed to load encryption program: %w", errs)
+	}
+
+	if err := commit(); err != nil {
+		return fmt.Errorf("committing bpf pins: %w", err)
 	}
 
 	return nil
@@ -259,7 +255,7 @@ func (l *loader) reinitializeOverlay(ctx context.Context, tunnelConfig tunnel.Co
 	// gather compile options for bpf_overlay.c
 	opts := []string{
 		fmt.Sprintf("-DSECLABEL=%d", identity.ReservedIdentityWorld),
-		fmt.Sprintf("-DNODE_MAC={.addr=%s}", mac.CArrayString(link.Attrs().HardwareAddr)),
+		fmt.Sprintf("-DTHIS_INTERFACE_MAC={.addr=%s}", mac.CArrayString(link.Attrs().HardwareAddr)),
 		fmt.Sprintf("-DCALLS_MAP=cilium_calls_overlay_%d", identity.ReservedIdentityWorld),
 	}
 	if option.Config.EnableNodePort {
@@ -303,19 +299,21 @@ func (l *loader) reinitializeXDPLocked(ctx context.Context, extraCArgs []string,
 			}
 		}
 	}
+
+	// Clean up the legacy cilium_calls_xdp path.
+	// TODO:  Remove in Cilium 1.17.
+	os.Remove(filepath.Join(bpf.TCGlobalsPath(), "cilium_calls_xdp"))
+
 	return nil
 }
 
 // ReinitializeXDP (re-)configures the XDP datapath only. This includes recompilation
 // and reinsertion of the object into the kernel as well as an atomic program replacement
 // at the XDP hook. extraCArgs can be passed-in in order to alter BPF code defines.
-func (l *loader) ReinitializeXDP(ctx context.Context, o datapath.BaseProgramOwner, extraCArgs []string) error {
-	// TODO: react to changes (using the currently ignored watch channel)
-	nativeDevices, _ := tables.SelectedDevices(l.devices, l.db.ReadTxn())
-	devices := tables.DeviceNames(nativeDevices)
-
-	o.GetCompilationLock().Lock()
-	defer o.GetCompilationLock().Unlock()
+func (l *loader) ReinitializeXDP(ctx context.Context, extraCArgs []string) error {
+	l.compilationLock.Lock()
+	defer l.compilationLock.Unlock()
+	devices := l.nodeConfig.Load().DeviceNames()
 	return l.reinitializeXDPLocked(ctx, extraCArgs, devices)
 }
 
@@ -323,7 +321,7 @@ func (l *loader) ReinitializeXDP(ctx context.Context, o datapath.BaseProgramOwne
 // BPF programs, netfilter rule configuration and reserving routes in IPAM for
 // locally detected prefixes. It may be run upon initial Cilium startup, after
 // restore from a previous Cilium run, or during regular Cilium operation.
-func (l *loader) Reinitialize(ctx context.Context, o datapath.BaseProgramOwner, tunnelConfig tunnel.Config, deviceMTU int, iptMgr datapath.IptablesManager, p datapath.Proxy) error {
+func (l *loader) Reinitialize(ctx context.Context, cfg datapath.LocalNodeConfiguration, tunnelConfig tunnel.Config, iptMgr datapath.IptablesManager, p datapath.Proxy) error {
 	sysSettings := []tables.Sysctl{
 		{Name: "net.core.bpf_jit_enable", Val: "1", IgnoreErr: true, Warn: "Unable to ensure that BPF JIT compilation is enabled. This can be ignored when Cilium is running inside non-host network namespace (e.g. with kind or minikube)"},
 		{Name: "net.ipv4.conf.all.rp_filter", Val: "0", IgnoreErr: false},
@@ -333,18 +331,21 @@ func (l *loader) Reinitialize(ctx context.Context, o datapath.BaseProgramOwner, 
 	}
 
 	// Lock so that endpoints cannot be built while we are compile base programs.
-	o.GetCompilationLock().Lock()
-	defer o.GetCompilationLock().Unlock()
-	defer func() { firstInitialization = false }()
+	l.compilationLock.Lock()
+	defer l.compilationLock.Unlock()
 
-	l.init(o.Datapath(), o.LocalConfig())
+	// Store the new LocalNodeConfiguration
+	l.nodeConfig.Store(&cfg)
+	// Startup relies on not returning an error here, maybe something we
+	// can fix in the future.
+	_ = l.templateCache.UpdateDatapathHash(&cfg)
 
-	var nodeIPv4, nodeIPv6 net.IP
+	var internalIPv4, internalIPv6 net.IP
 	if option.Config.EnableIPv4 {
-		nodeIPv4 = node.GetInternalIPv4Router()
+		internalIPv4 = cfg.CiliumInternalIPv4
 	}
 	if option.Config.EnableIPv6 {
-		nodeIPv6 = node.GetIPv6Router()
+		internalIPv6 = cfg.CiliumInternalIPv6
 		// Docker <17.05 has an issue which causes IPv6 to be disabled in the initns for all
 		// interface (https://github.com/docker/libnetwork/issues/1720)
 		// Enable IPv6 for now
@@ -353,7 +354,7 @@ func (l *loader) Reinitialize(ctx context.Context, o datapath.BaseProgramOwner, 
 	}
 
 	// Datapath initialization
-	hostDev1, _, err := setupBaseDevice(l.sysctl, deviceMTU)
+	hostDev1, _, err := setupBaseDevice(l.sysctl, cfg.DeviceMTU)
 	if err != nil {
 		return fmt.Errorf("failed to setup base devices: %w", err)
 	}
@@ -370,7 +371,7 @@ func (l *loader) Reinitialize(ctx context.Context, o datapath.BaseProgramOwner, 
 		}
 	}
 
-	if err := setupTunnelDevice(l.sysctl, tunnelConfig.Protocol(), tunnelConfig.Port(), deviceMTU); err != nil {
+	if err := setupTunnelDevice(l.sysctl, tunnelConfig.Protocol(), tunnelConfig.Port(), cfg.DeviceMTU); err != nil {
 		return fmt.Errorf("failed to setup %s tunnel device: %w", tunnelConfig.Protocol(), err)
 	}
 
@@ -387,24 +388,23 @@ func (l *loader) Reinitialize(ctx context.Context, o datapath.BaseProgramOwner, 
 	}
 
 	// add internal ipv4 and ipv6 addresses to cilium_host
-	if err := addHostDeviceAddr(hostDev1, nodeIPv4, nodeIPv6); err != nil {
+	if err := addHostDeviceAddr(hostDev1, internalIPv4, internalIPv6); err != nil {
 		return fmt.Errorf("failed to add internal IP address to %s: %w", hostDev1.Attrs().Name, err)
 	}
 
-	// TODO: react to changes (using the currently ignored watch channel)
-	nativeDevices, _ := tables.SelectedDevices(l.devices, l.db.ReadTxn())
-	devices := tables.DeviceNames(nativeDevices)
+	devices := cfg.DeviceNames()
+
 	if err := cleanIngressQdisc(devices); err != nil {
 		log.WithError(err).Warn("Unable to clean up ingress qdiscs")
 		return err
 	}
 
-	if err := l.writeNodeConfigHeader(o); err != nil {
+	if err := l.writeNodeConfigHeader(&cfg); err != nil {
 		log.WithError(err).Error("Unable to write node config header")
 		return err
 	}
 
-	if err := l.writeNetdevHeader("./", o); err != nil {
+	if err := l.writeNetdevHeader("./"); err != nil {
 		log.WithError(err).Warn("Unable to write netdev header")
 		return err
 	}
@@ -412,18 +412,10 @@ func (l *loader) Reinitialize(ctx context.Context, o datapath.BaseProgramOwner, 
 	if option.Config.EnableXDPPrefilter {
 		scopedLog := log.WithField(logfields.Devices, devices)
 
-		preFilter, err := prefilter.NewPreFilter()
-		if err != nil {
-			scopedLog.WithError(err).Warn("Unable to init prefilter")
-			return err
-		}
-
-		if err := writePreFilterHeader(preFilter, "./", devices); err != nil {
+		if err := writePreFilterHeader(l.prefilter, "./", devices); err != nil {
 			scopedLog.WithError(err).Warn("Unable to write prefilter header")
 			return err
 		}
-
-		o.SetPrefilter(preFilter)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, defaults.ExecTimeout)
@@ -462,13 +454,8 @@ func (l *loader) Reinitialize(ctx context.Context, o datapath.BaseProgramOwner, 
 			log.WithError(err).Fatal("failed to compile encryption programs")
 		}
 
-		if err := l.reinitializeIPSec(ctx); err != nil {
+		if err := l.reinitializeIPSec(); err != nil {
 			return err
-		}
-
-		if firstInitialization {
-			// Start a background worker to reinitialize IPsec if links change.
-			l.reloadIPSecOnLinkChanges()
 		}
 	}
 
@@ -476,7 +463,7 @@ func (l *loader) Reinitialize(ctx context.Context, o datapath.BaseProgramOwner, 
 		return err
 	}
 
-	if err := o.Datapath().Node().NodeConfigurationChanged(*o.LocalConfig()); err != nil {
+	if err := l.nodeHandler.NodeConfigurationChanged(cfg); err != nil {
 		return err
 	}
 

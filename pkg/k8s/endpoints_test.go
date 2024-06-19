@@ -7,9 +7,8 @@ import (
 	"reflect"
 	"testing"
 
-	check "github.com/cilium/checkmate"
+	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/checker"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_discovery_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1"
@@ -255,8 +254,9 @@ func TestEndpoints_DeepEqual(t *testing.T) {
 	}
 }
 
-func (s *K8sSuite) Test_parseK8sEPv1(c *check.C) {
+func Test_parseK8sEPv1(t *testing.T) {
 	nodeName := "k8s1"
+	hostname := "pod-1"
 
 	meta := slim_metav1.ObjectMeta{
 		Name:      "foo",
@@ -344,6 +344,7 @@ func (s *K8sSuite) Test_parseK8sEPv1(c *check.C) {
 									{
 										IP:       "172.0.0.1",
 										NodeName: &nodeName,
+										Hostname: hostname,
 									},
 								},
 								Ports: []slim_corev1.EndpointPort{
@@ -371,6 +372,7 @@ func (s *K8sSuite) Test_parseK8sEPv1(c *check.C) {
 						"http-test-svc-2": loadbalancer.NewL4Addr(loadbalancer.TCP, 8081),
 					},
 					NodeName: nodeName,
+					Hostname: hostname,
 				}
 				return svcEP
 			},
@@ -521,11 +523,11 @@ func (s *K8sSuite) Test_parseK8sEPv1(c *check.C) {
 		args := tt.setupArgs()
 		want := tt.setupWanted()
 		got := ParseEndpoints(args.eps)
-		c.Assert(got, checker.DeepEquals, want, check.Commentf("Test name: %q", tt.name))
+		require.EqualValuesf(t, want, got, "Test name: %q", tt.name)
 	}
 }
 
-func (s *K8sSuite) TestEndpointsString(c *check.C) {
+func TestEndpointsString(t *testing.T) {
 	endpoints := &slim_corev1.Endpoints{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "foo",
@@ -563,11 +565,12 @@ func (s *K8sSuite) TestEndpointsString(c *check.C) {
 	}
 
 	ep := ParseEndpoints(endpoints)
-	c.Assert(ep.String(), check.Equals, "172.0.0.1:5555/SCTP,172.0.0.1:8080/TCP,172.0.0.1:8081/TCP,172.0.0.2:5555/SCTP,172.0.0.2:8080/TCP,172.0.0.2:8081/TCP")
+	require.Equal(t, "172.0.0.1:5555/SCTP,172.0.0.1:8080/TCP,172.0.0.1:8081/TCP,172.0.0.2:5555/SCTP,172.0.0.2:8080/TCP,172.0.0.2:8081/TCP", ep.String())
 }
 
-func (s *K8sSuite) Test_parseK8sEPSlicev1Beta1(c *check.C) {
+func Test_parseK8sEPSlicev1Beta1(t *testing.T) {
 	nodeName := "k8s1"
+	hostname := "pod-1"
 
 	meta := slim_metav1.ObjectMeta{
 		Name:      "foo",
@@ -622,6 +625,7 @@ func (s *K8sSuite) Test_parseK8sEPSlicev1Beta1(c *check.C) {
 								Topology: map[string]string{
 									"kubernetes.io/hostname": nodeName,
 								},
+								Hostname: func() *string { return &hostname }(),
 							},
 						},
 						Ports: []slim_discovery_v1beta1.EndpointPort{
@@ -641,6 +645,7 @@ func (s *K8sSuite) Test_parseK8sEPSlicev1Beta1(c *check.C) {
 						"http-test-svc": loadbalancer.NewL4Addr(loadbalancer.TCP, 8080),
 					},
 					NodeName: nodeName,
+					Hostname: hostname,
 				}
 				return svcEP
 			},
@@ -1135,7 +1140,7 @@ func (s *K8sSuite) Test_parseK8sEPSlicev1Beta1(c *check.C) {
 			option.Config.EnableK8sTerminatingEndpoint = true
 		}
 		got := ParseEndpointSliceV1Beta1(args.eps)
-		c.Assert(got, checker.DeepEquals, want, check.Commentf("Test name: %q", tt.name))
+		require.EqualValuesf(t, want, got, "Test name: %q", tt.name)
 	}
 }
 
@@ -1230,8 +1235,9 @@ func Test_parseEndpointPortV1Beta1(t *testing.T) {
 	}
 }
 
-func (s *K8sSuite) Test_parseK8sEPSlicev1(c *check.C) {
+func Test_parseK8sEPSlicev1(t *testing.T) {
 	nodeName := "k8s1"
+	hostname := "pod-1"
 
 	meta := slim_metav1.ObjectMeta{
 		Name:      "foo",
@@ -1286,6 +1292,7 @@ func (s *K8sSuite) Test_parseK8sEPSlicev1(c *check.C) {
 								DeprecatedTopology: map[string]string{
 									"kubernetes.io/hostname": nodeName,
 								},
+								Hostname: func() *string { return &hostname }(),
 							},
 						},
 						Ports: []slim_discovery_v1.EndpointPort{
@@ -1305,6 +1312,7 @@ func (s *K8sSuite) Test_parseK8sEPSlicev1(c *check.C) {
 						"http-test-svc": loadbalancer.NewL4Addr(loadbalancer.TCP, 8080),
 					},
 					NodeName: nodeName,
+					Hostname: hostname,
 				}
 				return svcEP
 			},
@@ -2006,7 +2014,7 @@ func (s *K8sSuite) Test_parseK8sEPSlicev1(c *check.C) {
 			option.Config.EnableK8sTerminatingEndpoint = true
 		}
 		got := ParseEndpointSliceV1(args.eps)
-		c.Assert(got, checker.DeepEquals, want, check.Commentf("Test name: %q", tt.name))
+		require.EqualValues(t, want, got, "Test name: %q", tt.name)
 	}
 }
 

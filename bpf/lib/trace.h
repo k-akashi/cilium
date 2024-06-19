@@ -19,8 +19,7 @@
  *
  * If TRACE_NOTIFY is not defined, the API will be compiled in as a NOP.
  */
-#ifndef __LIB_TRACE__
-#define __LIB_TRACE__
+#pragma once
 
 #include "dbg.h"
 #include "events.h"
@@ -44,13 +43,13 @@ enum trace_point {
 	TRACE_TO_NETWORK,
 } __packed;
 
-/* Reasons for forwarding a packet. */
+/* Reasons for forwarding a packet, keep in sync with pkg/monitor/datapath_trace.go */
 enum trace_reason {
 	TRACE_REASON_POLICY = CT_NEW,
 	TRACE_REASON_CT_ESTABLISHED = CT_ESTABLISHED,
 	TRACE_REASON_CT_REPLY = CT_REPLY,
 	TRACE_REASON_CT_RELATED = CT_RELATED,
-	TRACE_REASON_CT_REOPENED = CT_REOPENED,
+	TRACE_REASON_RESERVED,
 	TRACE_REASON_UNKNOWN,
 	TRACE_REASON_SRV6_ENCAP,
 	TRACE_REASON_SRV6_DECAP,
@@ -67,6 +66,9 @@ enum {
 	TRACE_AGGREGATE_RX = 1,        /* Hide trace on packet receive */
 	TRACE_AGGREGATE_ACTIVE_CT = 3, /* Ratelimit active connection traces */
 };
+
+#define TRACE_EP_ID_UNKNOWN		0
+#define TRACE_IFINDEX_UNKNOWN		0	/* Linux kernel doesn't use ifindex 0 */
 
 #ifndef MONITOR_AGGREGATION
 #define MONITOR_AGGREGATION TRACE_AGGREGATE_NONE
@@ -315,4 +317,3 @@ send_trace_notify6(struct __ctx_buff *ctx, enum trace_point obs_point,
 	update_trace_metrics(ctx, obs_point, reason);
 }
 #endif /* TRACE_NOTIFY */
-#endif /* __LIB_TRACE__ */

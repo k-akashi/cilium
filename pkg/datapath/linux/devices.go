@@ -4,17 +4,19 @@
 package linux
 
 import (
-	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/statedb"
+
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
-	"github.com/cilium/cilium/pkg/statedb"
 )
 
 // DeviceManager is a temporary compatibility bridge to keep DeviceManager uses as is and reuse its tests
@@ -71,8 +73,9 @@ func (dm *DeviceManager) Detect(k8sEnabled bool) ([]string, error) {
 			return nil, fmt.Errorf("unable to determine direct routing device. Use --%s to specify it",
 				option.DirectRoutingDevice)
 		}
-		log.WithField(option.DirectRoutingDevice, option.Config.DirectRoutingDevice).
-			Info("Direct routing device detected")
+		dm.params.Log.Info("Direct routing device detected",
+			logfields.DirectRoutingDevice, option.Config.DirectRoutingDevice,
+		)
 	}
 
 	if option.Config.EnableIPv6NDP && option.Config.IPv6MCastDevice == "" {
@@ -90,6 +93,7 @@ func (dm *DeviceManager) Detect(k8sEnabled bool) ([]string, error) {
 type devicesManagerParams struct {
 	cell.In
 
+	Log         *slog.Logger
 	DB          *statedb.DB
 	DeviceTable statedb.Table[*tables.Device]
 	RouteTable  statedb.Table[*tables.Route]
@@ -99,10 +103,4 @@ type devicesManagerParams struct {
 // Dummy dependency to *devicesController to make sure devices table is populated.
 func newDeviceManager(p devicesManagerParams, _ *devicesController) *DeviceManager {
 	return &DeviceManager{params: p, hive: nil}
-}
-
-func (dm *DeviceManager) Stop() {
-	if dm.hive != nil {
-		dm.hive.Stop(context.TODO())
-	}
 }

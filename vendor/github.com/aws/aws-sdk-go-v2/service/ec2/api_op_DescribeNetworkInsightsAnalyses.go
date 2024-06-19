@@ -43,8 +43,10 @@ type DescribeNetworkInsightsAnalysesInput struct {
 	DryRun *bool
 
 	// The filters. The following are the possible values:
+	//
 	//   - path-found - A Boolean value that indicates whether a feasible path is
 	//   found.
+	//
 	//   - status - The status of the analysis (running | succeeded | failed).
 	Filters []types.Filter
 
@@ -133,6 +135,9 @@ func (c *Client) addOperationDescribeNetworkInsightsAnalysesMiddlewares(stack *m
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeNetworkInsightsAnalyses(options.Region), middleware.Before); err != nil {

@@ -12,8 +12,9 @@ import (
 )
 
 // Describes the attributes of the specified Elastic IP addresses. For
-// requirements, see Using reverse DNS for email applications (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html#Using_Elastic_Addressing_Reverse_DNS)
-// .
+// requirements, see [Using reverse DNS for email applications].
+//
+// [Using reverse DNS for email applications]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html#Using_Elastic_Addressing_Reverse_DNS
 func (c *Client) DescribeAddressesAttribute(ctx context.Context, params *DescribeAddressesAttributeInput, optFns ...func(*Options)) (*DescribeAddressesAttributeOutput, error) {
 	if params == nil {
 		params = &DescribeAddressesAttributeInput{}
@@ -121,6 +122,9 @@ func (c *Client) addOperationDescribeAddressesAttributeMiddlewares(stack *middle
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeAddressesAttribute(options.Region), middleware.Before); err != nil {

@@ -44,9 +44,9 @@ type GetIpamResourceCidrsInput struct {
 	// UnauthorizedOperation .
 	DryRun *bool
 
-	// One or more filters for the request. For more information about filtering, see
-	// Filtering CLI output (https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-filter.html)
-	// .
+	// One or more filters for the request. For more information about filtering, see [Filtering CLI output].
+	//
+	// [Filtering CLI output]: https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-filter.html
 	Filters []types.Filter
 
 	// The ID of the IPAM pool that the resource is in.
@@ -141,6 +141,9 @@ func (c *Client) addOperationGetIpamResourceCidrsMiddlewares(stack *middleware.S
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = addOpGetIpamResourceCidrsValidationMiddleware(stack); err != nil {

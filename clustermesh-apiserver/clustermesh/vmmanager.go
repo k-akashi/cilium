@@ -11,6 +11,7 @@ import (
 	"path"
 	"sort"
 
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,7 +21,6 @@ import (
 	"github.com/cilium/cilium/pkg/cidr"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/identity"
 	identityCache "github.com/cilium/cilium/pkg/identity/cache"
 	identitymodel "github.com/cilium/cilium/pkg/identity/model"
@@ -137,7 +137,7 @@ type VMManager struct {
 //
 
 // UpdateIdentities will be called when identities have changed
-func (m *VMManager) UpdateIdentities(added, deleted identityCache.IdentityCache) {}
+func (m *VMManager) UpdateIdentities(added, deleted identity.IdentityMap) {}
 
 // GetNodeSuffix must return the node specific suffix to use
 func (m *VMManager) GetNodeSuffix() string {

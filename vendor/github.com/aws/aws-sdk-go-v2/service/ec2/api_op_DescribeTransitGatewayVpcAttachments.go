@@ -37,11 +37,15 @@ type DescribeTransitGatewayVpcAttachmentsInput struct {
 	DryRun *bool
 
 	// One or more filters. The possible values are:
+	//
 	//   - state - The state of the attachment. Valid values are available | deleted |
 	//   deleting | failed | failing | initiatingRequest | modifying |
 	//   pendingAcceptance | pending | rollingBack | rejected | rejecting .
+	//
 	//   - transit-gateway-attachment-id - The ID of the attachment.
+	//
 	//   - transit-gateway-id - The ID of the transit gateway.
+	//
 	//   - vpc-id - The ID of the VPC.
 	Filters []types.Filter
 
@@ -126,6 +130,9 @@ func (c *Client) addOperationDescribeTransitGatewayVpcAttachmentsMiddlewares(sta
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeTransitGatewayVpcAttachments(options.Region), middleware.Before); err != nil {

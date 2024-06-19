@@ -36,12 +36,17 @@ type DescribeTrafficMirrorTargetsInput struct {
 	DryRun *bool
 
 	// One or more filters. The possible values are:
+	//
 	//   - description : The Traffic Mirror target description.
+	//
 	//   - network-interface-id : The ID of the Traffic Mirror session network
 	//   interface.
+	//
 	//   - network-load-balancer-arn : The Amazon Resource Name (ARN) of the Network
 	//   Load Balancer that is associated with the session.
+	//
 	//   - owner-id : The ID of the account that owns the Traffic Mirror session.
+	//
 	//   - traffic-mirror-target-id : The ID of the Traffic Mirror target.
 	Filters []types.Filter
 
@@ -126,6 +131,9 @@ func (c *Client) addOperationDescribeTrafficMirrorTargetsMiddlewares(stack *midd
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeTrafficMirrorTargets(options.Region), middleware.Before); err != nil {

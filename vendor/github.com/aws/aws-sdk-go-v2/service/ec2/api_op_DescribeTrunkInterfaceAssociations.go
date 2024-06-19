@@ -39,7 +39,9 @@ type DescribeTrunkInterfaceAssociationsInput struct {
 	DryRun *bool
 
 	// One or more filters.
+	//
 	//   - gre-key - The ID of a trunk interface association.
+	//
 	//   - interface-protocol - The interface protocol. Valid values are VLAN and GRE .
 	Filters []types.Filter
 
@@ -121,6 +123,9 @@ func (c *Client) addOperationDescribeTrunkInterfaceAssociationsMiddlewares(stack
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeTrunkInterfaceAssociations(options.Region), middleware.Before); err != nil {

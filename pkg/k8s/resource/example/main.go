@@ -7,14 +7,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
+	"log/slog"
+	"math/rand/v2"
 
+	"github.com/cilium/hive/cell"
 	"github.com/cilium/workerpool"
 	"github.com/spf13/pflag"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/k8s/utils"
@@ -49,7 +50,7 @@ func main() {
 	)
 	hive.RegisterFlags(pflag.CommandLine)
 	pflag.Parse()
-	hive.Run()
+	hive.Run(slog.Default())
 }
 
 var resourcesCell = cell.Module(
@@ -214,7 +215,7 @@ func (ps *PrintServices) processLoop(ctx context.Context) error {
 
 			// Simulate a fault 10% of the time. This will cause this event to be retried
 			// later.
-			if rand.Intn(10) == 1 {
+			if rand.IntN(10) == 1 {
 				log.Info("Injecting a fault!")
 				ev.Done(errors.New("injected fault"))
 				continue

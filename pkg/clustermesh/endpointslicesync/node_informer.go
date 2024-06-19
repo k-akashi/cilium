@@ -6,6 +6,7 @@ package endpointslicesync
 import (
 	"fmt"
 
+	"github.com/sirupsen/logrus"
 	"golang.org/x/exp/maps"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -29,9 +30,9 @@ type meshNodeInformer struct {
 	mutex   lock.RWMutex
 }
 
-func newMeshNodeInformer() *meshNodeInformer {
+func newMeshNodeInformer(logger logrus.FieldLogger) *meshNodeInformer {
 	return &meshNodeInformer{
-		dummyInformer: dummyInformer{"meshNodeInformer"},
+		dummyInformer: dummyInformer{name: "meshNodeInformer", logger: logger},
 		nodes:         map[string]*v1.Node{},
 	}
 }
@@ -55,6 +56,13 @@ func createDummyNode(cluster string) *v1.Node {
 	}
 }
 
+func (i *meshNodeInformer) ListClusters() []string {
+	i.mutex.RLock()
+	defer i.mutex.RUnlock()
+
+	return maps.Keys(i.nodes)
+}
+
 func (i *meshNodeInformer) List(selector labels.Selector) ([]*v1.Node, error) {
 	reqs, _ := selector.Requirements()
 	if !selector.Empty() {
@@ -75,7 +83,7 @@ func (i *meshNodeInformer) Get(name string) (*v1.Node, error) {
 	return nil, newNotFoundError(fmt.Sprintf("node '%s' not found", name))
 }
 
-func (i *meshNodeInformer) onAddCluster(cluster string) {
+func (i *meshNodeInformer) onClusterAdd(cluster string) {
 	i.mutex.Lock()
 	node := createDummyNode(cluster)
 	i.nodes[cluster] = node
@@ -87,7 +95,7 @@ func (i *meshNodeInformer) onAddCluster(cluster string) {
 	i.handler.OnAdd(node, false)
 }
 
-func (i *meshNodeInformer) onDeleteCluster(cluster string) {
+func (i *meshNodeInformer) onClusterDelete(cluster string) {
 	i.mutex.Lock()
 	delete(i.nodes, cluster)
 	i.mutex.Unlock()

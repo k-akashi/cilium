@@ -6,6 +6,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 
 	"github.com/go-openapi/runtime/middleware"
@@ -17,6 +18,7 @@ import (
 	. "github.com/cilium/cilium/api/v1/server/restapi/daemon"
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
@@ -35,7 +37,6 @@ import (
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/promise"
-	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/status"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/version"
@@ -52,7 +53,12 @@ const (
 	k8sMinimumEventHeartbeat = time.Minute
 )
 
-var randGen = rand.NewSafeRand(time.Now().UnixNano())
+var (
+	// randSrc is a source of pseudo-random numbers. It is seeded to the current time in
+	// nanoseconds by default but can be reseeded in tests so they are deterministic.
+	randSrc = rand.NewPCG(uint64(time.Now().UnixNano()), 0)
+	randGen = rand.New(randSrc)
+)
 
 type k8sVersion struct {
 	version          string
@@ -221,6 +227,25 @@ func (d *Daemon) getClockSourceStatus() *models.ClockSource {
 	return timestamp.GetClockSourceFromOptions()
 }
 
+func (d *Daemon) getAttachModeStatus() models.AttachMode {
+	mode := models.AttachModeTc
+	if option.Config.EnableTCX && probes.HaveTCX() == nil {
+		mode = models.AttachModeTcx
+	}
+	return mode
+}
+
+func (d *Daemon) getDatapathModeStatus() models.DatapathMode {
+	mode := models.DatapathModeVeth
+	switch option.Config.DatapathMode {
+	case datapathOption.DatapathModeNetkit:
+		mode = models.DatapathModeNetkit
+	case datapathOption.DatapathModeNetkitL2:
+		mode = models.DatapathModeNetkitDashL2
+	}
+	return mode
+}
+
 func (d *Daemon) getCNIChainingStatus() *models.CNIChainingStatus {
 	mode := d.cniConfigManager.GetChainingMode()
 	if len(mode) == 0 {
@@ -276,6 +301,7 @@ func (d *Daemon) getKubeProxyReplacementStatus() *models.KubeProxyReplacement {
 			features.NodePort.DsrMode = models.KubeProxyReplacementFeaturesNodePortDsrModeGeneve
 		}
 		if option.Config.NodePortMode == option.NodePortModeHybrid {
+			//nolint:staticcheck
 			features.NodePort.Mode = strings.Title(option.Config.NodePortMode)
 		}
 		features.NodePort.Algorithm = models.KubeProxyReplacementFeaturesNodePortAlgorithmRandom
@@ -589,7 +615,7 @@ func (h *getNodes) Handle(d *Daemon, params GetClusterNodesParams) middleware.Re
 	if exists {
 		clientID = *params.ClientID
 	} else {
-		clientID = randGen.Int63()
+		clientID = randGen.Int64()
 		// make sure we haven't allocated an existing client ID nor the
 		// randomizer has allocated ID 0, if we have then we will return
 		// clientID 0.
@@ -728,8 +754,8 @@ func (d *Daemon) getStatus(brief bool) models.StatusResponse {
 
 func (d *Daemon) getIdentityRange() *models.IdentityRange {
 	s := &models.IdentityRange{
-		MinIdentity: int64(identity.GetMinimalAllocationIdentity()),
-		MaxIdentity: int64(identity.GetMaximumAllocationIdentity()),
+		MinIdentity: int64(identity.GetMinimalAllocationIdentity(d.clusterInfo.ID)),
+		MaxIdentity: int64(identity.GetMaximumAllocationIdentity(d.clusterInfo.ID)),
 	}
 
 	return s
@@ -1072,6 +1098,25 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 				}
 			},
 		},
+		{
+			Name: "cni-config",
+			Probe: func(ctx context.Context) (interface{}, error) {
+				if d.cniConfigManager == nil {
+					return nil, nil
+				}
+				return d.cniConfigManager.Status(), nil
+			},
+			OnStatusUpdate: func(status status.Status) {
+				d.statusCollectMutex.Lock()
+				defer d.statusCollectMutex.Unlock()
+
+				if status.Err == nil {
+					if s, ok := status.Data.(*models.Status); ok {
+						d.statusResponse.CniFile = s
+					}
+				}
+			},
+		},
 	}
 
 	d.statusResponse.Masquerading = d.getMasqueradingStatus()
@@ -1085,6 +1130,8 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 	d.statusResponse.CniChaining = d.getCNIChainingStatus()
 	d.statusResponse.IdentityRange = d.getIdentityRange()
 	d.statusResponse.Srv6 = d.getSRv6Status()
+	d.statusResponse.AttachMode = d.getAttachModeStatus()
+	d.statusResponse.DatapathMode = d.getDatapathModeStatus()
 
 	d.statusCollector = status.NewCollector(probes, status.Config{StackdumpPath: "/run/cilium/state/agent.stack.gz"})
 
@@ -1102,5 +1149,7 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 			}).Error("KVStore state not OK")
 
 		}
+
+		d.statusCollector.Close()
 	})
 }

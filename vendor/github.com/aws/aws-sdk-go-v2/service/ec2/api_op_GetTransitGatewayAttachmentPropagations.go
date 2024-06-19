@@ -42,6 +42,7 @@ type GetTransitGatewayAttachmentPropagationsInput struct {
 	DryRun *bool
 
 	// One or more filters. The possible values are:
+	//
 	//   - transit-gateway-route-table-id - The ID of the transit gateway route table.
 	Filters []types.Filter
 
@@ -123,6 +124,9 @@ func (c *Client) addOperationGetTransitGatewayAttachmentPropagationsMiddlewares(
 		return err
 	}
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
 	if err = addOpGetTransitGatewayAttachmentPropagationsValidationMiddleware(stack); err != nil {

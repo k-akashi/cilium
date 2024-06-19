@@ -4,6 +4,8 @@
 package clustermesh
 
 import (
+	"github.com/cilium/hive/cell"
+
 	cmk8s "github.com/cilium/cilium/clustermesh-apiserver/clustermesh/k8s"
 	"github.com/cilium/cilium/clustermesh-apiserver/health"
 	cmmetrics "github.com/cilium/cilium/clustermesh-apiserver/metrics"
@@ -13,7 +15,6 @@ import (
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/gops"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/heartbeat"
@@ -31,8 +32,8 @@ var Cell = cell.Module(
 	// ClusterName is not the default one), because they are valid in
 	// case we only use the external workloads feature, and not clustermesh.
 	cell.Config(cmtypes.DefaultClusterInfo),
-	cell.Invoke(func(cinfo cmtypes.ClusterInfo) error { return cinfo.InitClusterIDMax() }),
-	cell.Invoke(func(cinfo cmtypes.ClusterInfo) error { return cinfo.Validate() }),
+	cell.Invoke(cmtypes.ClusterInfo.InitClusterIDMax),
+	cell.Invoke(cmtypes.ClusterInfo.Validate),
 
 	pprof.Cell,
 	cell.Config(pprof.Config{

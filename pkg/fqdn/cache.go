@@ -11,6 +11,7 @@ import (
 	"sort"
 	"unsafe"
 
+	"golang.org/x/exp/maps"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/fqdn/matchpattern"
@@ -483,9 +484,14 @@ func (c *DNSCache) lookupIPByTime(now time.Time, ip netip.Addr) (names []string)
 	return names
 }
 
-// ipExistsLocked returns true if the IP is known to the cache.
-func (c *DNSCache) ipExistsLocked(ip netip.Addr) bool {
-	_, exists := c.reverse[ip]
+// entryExistsLocked returns true if this (name, IP) pair is known to the cache.
+func (c *DNSCache) entryExistsLocked(name string, ip netip.Addr) bool {
+	names, exists := c.reverse[ip]
+	if !exists {
+		return false
+	}
+
+	_, exists = names[name]
 	return exists
 }
 
@@ -581,14 +587,14 @@ func (c *DNSCache) removeReverse(ip netip.Addr, entry *cacheEntry) {
 }
 
 // GetIPs takes a snapshot of all IPs in the reverse cache.
-func (c *DNSCache) GetIPs() sets.Set[netip.Addr] {
+func (c *DNSCache) GetIPs() map[netip.Addr][]string {
 	c.RWMutex.RLock()
 	defer c.RWMutex.RUnlock()
 
-	out := make(sets.Set[netip.Addr], len(c.reverse))
+	out := make(map[netip.Addr][]string, len(c.reverse))
 
-	for ip := range c.reverse {
-		out.Insert(ip)
+	for ip, names := range c.reverse {
+		out[ip] = maps.Keys(names)
 	}
 
 	return out
@@ -791,6 +797,7 @@ type DNSZombieMappings struct {
 	lock.Mutex
 	deletes        map[netip.Addr]*DNSZombieMapping
 	lastCTGCUpdate time.Time
+	nextCTGCUpdate time.Time // estimated
 	// ctGCRevision is a serial number tracking the number of conntrack
 	// garbage collection runs. It is used to ensure that entries
 	// are not reaped until CT GC has run at least twice.
@@ -1059,9 +1066,10 @@ func (zombies *DNSZombieMappings) MarkAlive(now time.Time, ip netip.Addr) {
 // When 'ctGCStart' is later than an alive timestamp, set with MarkAlive, the zombie is
 // no longer alive. Thus, this call acts as a gating function for what data is
 // returned by GC.
-func (zombies *DNSZombieMappings) SetCTGCTime(ctGCStart time.Time) {
+func (zombies *DNSZombieMappings) SetCTGCTime(ctGCStart, estNext time.Time) {
 	zombies.Lock()
 	zombies.lastCTGCUpdate = ctGCStart
+	zombies.nextCTGCUpdate = estNext
 	zombies.ctGCRevision++
 	zombies.Unlock()
 }
@@ -1151,12 +1159,13 @@ func (zombies *DNSZombieMappings) ForceExpireByNameIP(expireLookupsBefore time.T
 	return nil
 }
 
-// CIDRMatcherFunc is a function passed to (*DNSZombieMappings).DumpAlive,
+// PrefixMatcherFunc is a function passed to (*DNSZombieMappings).DumpAlive,
 // called on each zombie to determine whether it should be returned.
-type CIDRMatcherFunc func(ip net.IP) bool
+type PrefixMatcherFunc func(ip netip.Addr) bool
+type NameMatcherFunc func(name string) bool
 
-// DumpAlive returns copies of still-alive zombies matching cidrMatcher.
-func (zombies *DNSZombieMappings) DumpAlive(cidrMatcher CIDRMatcherFunc) (alive []*DNSZombieMapping) {
+// DumpAlive returns copies of still-alive zombies matching prefixMatcher.
+func (zombies *DNSZombieMappings) DumpAlive(prefixMatcher PrefixMatcherFunc) (alive []*DNSZombieMapping) {
 	zombies.Lock()
 	defer zombies.Unlock()
 
@@ -1166,7 +1175,7 @@ func (zombies *DNSZombieMappings) DumpAlive(cidrMatcher CIDRMatcherFunc) (alive 
 			continue
 		}
 		// only proceed if zombie is alive and the IP matches the CIDR selector
-		if cidrMatcher != nil && !cidrMatcher(zombie.IP.AsSlice()) {
+		if prefixMatcher != nil && !prefixMatcher(zombie.IP) {
 			continue
 		}
 

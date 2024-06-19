@@ -4,6 +4,8 @@
 package endpoint
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -13,7 +15,6 @@ import (
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/eventqueue"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/maps/bwmap"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 )
@@ -45,7 +46,9 @@ func (ev *EndpointRegenerationEvent) Handle(res chan interface{}) {
 	// being deleted at the same time. More info PR-1777.
 	doneFunc, err := e.owner.QueueEndpointBuild(regenContext.parentContext, uint64(e.ID))
 	if err != nil {
-		e.getLogger().WithError(err).Warning("unable to queue endpoint build")
+		if !errors.Is(err, context.Canceled) {
+			e.getLogger().WithError(err).Warning("unable to queue endpoint build")
+		}
 	} else if doneFunc != nil {
 		e.getLogger().Debug("Dequeued endpoint from build queue")
 
@@ -233,7 +236,7 @@ func (ev *EndpointPolicyVisibilityEvent) Handle(res chan interface{}) {
 			return
 		}
 		e.getLogger().Debug("creating visibility policy")
-		nvp, err = policy.NewVisibilityPolicy(proxyVisibility)
+		nvp, err = policy.NewVisibilityPolicy(proxyVisibility, e.K8sNamespace, e.K8sPodName)
 		if err != nil {
 			e.getLogger().WithError(err).Warning("unable to parse annotations into visibility policy; disabling visibility policy for endpoint")
 			e.visibilityPolicy = &policy.VisibilityPolicy{
@@ -296,10 +299,12 @@ func (ev *EndpointPolicyBandwidthEvent) Handle(res chan interface{}) {
 	if bandwidthEgress != "" {
 		bps, err = bandwidth.GetBytesPerSec(bandwidthEgress)
 		if err == nil {
-			err = bwmap.Update(e.ID, bps)
+			ev.bwm.UpdateBandwidthLimit(e.ID, bps)
+		} else {
+			e.getLogger().WithError(err).Debugf("failed to parse bandwidth limit %q", bandwidthEgress)
 		}
 	} else {
-		err = bwmap.SilentDelete(e.ID)
+		ev.bwm.DeleteBandwidthLimit(e.ID)
 	}
 	if err != nil {
 		res <- &EndpointRegenerationResult{

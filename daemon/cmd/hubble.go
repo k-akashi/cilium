@@ -221,18 +221,21 @@ func (d *Daemon) launchHubble() {
 	namespaceManager := observer.NewNamespaceManager()
 	go namespaceManager.Run(d.ctx)
 
-	hubbleObserver, err := observer.NewLocalServer(
-		payloadParser,
-		namespaceManager,
-		logger,
-		observerOpts...,
-	)
-	if err != nil {
-		logger.WithError(err).Error("Failed to initialize Hubble")
-		return
+	hubbleObservers := make([]*observer.LocalObserverServer, 10)
+	for i := 0; i < 10; i++ {
+		hubbleObservers[i], err = observer.NewLocalServer(
+			payloadParser,
+			namespaceManager,
+			logger,
+			observerOpts...,
+		)
+		if err != nil {
+			logger.WithError(err).Error("Failed to initialize Hubble")
+			return
+		}
+		go hubbleObservers[i].Start()
+		d.monitorAgent.RegisterNewConsumer(monitor.NewConsumer(hubbleObservers[i]))
 	}
-	go hubbleObserver.Start()
-	d.monitorAgent.RegisterNewConsumer(monitor.NewConsumer(hubbleObserver))
 
 	// configure a local hubble instance that serves more gRPC services
 	sockPath := "unix://" + option.Config.HubbleSocketPath
@@ -244,14 +247,17 @@ func (d *Daemon) launchHubble() {
 		peerServiceOptions = append(peerServiceOptions, serviceoption.WithAddressFamilyPreference(serviceoption.AddressPreferIPv6))
 	}
 	peerSvc := peer.NewService(d.nodeDiscovery.Manager, peerServiceOptions...)
+
 	localSrvOpts = append(localSrvOpts,
 		serveroption.WithUnixSocketListener(sockPath),
 		serveroption.WithHealthService(),
-		serveroption.WithObserverService(hubbleObserver),
+		//serveroption.WithObserverService(hubbleObserver),
 		serveroption.WithPeerService(peerSvc),
 		serveroption.WithInsecure(),
 	)
-
+	for i := 0; i < 10; i++ {
+		localSrvOpts = append(localSrvOpts, serveroption.WithObserverService(hubbleObservers[i]))
+	}
 	if option.Config.EnableRecorder && option.Config.EnableHubbleRecorderAPI {
 		dispatch, err := sink.NewDispatch(option.Config.HubbleRecorderSinkQueueSize)
 		if err != nil {
@@ -295,7 +301,10 @@ func (d *Daemon) launchHubble() {
 			serveroption.WithTCPListener(address),
 			serveroption.WithHealthService(),
 			serveroption.WithPeerService(peerSvc),
-			serveroption.WithObserverService(hubbleObserver),
+			//serveroption.WithObserverService(hubbleObserver),
+		}
+		for i := 0; i < 10; i++ {
+			options = append(options, serveroption.WithObserverService(hubbleObservers[i]))
 		}
 
 		// Hubble TLS/mTLS setup.
@@ -354,7 +363,9 @@ func (d *Daemon) launchHubble() {
 		}()
 	}
 
-	d.hubbleObserver.Store(hubbleObserver)
+	for i := 0; i < 10; i++ {
+		d.hubbleObserver.Store(hubbleObservers[i])
+	}
 }
 
 // GetIdentity looks up identity by ID from Cilium's identity cache. Hubble uses the identity info

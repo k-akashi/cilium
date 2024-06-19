@@ -34,7 +34,7 @@ const MinTLSVersion = tls.VersionTLS13
 type Options struct {
 	Listener               net.Listener
 	HealthService          healthpb.HealthServer
-	ObserverService        observerpb.ObserverServer
+	ObserverServices       []observerpb.ObserverServer
 	PeerService            peerpb.PeerServer
 	RecorderService        recorderpb.RecorderServer
 	ServerTLSConfig        certloader.ServerConfigBuilder
@@ -101,7 +101,7 @@ func WithHealthService() Option {
 // WithObserverService configures the server to expose the given observer server service.
 func WithObserverService(svc observerpb.ObserverServer) Option {
 	return func(o *Options) error {
-		o.ObserverService = svc
+		o.ObserverServices = append(o.ObserverServices, svc)
 		return nil
 	}
 }

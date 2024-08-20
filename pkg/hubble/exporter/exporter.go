@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 
@@ -30,6 +31,7 @@ type exporter struct {
 	writer  io.WriteCloser
 	flow    *flowpb.Flow
 
+	evch []chan *v1.Event
 	opts exporteroption.Options
 }
 
@@ -57,7 +59,12 @@ func NewExporter(
 			Compress:   opts.Compress,
 		}
 	}
-	return newExporter(ctx, logger, writer, opts)
+	exporter, err := newExporter(ctx, logger, writer, opts)
+	for i := 0; i < 10; i++ {
+		go exporter.DecodeEvent(exporter.evch[i])
+	}
+	return exporter, err
+	//return newExporter(ctx, logger, writer, opts)
 }
 
 // newExporter let's you supply your own WriteCloser for tests.
@@ -68,6 +75,11 @@ func newExporter(ctx context.Context, logger logrus.FieldLogger, writer io.Write
 		flow = new(flowpb.Flow)
 		opts.FieldMask.Alloc(flow.ProtoReflect())
 	}
+
+	ch := make([]chan *v1.Event, 10)
+	for i := 0; i < 10; i++ {
+		ch[i] = make(chan *v1.Event, 10000)
+	}
 	return &exporter{
 		ctx:     ctx,
 		logger:  logger,
@@ -75,6 +87,7 @@ func newExporter(ctx context.Context, logger logrus.FieldLogger, writer io.Write
 		writer:  writer,
 		flow:    flow,
 		opts:    opts,
+		evch:    ch,
 	}, nil
 }
 
@@ -134,18 +147,45 @@ func (e *exporter) Stop() error {
 
 // OnDecodedEvent checks if the event passes the filter.
 // If context was cancelled, it calls Stop() and stops processing events.
+//func (e *exporter) OnDecodedEvent(_ context.Context, ev *v1.Event) (bool, error) {
+//	select {
+//	case <-e.ctx.Done():
+//		return false, e.Stop()
+//	default:
+//	}
+//	if !filters.Apply(e.opts.AllowList, e.opts.DenyList, ev) {
+//		return false, nil
+//	}
+//	res := e.eventToExportEvent(ev)
+//	if res == nil {
+//		return false, nil
+//	}
+//	return false, e.encoder.Encode(res)
+//}
+
 func (e *exporter) OnDecodedEvent(_ context.Context, ev *v1.Event) (bool, error) {
-	select {
-	case <-e.ctx.Done():
-		return false, e.Stop()
+	switch event := ev.Event.(type) {
+	case *flowpb.Flow:
+		uuid := event.GetUuid()
+		hs := fnv.New32a()
+		hs.Write([]byte(uuid))
+		worker_id := int(hs.Sum32() % 100)
+		e.logger.Debugf("OnDevocedEvent: ch [%d]", worker_id)
+		e.logger.Infof("OnDevocedEvent: ch [%d]", worker_id)
+		e.evch[worker_id] <- ev
 	default:
+		e.logger.Infof("OnDevocedEvent: ch default")
+		e.evch[0] <- ev
 	}
-	if !filters.Apply(e.opts.AllowList, e.opts.DenyList, ev) {
-		return false, nil
+
+	return false, nil
+}
+
+func (e *exporter) DecodeEvent(evc chan *v1.Event) {
+	for ev := range evc {
+		if !filters.Apply(e.opts.AllowList, e.opts.DenyList, ev) {
+			continue
+		}
+		e.eventToExportEvent(ev)
 	}
-	res := e.eventToExportEvent(ev)
-	if res == nil {
-		return false, nil
-	}
-	return false, e.encoder.Encode(res)
 }

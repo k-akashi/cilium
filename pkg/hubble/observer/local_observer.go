@@ -55,7 +55,9 @@ type LocalObserverServer struct {
 	// payloadParser decodes flowpb.Payload into flowpb.Flow
 	payloadParser parser.Decoder
 
-	opts observeroption.Options
+	opts      observeroption.Options
+	opt_count int
+	nopts     []observeroption.Options
 
 	// startTime is the time when this instance was started
 	startTime time.Time
@@ -95,6 +97,8 @@ func NewLocalServer(
 		startTime:        time.Now(),
 		namespaceManager: namespaceManager,
 		opts:             opts,
+		nopts:            nil,
+		opt_count:        1,
 	}
 
 	for _, f := range s.opts.OnServerInit {

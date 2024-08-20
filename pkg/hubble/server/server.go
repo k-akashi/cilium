@@ -81,11 +81,14 @@ func (s *Server) initGRPCServer() error {
 	if s.opts.HealthService != nil {
 		healthpb.RegisterHealthServer(srv, s.opts.HealthService)
 	}
-	for i := 0; i < 10; i++ {
-		if s.opts.ObserverServices[i] != nil {
-			observerpb.RegisterObserverServer(srv, s.opts.ObserverServices[i])
-		}
+	if s.opts.ObserverServices != nil {
+		observerpb.RegisterObserverServer(srv, s.opts.ObserverServices)
 	}
+	//for i := 0; i < 10; i++ {
+	//	if s.opts.ObserverServices[i] != nil {
+	//		observerpb.RegisterObserverServer(srv, s.opts.ObserverServices[i])
+	//	}
+	//}
 	if s.opts.PeerService != nil {
 		peerpb.RegisterPeerServer(srv, s.opts.PeerService)
 	}

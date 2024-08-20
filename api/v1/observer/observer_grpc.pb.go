@@ -249,6 +249,14 @@ func RegisterObserverServer(s grpc.ServiceRegistrar, srv ObserverServer) {
 	s.RegisterService(&Observer_ServiceDesc, srv)
 }
 
+func _Observer_GetFlowsMt_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(GetFlowsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ObserverServer).GetFlows(m, &observerGetFlowsServer{ServerStream: stream})
+}
+
 func _Observer_GetFlows_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(GetFlowsRequest)
 	if err := stream.RecvMsg(m); err != nil {

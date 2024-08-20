@@ -87,6 +87,7 @@ func (c *consumer) sendEvent(event *observerTypes.MonitorEvent) {
 	select {
 	case c.observer.GetEventsChannel() <- event:
 	default:
+		c.observer.GetLogger().Infof("debug: event %T", event.Payload)
 		c.countDroppedEvent()
 	}
 }

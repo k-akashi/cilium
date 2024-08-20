@@ -267,8 +267,9 @@ func (d *Daemon) launchHubble() {
 	namespaceManager := observer.NewNamespaceManager()
 	go namespaceManager.Run(d.ctx)
 
-	hubbleObservers := make([]*observer.LocalObserverServer, 10)
-	for i := 0; i < 10; i++ {
+	numObservers := 100
+	hubbleObservers := make([]*observer.LocalObserverServer, numObservers)
+	for i := 0; i < numObservers; i++ {
 		hubbleObservers[i], err = observer.NewLocalServer(
 			payloadParser,
 			namespaceManager,

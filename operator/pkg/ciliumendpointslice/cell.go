@@ -64,25 +64,25 @@ var Cell = cell.Module(
 type Config struct {
 	CESMaxCEPsInCES             int      `mapstructure:"ces-max-ciliumendpoints-per-ces"`
 	CESSlicingMode              string   `mapstructure:"ces-slice-mode"`
-	CESWriteQPSLimit            float64  `mapstructure:"ces-write-qps-limit"`
-	CESWriteQPSBurst            int      `mapstructure:"ces-write-qps-burst"`
-	CESEnableDynamicRateLimit   bool     `mapstructure:"ces-enable-dynamic-rate-limit"`
-	CESDynamicRateLimitNodes    []string `mapstructure:"ces-dynamic-rate-limit-nodes"`
-	CESDynamicRateLimitQPSLimit []string `mapstructure:"ces-dynamic-rate-limit-qps-limit"`
-	CESDynamicRateLimitQPSBurst []string `mapstructure:"ces-dynamic-rate-limit-qps-burst"`
+	CESWriteQPSLimit            float64  `mapstructure:"ces-write-qps-limit" exhaustruct:"optional"`
+	CESWriteQPSBurst            int      `mapstructure:"ces-write-qps-burst" exhaustruct:"optional"`
+	CESEnableDynamicRateLimit   bool     `mapstructure:"ces-enable-dynamic-rate-limit" exhaustruct:"optional"`
+	CESDynamicRateLimitNodes    []string `mapstructure:"ces-dynamic-rate-limit-nodes" exhaustruct:"optional"`
+	CESDynamicRateLimitQPSLimit []string `mapstructure:"ces-dynamic-rate-limit-qps-limit" exhaustruct:"optional"`
+	CESDynamicRateLimitQPSBurst []string `mapstructure:"ces-dynamic-rate-limit-qps-burst" exhaustruct:"optional"`
 	CESDynamicRateLimitConfig   string   `mapstructure:"ces-rate-limits"`
 }
 
 var defaultConfig = Config{
 	CESMaxCEPsInCES:           100,
-	CESSlicingMode:            "cesSliceModeIdentity",
+	CESSlicingMode:            identityMode,
 	CESDynamicRateLimitConfig: "[{\"nodes\":0,\"limit\":10,\"burst\":20}]",
 }
 
 func (def Config) Flags(flags *pflag.FlagSet) {
 	depUseDLR := fmt.Sprintf("dynamic rate limiting is now configured by default. Please use --%s to supply a custom config", CESRateLimits)
 	flags.Int(CESMaxCEPsInCES, def.CESMaxCEPsInCES, "Maximum number of CiliumEndpoints allowed in a CES")
-	flags.String(CESSlicingMode, def.CESSlicingMode, "Slicing mode defines how CiliumEndpoints are grouped into CES: either batched by their Identity (\"cesSliceModeIdentity\") or batched on a \"First Come, First Served\" basis (\"cesSliceModeFCFS\")")
+	flags.String(CESSlicingMode, def.CESSlicingMode, "Slicing mode defines how CiliumEndpoints are grouped into CES: either batched by their Identity (\"identity\") or batched on a \"First Come, First Served\" basis (\"fcfs\")")
 	flags.Float64(CESWriteQPSLimit, def.CESWriteQPSLimit, "CES work queue rate limit. Ignored when "+CESEnableDynamicRateLimit+" is set")
 	flags.MarkDeprecated(CESWriteQPSLimit, depUseDLR)
 	flags.Int(CESWriteQPSBurst, def.CESWriteQPSBurst, "CES work queue burst rate. Ignored when "+CESEnableDynamicRateLimit+" is set")

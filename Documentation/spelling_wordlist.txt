@@ -48,6 +48,7 @@ Fsnotify
 GCP
 GKE
 Gartrell
+GatewayClass
 Gbit
 GiB
 Gospodarek
@@ -196,6 +197,7 @@ bugfix
 bugfixes
 bugtool
 buildx
+burstLimit
 bytecode
 cBPF
 callee
@@ -313,6 +315,7 @@ etcd
 eth
 ethernet
 ethtool
+existingSecret
 extTrafficPolicy
 extern
 externalIPs
@@ -320,6 +323,7 @@ externalTrafficPolicy
 extraConfig
 facto
 failover
+fcfs
 fec
 filesystem
 filesystems
@@ -330,6 +334,7 @@ fromCIDR
 fromCIDRSet
 fromEndpoints
 frontend
+frontends
 fs
 func
 gRPC
@@ -429,6 +434,9 @@ jsgt
 jsle
 jslt
 json
+k8sServiceHost
+k8sServiceLookupConfigMapName
+k8sServiceLookupNamespace
 kTLS
 kafka
 kallsyms
@@ -476,6 +484,7 @@ llc
 llvm
 loadBalancerClass
 loadBalancerIP
+loadBalancerSourceRanges
 loadbalancer
 loadbalancers
 loadbalancing
@@ -618,6 +627,8 @@ qemu
 queryable
 queueing
 rST
+rateLimit
+ratelimiter
 rc
 reStructuredText
 reachability
@@ -637,6 +648,7 @@ repo
 repos
 reproducibility
 requireIPv
+requireLBClass
 resync
 retpoline
 retransmission
@@ -727,12 +739,14 @@ toGroups
 tofqdns
 tolerations
 toolchain
+toto
 traceparent
 tracepoint
 tracepoints
 tracestate
 transpiling
 tsne
+tunings
 tunnelProtocol
 ubuntu
 udp

@@ -1,3 +1,54 @@
+# v1.173.0 (2024-07-25)
+
+* **Feature**: EC2 Fleet now supports using custom identifiers to reference Amazon Machine Images (AMI) in launch requests that are configured to choose from a diversified list of instance types.
+
+# v1.172.0 (2024-07-23)
+
+* **Feature**: Switch to new waiter matching implementation, which conveys a slight performance boost and removes the need for the go-jmespath runtime dependency.
+
+# v1.171.0 (2024-07-18)
+
+* **Feature**: Amazon VPC IP Address Manager (IPAM) now supports Bring-Your-Own-IP (BYOIP) for IP addresses registered with any Internet Registry. This feature uses DNS TXT records to validate ownership of a public IP address range.
+
+# v1.170.0 (2024-07-10.2)
+
+* **Feature**: Add parameters to enable provisioning IPAM BYOIPv4 space at a Local Zone Network Border Group level
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v1.169.0 (2024-07-10)
+
+* **Feature**: Add parameters to enable provisioning IPAM BYOIPv4 space at a Local Zone Network Border Group level
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v1.168.0 (2024-07-02)
+
+* **Feature**: Documentation updates for Elastic Compute Cloud (EC2).
+
+# v1.167.1 (2024-06-28)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v1.167.0 (2024-06-26)
+
+* **Feature**: Support list-of-string endpoint parameter.
+
+# v1.166.0 (2024-06-25)
+
+* **Feature**: This release is for the launch of the new u7ib-12tb.224xlarge, R8g, c7gn.metal and mac2-m1ultra.metal instance types
+
+# v1.165.1 (2024-06-19)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v1.165.0 (2024-06-18)
+
+* **Feature**: Track usage of various AWS SDK features in user-agent string.
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v1.164.2 (2024-06-17)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
 # v1.164.1 (2024-06-14)
 
 * **Documentation**: Documentation updates for Amazon EC2.

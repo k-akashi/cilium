@@ -12,6 +12,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
+	"github.com/cilium/cilium/pkg/inctimer"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/nat"
@@ -152,7 +153,13 @@ func newStats(params params) (*Stats, error) {
 			tr := job.NewTrigger()
 			params.Jobs.Add(job.Timer("nat-stats", m.countNat, params.Config.NATMapStatInterval,
 				job.WithTrigger(tr)))
-			tr.Trigger() // trigger initial count right away
+			// Wait a couple seconds, and then trigger the initial count.
+			// This is to give time for init time CT/NAT gc scanning to complete
+			// to avoid NAT map GC timeouts at startup.
+			go func() {
+				<-inctimer.After(time.Second * 5)
+				tr.Trigger()
+			}()
 			return params.Jobs.Start(hc)
 		},
 	})
@@ -164,7 +171,7 @@ func upsertStat[KT tupleKey](m *Stats, topk *topk[KT], family nat.IPFamily) erro
 	defer tx.Abort()
 
 	var errs error
-	iter, _ := m.table.All(tx)
+	iter := m.table.All(tx)
 	for entry, _, ok := iter.Next(); ok; entry, _, ok = iter.Next() {
 		if entry.Type == family.String() {
 			_, _, err := m.table.Delete(tx, entry)

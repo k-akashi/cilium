@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -926,7 +927,7 @@ func Test_httpRouteReconciler_Reconcile(t *testing.T) {
 		WithStatusSubresource(&gatewayv1.HTTPRoute{}).
 		Build()
 
-	r := &httpRouteReconciler{Client: c}
+	r := &httpRouteReconciler{Client: c, logger: hivetest.Logger(t)}
 
 	t.Run("no http route", func(t *testing.T) {
 		result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -1296,7 +1297,7 @@ func Test_httpRouteReconciler_Reconcile_NoServiceImportCRD(t *testing.T) {
 		WithStatusSubresource(&gatewayv1.HTTPRoute{}).
 		Build()
 
-	r := &httpRouteReconciler{Client: c}
+	r := &httpRouteReconciler{Client: c, logger: hivetest.Logger(t)}
 
 	t.Run("valid http route with Service", func(t *testing.T) {
 		key := types.NamespacedName{
@@ -1349,9 +1350,7 @@ func Test_httpRouteReconciler_Reconcile_NoServiceImportCRD(t *testing.T) {
 		require.Equal(t, "ResolvedRefs", route.Status.RouteStatus.Parents[0].Conditions[1].Type)
 		require.Equal(t, metav1.ConditionStatus("False"), route.Status.RouteStatus.Parents[0].Conditions[1].Status)
 		require.Equal(t, "BackendNotFound", route.Status.RouteStatus.Parents[0].Conditions[1].Reason)
-		require.Equal(t, "Attempt to reference a ServiceImport backend while "+
-			"the corresponding CRD is not installed, "+
-			"please restart the cilium-operator if the CRD is already installed",
+		require.Equal(t, "serviceimports.multicluster.x-k8s.io \"dummy-backend\" not found",
 			route.Status.RouteStatus.Parents[0].Conditions[1].Message)
 	})
 }

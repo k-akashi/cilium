@@ -18,12 +18,12 @@ import (
 
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/controller"
+	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	dptypes "github.com/cilium/cilium/pkg/datapath/types"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/eventqueue"
 	identityPkg "github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/labels"
@@ -90,7 +90,9 @@ func (e *Endpoint) getNamedPortEgress(npMap types.NamedPortMultiMap, name string
 }
 
 // proxyID returns a unique string to identify a proxy mapping,
-// and the resolved destination port and protocol numbers, if any.
+// and the resolved destination port number, if any.
+// For port ranges the proxy is identified by the first port in
+// the range, as overlapping proxy port ranges are not supported.
 // Must be called with e.mutex held.
 func (e *Endpoint) proxyID(l4 *policy.L4Filter, listener string) (string, uint16, uint8) {
 	port := l4.Port
@@ -515,7 +517,8 @@ func (e *Endpoint) updateRealizedState(stats *regenerationStatistics, origDir st
 
 	// Start periodic background full reconciliation of the policy map.
 	// Does nothing if it has already been started.
-	if !e.isProperty(PropertyFakeEndpoint) {
+	if !e.isProperty(PropertyFakeEndpoint) &&
+		option.Config.DatapathMode != datapathOption.DatapathModeLBOnly {
 		e.startSyncPolicyMapController()
 	}
 
@@ -852,9 +855,9 @@ func (e *Endpoint) SetIdentity(identity *identityPkg.Identity, newEndpoint bool)
 	// identity for the endpoint.
 	if newEndpoint {
 		// TODO - GH-9354.
-		identitymanager.Add(identity)
+		e.owner.AddIdentity(identity)
 	} else {
-		identitymanager.RemoveOldAddNew(e.SecurityIdentity, identity)
+		e.owner.RemoveOldAddNewIdentity(e.SecurityIdentity, identity)
 	}
 	e.SecurityIdentity = identity
 	e.replaceIdentityLabels(labels.LabelSourceAny, identity.Labels)

@@ -7,6 +7,7 @@ import (
 	"github.com/cilium/hive/cell"
 
 	"github.com/cilium/cilium/pkg/datapath/types"
+	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	monitorAgent "github.com/cilium/cilium/pkg/monitor/agent"
 )
 
@@ -15,7 +16,10 @@ var Cell = cell.Module(
 	"service-manager",
 	"Service Manager",
 
-	cell.Provide(newServiceManager),
+	cell.ProvidePrivate(newServiceInternal),
+	cell.Provide(func(svc *Service) ServiceManager { return svc }),
+	cell.Provide(func(svc *Service) ServiceHealthCheckManager { return svc }),
+	cell.Provide(newServiceRestApiHandler),
 
 	cell.ProvidePrivate(func(sm ServiceManager) syncNodePort { return sm }),
 	cell.Invoke(registerServiceReconciler),
@@ -24,10 +28,21 @@ var Cell = cell.Module(
 type serviceManagerParams struct {
 	cell.In
 
-	Datapath     types.Datapath
+	LBMap        types.LBMap
 	MonitorAgent monitorAgent.Agent
+
+	HealthCheckers []HealthChecker `group:"healthCheckers"`
+	Clientset      k8sClient.Clientset
+	NodeNeighbors  types.NodeNeighbors
 }
 
-func newServiceManager(params serviceManagerParams) ServiceManager {
-	return newService(params.MonitorAgent, params.Datapath.LBMap(), params.Datapath.NodeNeighbors())
+func newServiceInternal(params serviceManagerParams) *Service {
+	enabledHealthCheckers := []HealthChecker{}
+	for _, hc := range params.HealthCheckers {
+		if hc != nil {
+			enabledHealthCheckers = append(enabledHealthCheckers, hc)
+		}
+	}
+
+	return newService(params.MonitorAgent, params.LBMap, params.NodeNeighbors, enabledHealthCheckers, params.Clientset.IsEnabled())
 }

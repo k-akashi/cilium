@@ -40,6 +40,7 @@ import (
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
+	"github.com/cilium/cilium/pkg/datapath/iptables"
 	linuxdatapath "github.com/cilium/cilium/pkg/datapath/linux"
 	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
@@ -62,6 +63,8 @@ import (
 	"github.com/cilium/cilium/pkg/hubble/exporter/exporteroption"
 	"github.com/cilium/cilium/pkg/hubble/observer/observeroption"
 	"github.com/cilium/cilium/pkg/identity"
+	identitycell "github.com/cilium/cilium/pkg/identity/cache/cell"
+	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	"github.com/cilium/cilium/pkg/ipam"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/ipcache"
@@ -248,9 +251,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.StringSlice(option.DebugVerbose, []string{}, "List of enabled verbose debug groups")
 	option.BindEnv(vp, option.DebugVerbose)
 
-	flags.String(option.DirectRoutingDevice, "", "Device name used to connect nodes in direct routing mode (used by BPF NodePort, BPF host routing; if empty, automatically set to a device with k8s InternalIP/ExternalIP or with a default route)")
-	option.BindEnv(vp, option.DirectRoutingDevice)
-
 	flags.Bool(option.EnableRuntimeDeviceDetection, true, "Enable runtime device detection and datapath reconfiguration (experimental)")
 	option.BindEnv(vp, option.EnableRuntimeDeviceDetection)
 	flags.MarkDeprecated(option.EnableRuntimeDeviceDetection, "Runtime device detection and datapath reconfiguration is now the default and only mode of operation")
@@ -344,6 +344,10 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.Bool(option.EnableSocketLB, false, "Enable socket-based LB for E/W traffic")
 	option.BindEnv(vp, option.EnableSocketLB)
+
+	flags.Bool(option.EnableSocketLBPodConnectionTermination, true, "Enable terminating connections to deleted service backends when socket-LB is enabled")
+	flags.MarkHidden(option.EnableSocketLBPodConnectionTermination)
+	option.BindEnv(vp, option.EnableSocketLBPodConnectionTermination)
 
 	flags.Bool(option.EnableSocketLBTracing, true, "Enable tracing for socket-based LB")
 	option.BindEnv(vp, option.EnableSocketLBTracing)
@@ -854,8 +858,16 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.MarkHidden(option.DNSProxyLockTimeout)
 	option.BindEnv(vp, option.DNSProxyLockTimeout)
 
+	flags.Int(option.DNSProxySocketLingerTimeout, defaults.DNSProxySocketLingerTimeout, "Timeout (in seconds) when closing the connection between the DNS proxy and the upstream server. "+
+		"If set to 0, the connection is closed immediately (with TCP RST). If set to -1, the connection is closed asynchronously in the background")
+	option.BindEnv(vp, option.DNSProxySocketLingerTimeout)
+
 	flags.Bool(option.DNSProxyEnableTransparentMode, defaults.DNSProxyEnableTransparentMode, "Enable DNS proxy transparent mode")
 	option.BindEnv(vp, option.DNSProxyEnableTransparentMode)
+
+	flags.Bool(option.DNSProxyInsecureSkipTransparentModeCheck, false, "Allows DNS proxy transparent mode to be disabled even if encryption is enabled. Enabling this flag and disabling DNS proxy transparent mode will cause proxied DNS traffic to leave the node unencrypted.")
+	flags.MarkHidden(option.DNSProxyInsecureSkipTransparentModeCheck)
+	option.BindEnv(vp, option.DNSProxyInsecureSkipTransparentModeCheck)
 
 	flags.Int(option.PolicyQueueSize, defaults.PolicyQueueSize, "Size of queues for policy-related events")
 	option.BindEnv(vp, option.PolicyQueueSize)
@@ -971,7 +983,7 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.StringSlice(option.HubbleRedactHttpHeadersDeny, []string{}, "HTTP headers to redact from flows")
 	option.BindEnv(vp, option.HubbleRedactHttpHeadersDeny)
 
-	flags.Bool(option.HubbleDropEvents, defaults.HubbleDropEventsEnabled, "Emit packet drop Events related to pods")
+	flags.Bool(option.HubbleDropEvents, defaults.HubbleDropEventsEnabled, "Emit packet drop Events related to pods (alpha)")
 	option.BindEnv(vp, option.HubbleDropEvents)
 
 	flags.Duration(option.HubbleDropEventsInterval, defaults.HubbleDropEventsInterval, "Minimum time between emitting same events")
@@ -988,6 +1000,14 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.Int(option.LBMapEntriesName, lbmap.DefaultMaxEntries, "Maximum number of entries in Cilium BPF lbmap")
 	option.BindEnv(vp, option.LBMapEntriesName)
+
+	flags.Int(option.BPFEventsDefaultRateLimit, 0, fmt.Sprintf("Limit of average number of messages per second that can be written to BPF events map (if set, --%s value must also be specified). If both --%s and --%s are 0 or not specified, no limit is imposed.", option.BPFEventsDefaultBurstLimit, option.BPFEventsDefaultRateLimit, option.BPFEventsDefaultBurstLimit))
+	flags.MarkHidden(option.BPFEventsDefaultRateLimit)
+	option.BindEnv(vp, option.BPFEventsDefaultRateLimit)
+
+	flags.Int(option.BPFEventsDefaultBurstLimit, 0, fmt.Sprintf("Maximum number of messages that can be written to BPF events map in 1 second (if set, --%s value must also be specified). If both --%s and --%s are 0 or not specified, no limit is imposed.", option.BPFEventsDefaultRateLimit, option.BPFEventsDefaultBurstLimit, option.BPFEventsDefaultRateLimit))
+	flags.MarkHidden(option.BPFEventsDefaultBurstLimit)
+	option.BindEnv(vp, option.BPFEventsDefaultBurstLimit)
 
 	flags.Int(option.LBServiceMapMaxEntries, 0, fmt.Sprintf("Maximum number of entries in Cilium BPF lbmap for services (if this isn't set, the value of --%s will be used.)", option.LBMapEntriesName))
 	flags.MarkHidden(option.LBServiceMapMaxEntries)
@@ -1274,8 +1294,8 @@ func initEnv(vp *viper.Viper) {
 	if err := os.MkdirAll(globalsDir, defaults.StateDirRights); err != nil {
 		log.WithError(err).WithField(logfields.Path, globalsDir).Fatal("Could not create runtime directory")
 	}
-	if err := os.Chdir(option.Config.LibDir); err != nil {
-		log.WithError(err).WithField(logfields.Path, option.Config.LibDir).Fatal("Could not change to runtime directory")
+	if err := os.Chdir(option.Config.StateDir); err != nil {
+		log.WithError(err).WithField(logfields.Path, option.Config.StateDir).Fatal("Could not change to runtime directory")
 	}
 	if _, err := os.Stat(option.Config.BpfDir); os.IsNotExist(err) {
 		log.WithError(err).Fatalf("BPF template directory: NOT OK. Please run 'make install-bpf'")
@@ -1364,8 +1384,7 @@ func initEnv(vp *viper.Viper) {
 		}
 		option.Config.KubeProxyReplacement = option.KubeProxyReplacementFalse
 		option.Config.EnableSocketLB = true
-		// Socket-LB tracing relies on metadata that's retrieved from Kubernetes.
-		option.Config.EnableSocketLBTracing = false
+		option.Config.EnableSocketLBPodConnectionTermination = true
 		option.Config.EnableHostPort = false
 		option.Config.EnableNodePort = true
 		option.Config.EnableExternalIPs = true
@@ -1383,8 +1402,10 @@ func initEnv(vp *viper.Viper) {
 		log.Fatal("L7 proxy requires iptables rules (--install-iptables-rules=\"true\")")
 	}
 
-	if option.Config.EnableIPSec && option.Config.EnableL7Proxy && !option.Config.DNSProxyEnableTransparentMode {
-		log.Fatal("IPSec requires DNS proxy transparent mode to be enabled (--dnsproxy-enable-transparent-mode=\"true\")")
+	if !option.Config.DNSProxyInsecureSkipTransparentModeCheck {
+		if option.Config.EnableIPSec && option.Config.EnableL7Proxy && !option.Config.DNSProxyEnableTransparentMode {
+			log.Fatal("IPSec requires DNS proxy transparent mode to be enabled (--dnsproxy-enable-transparent-mode=\"true\")")
+		}
 	}
 
 	if option.Config.EnableIPSec && !option.Config.EnableIPv4 {
@@ -1612,7 +1633,7 @@ var daemonCell = cell.Module(
 	cell.Provide(
 		newDaemonPromise,
 		promise.New[endpointstate.Restorer],
-		func() k8s.CacheStatus { return make(k8s.CacheStatus) },
+		promise.New[*option.DaemonConfig],
 		newSyncHostIPs,
 	),
 	// Provide a read-only copy of the current daemon settings to be consumed
@@ -1626,26 +1647,31 @@ var daemonCell = cell.Module(
 type daemonParams struct {
 	cell.In
 
+	CfgResolver promise.Resolver[*option.DaemonConfig]
+
 	Lifecycle              cell.Lifecycle
+	Health                 cell.Health
 	Clientset              k8sClient.Clientset
-	Datapath               datapath.Datapath
+	Loader                 datapath.Loader
 	WGAgent                *wireguard.Agent
 	LocalNodeStore         *node.LocalNodeStore
 	Shutdowner             hive.Shutdowner
 	Resources              agentK8s.Resources
-	CacheStatus            k8s.CacheStatus
 	K8sWatcher             *watchers.K8sWatcher
 	K8sSvcCache            *k8s.ServiceCache
+	CacheStatus            k8sSynced.CacheStatus
 	K8sResourceSynced      *k8sSynced.Resources
 	K8sAPIGroups           *k8sSynced.APIGroups
 	NodeManager            nodeManager.NodeManager
+	NodeHandler            datapath.NodeHandler
+	NodeNeighbors          datapath.NodeNeighbors
+	NodeAddressing         datapath.NodeAddressing
 	EndpointManager        endpointmanager.EndpointManager
 	CertManager            certificatemanager.CertificateManager
 	SecretManager          certificatemanager.SecretManager
-	IdentityAllocator      CachingIdentityAllocator
+	IdentityAllocator      identitycell.CachingIdentityAllocator
 	Policy                 *policy.Repository
 	IPCache                *ipcache.IPCache
-	PolicyK8sWatcher       *policyK8s.PolicyResourcesWatcher
 	DirectoryPolicyWatcher *policyDirectory.PolicyResourcesWatcher
 	DirReadStatus          policyDirectory.DirectoryWatcherReadStatus
 	CNIConfigManager       cni.CNIConfigManager
@@ -1662,9 +1688,9 @@ type daemonParams struct {
 	APILimiterSet          *rate.APILimiterSet
 	AuthManager            *auth.AuthManager
 	Settings               cellSettings
-	DeviceManager          *linuxdatapath.DeviceManager `optional:"true"`
 	Devices                statedb.Table[*datapathTables.Device]
 	NodeAddrs              statedb.Table[datapathTables.NodeAddress]
+	DirectRoutingDevice    datapathTables.DirectRoutingDevice
 	// Grab the GC object so that we can start the CT/NAT map garbage collection.
 	// This is currently necessary because these maps have not yet been modularized,
 	// and because it depends on parameters which are not provided through hive.
@@ -1686,27 +1712,34 @@ type daemonParams struct {
 	ServiceResolver     *dial.ServiceResolver
 	Recorder            *recorder.Recorder
 	IPAM                *ipam.IPAM
+	CRDSyncPromise      promise.Promise[k8sSynced.CRDSync]
+	IdentityManager     *identitymanager.IdentityManager
+	Orchestrator        datapath.Orchestrator
+	IPTablesManager     *iptables.Manager
 }
 
-func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Promise[*option.DaemonConfig]) {
+func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Promise[policyK8s.PolicyManager]) {
 	daemonResolver, daemonPromise := promise.New[*Daemon]()
-	cfgResolver, cfgPromise := promise.New[*option.DaemonConfig]()
+	policyManagerResolver, policyManagerPromise := promise.New[policyK8s.PolicyManager]()
 
 	// daemonCtx is the daemon-wide context cancelled when stopping.
 	daemonCtx, cancelDaemonCtx := context.WithCancel(context.Background())
 	cleaner := NewDaemonCleanup()
 
-	if option.Config.DatapathMode == datapathOption.DatapathModeLBOnly {
-		// In lb-only mode the k8s client is not used, even if its configuration
-		// is available, so disable it here before it starts.
-		params.Clientset.Disable()
-	}
-
 	var daemon *Daemon
 	var wg sync.WaitGroup
 
 	params.Lifecycle.Append(cell.Hook{
-		OnStart: func(cell.HookContext) error {
+		OnStart: func(cell.HookContext) (err error) {
+			defer func() {
+				// Reject promises on error
+				if err != nil {
+					params.CfgResolver.Reject(err)
+					policyManagerResolver.Reject(err)
+					daemonResolver.Reject(err)
+				}
+			}()
+
 			d, restoredEndpoints, err := newDaemon(daemonCtx, cleaner, &params)
 			if err != nil {
 				cancelDaemonCtx()
@@ -1716,16 +1749,46 @@ func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Pr
 			daemon = d
 
 			if !option.Config.DryMode {
-				if err := startDaemon(daemon, restoredEndpoints, cleaner, params); err != nil {
-					daemonResolver.Reject(err)
-					cancelDaemonCtx()
-					cleaner.Clean()
-					cfgResolver.Reject(err)
-					return err
+				log.Info("Initializing daemon")
+
+				// This validation needs to be done outside of the agent until
+				// datapath.NodeAddressing is used consistently across the code base.
+				log.Info("Validating configured node address ranges")
+				if err := node.ValidatePostInit(); err != nil {
+					return fmt.Errorf("postinit failed: %w", err)
+				}
+
+				// Store config in file before resolving the DaemonConfig promise.
+				err = option.Config.StoreInFile(option.Config.StateDir)
+				if err != nil {
+					log.WithError(err).Error("Unable to store Cilium's configuration")
+				}
+
+				err = option.StoreViperInFile(option.Config.StateDir)
+				if err != nil {
+					log.WithError(err).Error("Unable to store Viper's configuration")
 				}
 			}
-			daemonResolver.Resolve(daemon)
-			cfgResolver.Resolve(option.Config)
+
+			// 'option.Config' is assumed to be stable at this point, execpt for
+			// 'option.Config.Opts' that are explicitly deemed to be runtime-changeable
+			params.CfgResolver.Resolve(option.Config)
+			policyManagerResolver.Resolve(daemon)
+
+			if option.Config.DryMode {
+				daemonResolver.Resolve(daemon)
+			} else {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if err := startDaemon(daemon, restoredEndpoints, cleaner, params); err != nil {
+						log.WithError(err).Error("Daemon start failed")
+						daemonResolver.Reject(err)
+					} else {
+						daemonResolver.Resolve(daemon)
+					}
+				}()
+			}
 			return nil
 		},
 		OnStop: func(cell.HookContext) error {
@@ -1735,25 +1798,22 @@ func newDaemonPromise(params daemonParams) (promise.Promise[*Daemon], promise.Pr
 			return nil
 		},
 	})
-	return daemonPromise, cfgPromise
+	return daemonPromise, policyManagerPromise
 }
 
 // startDaemon starts the old unmodular part of the cilium-agent.
+// option.Config has already been exposed via *option.DaemonConfig promise,
+// so it may not be modified here
 func startDaemon(d *Daemon, restoredEndpoints *endpointRestoreState, cleaner *daemonCleanup, params daemonParams) error {
-	log.Info("Initializing daemon")
-
-	// This validation needs to be done outside of the agent until
-	// datapath.NodeAddressing is used consistently across the code base.
-	log.Info("Validating configured node address ranges")
-	if err := node.ValidatePostInit(); err != nil {
-		return fmt.Errorf("postinit failed: %w", err)
-	}
-
 	bootstrapStats.k8sInit.Start()
 	if params.Clientset.IsEnabled() {
 		// Wait only for certain caches, but not all!
 		// (Check Daemon.InitK8sSubsystem() for more info)
-		<-params.CacheStatus
+		select {
+		case <-params.CacheStatus:
+		case <-d.ctx.Done():
+			return d.ctx.Err()
+		}
 	}
 
 	// wait for directory watcher to ingest policy from files
@@ -1777,6 +1837,16 @@ func startDaemon(d *Daemon, restoredEndpoints *endpointRestoreState, cleaner *da
 
 	if params.WGAgent != nil {
 		go func() {
+			select {
+			case <-d.nodeDiscovery.Registered:
+				// Wait until the kvstore synchronization completed, to avoid
+				// causing connectivity blips due incorrectly removing
+				// WireGuard peers that have not yet been discovered. The
+				// Registered channel is immediately closed in CRD mode.
+			case <-d.ctx.Done():
+				return
+			}
+
 			if err := params.WGAgent.RestoreFinished(d.clustermesh); err != nil {
 				log.WithError(err).Error("Failed to set up WireGuard peers")
 			}
@@ -1822,7 +1892,11 @@ func startDaemon(d *Daemon, restoredEndpoints *endpointRestoreState, cleaner *da
 
 	go func() {
 		if d.endpointRestoreComplete != nil {
-			<-d.endpointRestoreComplete
+			select {
+			case <-d.endpointRestoreComplete:
+			case <-d.ctx.Done():
+				return
+			}
 		}
 		d.dnsNameManager.CompleteBootstrap()
 
@@ -1887,19 +1961,19 @@ func startDaemon(d *Daemon, restoredEndpoints *endpointRestoreState, cleaner *da
 	}
 
 	// Watches for node neighbors link updates.
-	d.nodeDiscovery.Manager.StartNodeNeighborLinkUpdater(d.datapath.NodeNeighbors())
+	d.nodeDiscovery.Manager.StartNodeNeighborLinkUpdater(params.NodeNeighbors)
 
 	if option.Config.DatapathMode != datapathOption.DatapathModeLBOnly {
-		if !d.datapath.NodeNeighbors().NodeNeighDiscoveryEnabled() {
+		if !params.NodeNeighbors.NodeNeighDiscoveryEnabled() {
 			// Remove all non-GC'ed neighbor entries that might have previously set
 			// by a Cilium instance.
-			d.datapath.NodeNeighbors().NodeCleanNeighbors(false)
+			params.NodeNeighbors.NodeCleanNeighbors(false)
 		} else {
 			// If we came from an agent upgrade, migrate entries.
-			d.datapath.NodeNeighbors().NodeCleanNeighbors(true)
+			params.NodeNeighbors.NodeCleanNeighbors(true)
 			// Start periodical refresh of the neighbor table from the agent if needed.
 			if option.Config.ARPPingRefreshPeriod != 0 && !option.Config.ARPPingKernelManaged {
-				d.nodeDiscovery.Manager.StartNeighborRefresh(d.datapath.NodeNeighbors())
+				d.nodeDiscovery.Manager.StartNeighborRefresh(params.NodeNeighbors)
 			}
 		}
 	}
@@ -1911,28 +1985,46 @@ func startDaemon(d *Daemon, restoredEndpoints *endpointRestoreState, cleaner *da
 	bootstrapStats.updateMetrics()
 	go d.launchHubble()
 
-	err = option.Config.StoreInFile(option.Config.StateDir)
-	if err != nil {
-		log.WithError(err).Error("Unable to store Cilium's configuration")
-	}
-
-	err = option.StoreViperInFile(option.Config.StateDir)
-	if err != nil {
-		log.WithError(err).Error("Unable to store Viper's configuration")
-	}
+	// Start controller to validate daemon config is unchanged
+	cfgGroup := controller.NewGroup("daemon-validate-config")
+	d.controllers.UpdateController(
+		cfgGroup.Name,
+		controller.ControllerParams{
+			Group:  cfgGroup,
+			Health: params.Health,
+			DoFunc: func(context.Context) error {
+				// Validate that Daemon config has not changed, ignoring 'Opts'
+				// that may be modified via config patch events.
+				return option.Config.ValidateUnchanged()
+			},
+			// avoid synhronized run with other
+			// controllers started at same time
+			RunInterval: 61 * time.Second,
+			Context:     d.ctx,
+		})
 
 	return nil
 }
 
 func registerEndpointStateResolver(lc cell.Lifecycle, daemonPromise promise.Promise[*Daemon], resolver promise.Resolver[endpointstate.Restorer]) {
+	var wg sync.WaitGroup
+
 	lc.Append(cell.Hook{
 		OnStart: func(ctx cell.HookContext) error {
-			daemon, err := daemonPromise.Await(context.Background())
-			if err != nil {
-				resolver.Reject(err)
-				return err
-			}
-			resolver.Resolve(daemon)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				daemon, err := daemonPromise.Await(context.Background())
+				if err != nil {
+					resolver.Reject(err)
+				} else {
+					resolver.Resolve(daemon)
+				}
+			}()
+			return nil
+		},
+		OnStop: func(ctx cell.HookContext) error {
+			wg.Wait()
 			return nil
 		},
 	})

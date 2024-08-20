@@ -13,7 +13,21 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 )
+
+type Config struct {
+	// ClusterMeshConfig is the path to the clustermesh configuration directory.
+	ClusterMeshConfig string
+}
+
+func (def Config) Flags(flags *pflag.FlagSet) {
+	flags.String("clustermesh-config", def.ClusterMeshConfig, "Path to the ClusterMesh configuration directory")
+}
+
+var DefaultConfig = Config{
+	ClusterMeshConfig: "",
+}
 
 // clusterLifecycle is the interface to implement in order to receive cluster
 // configuration lifecycle events. This is implemented by the ClusterMesh.
@@ -112,6 +126,7 @@ func (cdw *configDirectoryWatcher) handle(abspath string) {
 			// watcher (except for NotFound) to prevent an infinite loop if
 			// something wrong happened.
 			cdw.handle(abspath)
+			return
 		}
 	}
 

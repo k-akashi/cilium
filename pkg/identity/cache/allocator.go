@@ -17,6 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/allocator"
+	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/key"
 	"github.com/cilium/cilium/pkg/idpool"
@@ -25,6 +26,7 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/identitybackend"
 	"github.com/cilium/cilium/pkg/kvstore"
 	kvstoreallocator "github.com/cilium/cilium/pkg/kvstore/allocator"
+	"github.com/cilium/cilium/pkg/kvstore/allocator/doublewrite"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -197,7 +199,13 @@ func (m *CachingIdentityAllocator) InitIdentityAllocator(client clientset.Interf
 		switch option.Config.IdentityAllocationMode {
 		case option.IdentityAllocationModeKVstore:
 			log.Debug("Identity allocation backed by KVStore")
-			backend, err = kvstoreallocator.NewKVStoreBackend(m.identitiesPath, owner.GetNodeSuffix(), &key.GlobalIdentity{}, kvstore.Client())
+			backend, err = kvstoreallocator.NewKVStoreBackend(
+				kvstoreallocator.KVStoreBackendConfiguration{
+					BasePath: m.identitiesPath,
+					Suffix:   owner.GetNodeSuffix(),
+					Typ:      &key.GlobalIdentity{},
+					Backend:  kvstore.Client(),
+				})
 			if err != nil {
 				log.WithError(err).Fatal("Unable to initialize kvstore backend for identity allocation")
 			}
@@ -213,6 +221,29 @@ func (m *CachingIdentityAllocator) InitIdentityAllocator(client clientset.Interf
 				log.WithError(err).Fatal("Unable to initialize Kubernetes CRD backend for identity allocation")
 			}
 
+		case option.IdentityAllocationModeDoubleWriteReadKVstore, option.IdentityAllocationModeDoubleWriteReadCRD:
+			readFromKVStore := true
+			if option.Config.IdentityAllocationMode == option.IdentityAllocationModeDoubleWriteReadCRD {
+				readFromKVStore = false
+			}
+			log.Debugf("Double-Write Identity allocation mode (CRD and KVStore) with reads from KVStore = %t", readFromKVStore)
+			backend, err = doublewrite.NewDoubleWriteBackend(doublewrite.DoubleWriteBackendConfiguration{
+				CRDBackendConfiguration: identitybackend.CRDBackendConfiguration{
+					Store:   nil,
+					Client:  client,
+					KeyFunc: (&key.GlobalIdentity{}).PutKeyFromMap,
+				},
+				KVStoreBackendConfiguration: kvstoreallocator.KVStoreBackendConfiguration{
+					BasePath: m.identitiesPath,
+					Suffix:   owner.GetNodeSuffix(),
+					Typ:      &key.GlobalIdentity{},
+					Backend:  kvstore.Client(),
+				},
+				ReadFromKVStore: readFromKVStore,
+			})
+			if err != nil {
+				log.WithError(err).Fatal("Unable to initialize the Double Write backend for identity allocation")
+			}
 		default:
 			log.Fatalf("Unsupported identity allocation mode %s", option.Config.IdentityAllocationMode)
 		}
@@ -237,11 +268,23 @@ func (m *CachingIdentityAllocator) InitIdentityAllocator(client clientset.Interf
 // The CachingIdentityAllocator is used in multiple places, but we only want to
 // checkpoint the "primary" allocator
 func (m *CachingIdentityAllocator) EnableCheckpointing() {
+	controllerManager := controller.NewManager()
+	controllerGroup := controller.NewGroup("identity-allocator")
+	controllerName := "local-identity-checkpoint"
 	triggerDone := make(chan struct{})
 	t, _ := trigger.NewTrigger(trigger.Parameters{
-		MinInterval:  10 * time.Second,
-		TriggerFunc:  m.checkpoint,
-		ShutdownFunc: func() { close(triggerDone) },
+		MinInterval: 10 * time.Second,
+		TriggerFunc: func(reasons []string) {
+			controllerManager.UpdateController(controllerName, controller.ControllerParams{
+				Group:    controllerGroup,
+				DoFunc:   m.checkpoint,
+				StopFunc: m.checkpoint, // perform one last checkpoint when the controller is removed
+			})
+		},
+		ShutdownFunc: func() {
+			controllerManager.RemoveControllerAndWait(controllerName) // waits for StopFunc
+			close(triggerDone)
+		},
 	})
 
 	m.checkpointTrigger = t
@@ -381,6 +424,10 @@ func (m *CachingIdentityAllocator) AllocateLocalIdentity(lbls labels.Labels, not
 
 	if allocated {
 		metrics.Identity.WithLabelValues(metricLabel).Inc()
+		for labelSource := range lbls.CollectSources() {
+			metrics.IdentityLabelSources.WithLabelValues(labelSource).Inc()
+		}
+
 		if m.checkpointTrigger != nil {
 			m.checkpointTrigger.Trigger()
 		}
@@ -457,6 +504,9 @@ func (m *CachingIdentityAllocator) AllocateIdentity(ctx context.Context, lbls la
 
 	if allocated || isNewLocally {
 		metrics.Identity.WithLabelValues(identity.ClusterLocalIdentityType).Inc()
+		for labelSource := range lbls.CollectSources() {
+			metrics.IdentityLabelSources.WithLabelValues(labelSource).Inc()
+		}
 	}
 
 	// Notify the owner of the newly added identities so that the
@@ -495,9 +545,9 @@ func (m *CachingIdentityAllocator) UnwithholdLocalIdentities(nids []identity.Num
 // to ensure that numeric identities are, as much as possible, stable across agent restarts.
 //
 // Do not call this directly, rather, use m.checkpointTrigger.Trigger()
-func (m *CachingIdentityAllocator) checkpoint(reasons []string) {
+func (m *CachingIdentityAllocator) checkpoint(ctx context.Context) error {
 	if m.checkpointPath == "" {
-		return // this is a unit test
+		return nil // this is a unit test
 	}
 	log := log.WithField(logfields.Path, m.checkpointPath)
 
@@ -509,20 +559,21 @@ func (m *CachingIdentityAllocator) checkpoint(reasons []string) {
 	out, err := renameio.NewPendingFile(m.checkpointPath, renameio.WithExistingPermissions(), renameio.WithPermissions(0o600))
 	if err != nil {
 		log.WithError(err).Error("failed to prepare checkpoint file")
-		return
+		return err
 	}
 	defer out.Cleanup()
 
 	jw := jsoniter.ConfigFastest.NewEncoder(out)
 	if err := jw.Encode(ids); err != nil {
 		log.WithError(err).Error("failed to marshal identity checkpoint state")
-		return
+		return err
 	}
 	if err := out.CloseAtomicallyReplace(); err != nil {
 		log.WithError(err).Error("failed to write identity checkpoint file")
-		return
+		return err
 	}
 	log.Debug("Wrote local identity allocator checkpoint")
+	return nil
 }
 
 // RestoreLocalIdentities reads in the checkpointed local allocator state
@@ -665,6 +716,9 @@ func (m *CachingIdentityAllocator) Release(ctx context.Context, id *identity.Ide
 			if metricVal != identity.ClusterLocalIdentityType && m.checkpointTrigger != nil {
 				m.checkpointTrigger.Trigger()
 			}
+			for labelSource := range id.Labels.CollectSources() {
+				metrics.IdentityLabelSources.WithLabelValues(labelSource).Dec()
+			}
 			metrics.Identity.WithLabelValues(metricVal).Dec()
 		}
 
@@ -720,7 +774,7 @@ func (m *CachingIdentityAllocator) WatchRemoteIdentities(remoteName string, remo
 		prefix = path.Join(kvstore.StateToCachePrefix(prefix), remoteName)
 	}
 
-	remoteAllocatorBackend, err := kvstoreallocator.NewKVStoreBackend(prefix, m.owner.GetNodeSuffix(), &key.GlobalIdentity{}, backend)
+	remoteAllocatorBackend, err := kvstoreallocator.NewKVStoreBackend(kvstoreallocator.KVStoreBackendConfiguration{BasePath: prefix, Suffix: m.owner.GetNodeSuffix(), Typ: &key.GlobalIdentity{}, Backend: backend})
 	if err != nil {
 		return nil, fmt.Errorf("error setting up remote allocator backend: %w", err)
 	}

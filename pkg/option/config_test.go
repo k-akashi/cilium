@@ -24,22 +24,32 @@ import (
 )
 
 func TestValidateIPv6ClusterAllocCIDR(t *testing.T) {
-	valid1 := &DaemonConfig{IPv6ClusterAllocCIDR: "fdfd::/64"}
+	valid1 := &DaemonConfig{
+		IPv6ClusterAllocCIDR: "fdfd::/64",
+	}
 
 	require.Nil(t, valid1.validateIPv6ClusterAllocCIDR())
 	require.Equal(t, "fdfd::", valid1.IPv6ClusterAllocCIDRBase)
 
-	valid2 := &DaemonConfig{IPv6ClusterAllocCIDR: "fdfd:fdfd:fdfd:fdfd:aaaa::/64"}
+	valid2 := &DaemonConfig{
+		IPv6ClusterAllocCIDR: "fdfd:fdfd:fdfd:fdfd:aaaa::/64",
+	}
 	require.Nil(t, valid2.validateIPv6ClusterAllocCIDR())
 	require.Equal(t, "fdfd:fdfd:fdfd:fdfd::", valid2.IPv6ClusterAllocCIDRBase)
 
-	invalid1 := &DaemonConfig{IPv6ClusterAllocCIDR: "foo"}
+	invalid1 := &DaemonConfig{
+		IPv6ClusterAllocCIDR: "foo",
+	}
 	require.NotNil(t, invalid1.validateIPv6ClusterAllocCIDR())
 
-	invalid2 := &DaemonConfig{IPv6ClusterAllocCIDR: "fdfd"}
+	invalid2 := &DaemonConfig{
+		IPv6ClusterAllocCIDR: "fdfd",
+	}
 	require.NotNil(t, invalid2.validateIPv6ClusterAllocCIDR())
 
-	invalid3 := &DaemonConfig{IPv6ClusterAllocCIDR: "fdfd::/32"}
+	invalid3 := &DaemonConfig{
+		IPv6ClusterAllocCIDR: "fdfd::/32",
+	}
 	require.NotNil(t, invalid3.validateIPv6ClusterAllocCIDR())
 
 	invalid4 := &DaemonConfig{}
@@ -210,21 +220,29 @@ func TestEnabledFunctions(t *testing.T) {
 	assert.False(t, d.IPv4Enabled())
 	assert.False(t, d.IPv6Enabled())
 	assert.False(t, d.SCTPEnabled())
-	d = &DaemonConfig{EnableIPv4: true}
+	d = &DaemonConfig{
+		EnableIPv4: true,
+	}
 	assert.True(t, d.IPv4Enabled())
 	assert.False(t, d.IPv6Enabled())
 	assert.False(t, d.SCTPEnabled())
-	d = &DaemonConfig{EnableIPv6: true}
+	d = &DaemonConfig{
+		EnableIPv6: true,
+	}
 	assert.False(t, d.IPv4Enabled())
 	assert.True(t, d.IPv6Enabled())
 	assert.False(t, d.SCTPEnabled())
-	d = &DaemonConfig{EnableSCTP: true}
+	d = &DaemonConfig{
+		EnableSCTP: true,
+	}
 	assert.False(t, d.IPv4Enabled())
 	assert.False(t, d.IPv6Enabled())
 	assert.True(t, d.SCTPEnabled())
 	d = &DaemonConfig{}
 	require.Empty(t, d.IPAMMode())
-	d = &DaemonConfig{IPAM: ipamOption.IPAMENI}
+	d = &DaemonConfig{
+		IPAM: ipamOption.IPAMENI,
+	}
 	require.Equal(t, ipamOption.IPAMENI, d.IPAMMode())
 }
 
@@ -1291,4 +1309,29 @@ func TestDaemonConfig_validateContainerIPLocalReservedPorts(t *testing.T) {
 			tt.wantErr(t, c.validateContainerIPLocalReservedPorts(), "validateContainerIPLocalReservedPorts()")
 		})
 	}
+}
+
+func TestDaemonConfig_StoreInFile(t *testing.T) {
+	// Set an IntOption so that they are also stored in file
+	assert.False(t, Config.Opts.IsEnabled("unit-test-key-only")) // make sure not used
+	Config.Opts.SetBool("unit-test-key-only", true)
+
+	err := Config.StoreInFile(".")
+	assert.NoError(t, err)
+
+	err = Config.ValidateUnchanged()
+	assert.NoError(t, err)
+
+	// minor change
+	Config.DryMode = true
+	err = Config.ValidateUnchanged()
+	assert.Error(t, err)
+	assert.ErrorContains(t, err, "Config differs:", "Should return a validation error")
+	Config.DryMode = false
+
+	// IntOptions changes are ignored
+	Config.Opts.SetBool("unit-test-key-only", false)
+	err = Config.ValidateUnchanged()
+	assert.NoError(t, err)
+	Config.Opts.Delete("unit-test-key-only")
 }

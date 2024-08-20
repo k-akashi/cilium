@@ -16,9 +16,11 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/cilium/hive/cell"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/pkg/cidr"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
@@ -40,6 +42,7 @@ import (
 	"github.com/cilium/cilium/pkg/node/manager"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/source"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -80,7 +83,7 @@ type linuxNodeHandler struct {
 	// Node-scoped unique IDs for the nodes.
 	nodeIDsByIPs map[string]uint16
 	// reverse map of the above
-	nodeIPsByIDs map[uint16]string
+	nodeIPsByIDs map[uint16]sets.Set[string]
 
 	ipsecMetricCollector prometheus.Collector
 	ipsecMetricOnce      sync.Once
@@ -99,6 +102,7 @@ var (
 // NewNodeHandler returns a new node handler to handle node events and
 // implement the implications in the Linux datapath
 func NewNodeHandler(
+	lifecycle cell.Lifecycle,
 	log *slog.Logger,
 	tunnelConfig dpTunnel.Config,
 	nodeMap nodemap.MapV2,
@@ -110,6 +114,16 @@ func NewNodeHandler(
 	}
 
 	handler := newNodeHandler(log, datapathConfig, nodeMap, nodeManager)
+
+	nodeManager.Subscribe(handler)
+
+	lifecycle.Append(cell.Hook{
+		OnStart: func(_ cell.HookContext) error {
+			handler.RestoreNodeIDs()
+			return nil
+		},
+	})
+
 	return handler, handler, handler
 }
 
@@ -134,7 +148,7 @@ func newNodeHandler(
 		nodeMap:                nodeMap,
 		nodeIDs:                idpool.NewIDPool(minNodeID, maxNodeID),
 		nodeIDsByIPs:           map[string]uint16{},
-		nodeIPsByIDs:           map[uint16]string{},
+		nodeIPsByIDs:           map[uint16]sets.Set[string]{},
 		ipsecMetricCollector:   ipsec.NewXFRMCollector(),
 		prefixClusterMutatorFn: func(node *nodeTypes.Node) []cmtypes.PrefixClusterOpts { return nil },
 		nodeNeighborQueue:      nbq,
@@ -151,7 +165,8 @@ func (l *linuxNodeHandler) Name() string {
 // node are provided as context. The caller expects the tunnel mapping in the
 // datapath to be updated.
 func updateTunnelMapping(log *slog.Logger, oldCIDR, newCIDR cmtypes.PrefixCluster, oldIP, newIP net.IP,
-	firstAddition, encapEnabled bool, oldEncryptKey, newEncryptKey uint8) error {
+	firstAddition, encapEnabled bool, oldEncryptKey, newEncryptKey uint8,
+) error {
 	var errs error
 	if !encapEnabled {
 		// When the protocol family is disabled, the initial node addition will
@@ -335,7 +350,6 @@ func installDirectRoute(log *slog.Logger, CIDR *cidr.CIDR, nodeIP net.IP, skipUn
 }
 
 func (n *linuxNodeHandler) updateDirectRoutes(oldCIDRs, newCIDRs []*cidr.CIDR, oldIP, newIP net.IP, firstAddition, directRouteEnabled bool, directRouteSkipUnreachable bool) error {
-
 	if !directRouteEnabled {
 		// When the protocol family is disabled, the initial node addition will
 		// trigger a deletion to clean up leftover entries. The deletion happens
@@ -968,7 +982,7 @@ func (n *linuxNodeHandler) nodeUpdate(oldNode, newNode *nodeTypes.Node, firstAdd
 		oldKey, newKey                           uint8
 		isLocalNode                              = false
 	)
-	remoteNodeID, err := n.allocateIDForNode(oldNode, newNode)
+	nodeID, err := n.allocateIDForNode(oldNode, newNode)
 	if err != nil {
 		errs = errors.Join(errs, fmt.Errorf("failed to allocate ID for node %s: %w", newNode.Name, err))
 	}
@@ -984,7 +998,7 @@ func (n *linuxNodeHandler) nodeUpdate(oldNode, newNode *nodeTypes.Node, firstAdd
 	}
 
 	if n.nodeConfig.EnableIPSec {
-		errs = errors.Join(errs, n.enableIPsec(oldNode, newNode, remoteNodeID))
+		errs = errors.Join(errs, n.enableIPsec(oldNode, newNode, nodeID))
 		newKey = newNode.EncryptionKey
 	}
 
@@ -1006,7 +1020,7 @@ func (n *linuxNodeHandler) nodeUpdate(oldNode, newNode *nodeTypes.Node, firstAdd
 		}
 		if n.subnetEncryption() {
 			// Enables subnet IPSec by upserting node host routing table IPSec routing
-			if err := n.enableSubnetIPsec(n.nodeConfig.IPv4PodSubnets, n.nodeConfig.IPv6PodSubnets); err != nil {
+			if err := n.enableSubnetIPsec(n.nodeConfig.GetIPv4PodSubnets(), n.nodeConfig.GetIPv6PodSubnets()); err != nil {
 				errs = errors.Join(errs, fmt.Errorf("failed to enable subnet encryption: %w", err))
 			}
 		}
@@ -1086,8 +1100,12 @@ func (n *linuxNodeHandler) NodeDelete(oldNode nodeTypes.Node) error {
 	defer n.mutex.Unlock()
 
 	nodeIdentity := oldNode.Identity()
-	if oldCachedNode, nodeExists := n.nodes[nodeIdentity]; nodeExists {
+	if oldCachedNode, nodeExists := n.nodes[nodeIdentity]; nodeExists || oldNode.Source == source.Restored {
 		delete(n.nodes, nodeIdentity)
+
+		if oldNode.Source == source.Restored {
+			oldCachedNode = &oldNode
+		}
 
 		if n.isInitialized {
 			return n.nodeDelete(oldCachedNode)
@@ -1208,14 +1226,15 @@ func (n *linuxNodeHandler) NodeConfigurationChanged(newConfig datapath.LocalNode
 		case !option.Config.EnableL2NeighDiscovery:
 			n.enableNeighDiscovery = false
 		case option.Config.DirectRoutingDeviceRequired():
-			if option.Config.DirectRoutingDevice == "" {
+			if newConfig.DirectRoutingDevice == nil {
 				return fmt.Errorf("direct routing device is required, but not defined")
 			}
 
+			drd := newConfig.DirectRoutingDevice
 			devices := n.nodeConfig.DeviceNames()
 
 			targetDevices := make([]string, 0, len(devices)+1)
-			targetDevices = append(targetDevices, option.Config.DirectRoutingDevice)
+			targetDevices = append(targetDevices, drd.Name)
 			targetDevices = append(targetDevices, devices...)
 
 			var err error
@@ -1268,9 +1287,9 @@ func (n *linuxNodeHandler) NodeConfigurationChanged(newConfig datapath.LocalNode
 			len(option.Config.IPv4PodSubnets) == 0 {
 			if info := node.GetRouterInfo(); info != nil {
 				ipv4CIDRs := info.GetIPv4CIDRs()
-				ipv4PodSubnets := make([]*net.IPNet, 0, len(ipv4CIDRs))
+				ipv4PodSubnets := make([]*cidr.CIDR, 0, len(ipv4CIDRs))
 				for _, c := range ipv4CIDRs {
-					ipv4PodSubnets = append(ipv4PodSubnets, &c)
+					ipv4PodSubnets = append(ipv4PodSubnets, cidr.NewCIDR(&c))
 				}
 				n.nodeConfig.IPv4PodSubnets = ipv4PodSubnets
 			}
@@ -1284,13 +1303,13 @@ func (n *linuxNodeHandler) NodeConfigurationChanged(newConfig datapath.LocalNode
 		if err := n.removeEncryptRules(); err != nil {
 			n.log.Warn("Cannot cleanup previous encryption rule state.", logfields.Error, err)
 		}
-		if err := ipsec.DeleteXFRM(n.log); err != nil {
+		if err := ipsec.DeleteXFRM(n.log, ipsec.AllReqID); err != nil {
 			return fmt.Errorf("failed to delete xfrm policies on node configuration changed: %w", err)
 		}
 	}
 
 	if !newConfig.EnableIPSecEncryptedOverlay {
-		if err := ipsec.DeleteXFRMWithReqID(n.log, ipsec.EncryptedOverlayReqID); err != nil {
+		if err := ipsec.DeleteXFRM(n.log, ipsec.EncryptedOverlayReqID); err != nil {
 			return fmt.Errorf("failed to delete encrypt overlay xfrm policies on node configuration change: %w", err)
 		}
 	}

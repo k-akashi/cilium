@@ -17,6 +17,9 @@ on:
         description: "[JSON object] Arbitrary arguments passed from the trigger comment via regex capture group. Parse with 'fromJson(inputs.extra-args).argName' in workflow."
         required: false
         default: '{}'
+  push:
+    branches:
+      - 'renovate/main-**'
   # Run every 6 hours
   schedule:
     - cron:  '0 5/6 * * *'
@@ -47,6 +50,7 @@ concurrency:
     ${{ github.workflow }}
     ${{ github.event_name }}
     ${{
+      (github.event_name == 'push' && github.sha) ||
       (github.event_name == 'schedule' && github.sha) ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.PR-number)
     }}
@@ -54,7 +58,7 @@ concurrency:
 
 env:
   # renovate: datasource=golang-version depName=go
-  go-version: 1.22.4
+  go-version: 1.22.6
 
 jobs:
   echo-inputs:
@@ -76,29 +80,32 @@ jobs:
           sha: ${{ inputs.SHA || github.sha }}
 
   setup-and-test:
-    runs-on: ubuntu-latest-4cores-16gb
+    runs-on: ${{ vars.GH_RUNNER_EXTRA_POWER }}
     name: Setup & Test
     strategy:
       fail-fast: false
       matrix:
         include:
           # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-          - kernel: '5.4-20240612.090637'
+          - kernel: '5.4-20240710.064909'
             ci-kernel: '54'
           # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-          - kernel: 'rhel8-20240612.090637'
+          - kernel: 'rhel8-20240710.064909'
             ci-kernel: '54'
           # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-          - kernel: '5.10-20240612.090637'
+          - kernel: '5.10-20240710.064909'
             ci-kernel: '510'
           # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-          - kernel: '5.15-20240612.090637'
+          - kernel: '5.15-20240710.064909'
             ci-kernel: '510'
           # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-          - kernel: '6.1-20240612.090637'
+          - kernel: '6.1-20240710.064909'
             ci-kernel: '61'
           # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-          - kernel: 'bpf-next-20240617.013201'
+          - kernel: '6.6-20240710.064909'
+            ci-kernel: '61'
+          # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
+          - kernel: 'bpf-next-20240711.013133'
             ci-kernel: 'netnext'
     timeout-minutes: 60
     steps:
@@ -116,7 +123,7 @@ jobs:
           persist-credentials: false
 
       - name: Provision LVH VMs
-        uses: cilium/little-vm-helper@3c748d6fc9d6c44a433de85a66f70e8f7043be04 # v0.0.18
+        uses: cilium/little-vm-helper@97c89f004bd0ab4caeacfe92ebc956e13e362e6b # v0.0.19
         with:
           test-name: datapath-bpf-complexity
           image: 'complexity-test'
@@ -137,13 +144,12 @@ jobs:
 
             # The LVH image ships with LLVM taken from a release Cilium version.
             # Replace it with the one extracted from the cilium-builder image.
-            /bootstrap/deb-docker.sh # Install docker first.
             /host/contrib/scripts/extract-llvm.sh /tmp/llvm
             mv /tmp/llvm/usr/local/bin/{clang,llc} /bin/
             rm -r /tmp/llvm
 
       - name: Run verifier tests
-        uses: cilium/little-vm-helper@3c748d6fc9d6c44a433de85a66f70e8f7043be04 # v0.0.18
+        uses: cilium/little-vm-helper@97c89f004bd0ab4caeacfe92ebc956e13e362e6b # v0.0.19
         with:
           provision: 'false'
           cmd: |
@@ -153,7 +159,7 @@ jobs:
 
       - name: Fetch artifacts
         if: ${{ !success() }}
-        uses: cilium/little-vm-helper@3c748d6fc9d6c44a433de85a66f70e8f7043be04 # v0.0.18
+        uses: cilium/little-vm-helper@97c89f004bd0ab4caeacfe92ebc956e13e362e6b # v0.0.19
         with:
           provision: 'false'
           cmd: |
@@ -163,7 +169,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        uses: actions/upload-artifact@834a144ee995460fba8ed112a2fc961b36a5ec5a # v4.3.6
         with:
           name: datapath-verifier_${{ matrix.kernel }}
           path: datapath-verifier

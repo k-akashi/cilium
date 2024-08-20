@@ -35,11 +35,14 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      - name: Cleanup Disk space in runner
+        uses: ./.github/actions/disk-cleanup
+
       - name: Set environment variables
         uses: ./.github/actions/set-env-variables
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d70bba72b1f3fd22344832f00baa16ece964efeb # v3.3.0
+        uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
 
       # Warning: since this is a privileged workflow, subsequent workflow job
       # steps must take care not to execute untrusted code.
@@ -66,7 +69,7 @@ jobs:
 
       - name: Login to quay.io
         if: ${{ steps.docs-builder-tag-in-repositories.outputs.exists == 'false' }}
-        uses: docker/login-action@0d4c9c5ea7693da7b068278f7b52bda2a190a446 # v3.2.0
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_DOCS_BUILDER_USERNAME }}
@@ -75,7 +78,7 @@ jobs:
 
       - name: Build docs-builder image
         if: ${{ steps.docs-builder-tag-in-repositories.outputs.exists == 'false' }}
-        uses: docker/build-push-action@c382f710d39a5bb4e430307530a720f50c2d3318 # v6.0.0
+        uses: docker/build-push-action@16ebe778df0e7752d2cfcbd924afdbbd89c1a755 # v6.6.1
         id: docker-build-docs-builder
         with:
           provenance: false
@@ -138,7 +141,7 @@ jobs:
           REF: ${{ github.event.pull_request.head.ref }}
         run: |
           git diff HEAD^
-          git push https://x-access-token:${{ steps.get_token.outputs.app_token }}@github.com/${{ env.QUAY_ORGANIZATION }}/cilium.git HEAD:"$REF"
+          git push https://x-access-token:${{ steps.get_token.outputs.app_token }}@github.com/${{ github.event.pull_request.head.repo.full_name }}.git HEAD:"$REF"
 
   image-digest:
     name: Retrieve and display image digest
@@ -167,7 +170,7 @@ jobs:
           echo "" >> image-digest/docs-builder.txt
 
       - name: Upload artifact digests
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        uses: actions/upload-artifact@834a144ee995460fba8ed112a2fc961b36a5ec5a # v4.3.6
         with:
           name: image-digest docs-builder
           path: image-digest

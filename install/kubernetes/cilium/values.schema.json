@@ -1,5 +1,13 @@
 {
   "properties": {
+    "LBIPAM": {
+      "properties": {
+        "requireLBClass": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "MTU": {
       "type": "integer"
     },
@@ -520,6 +528,17 @@
         },
         "events": {
           "properties": {
+            "default": {
+              "properties": {
+                "burstLimit": {
+                  "type": "null"
+                },
+                "rateLimit": {
+                  "type": "null"
+                }
+              },
+              "type": "object"
+            },
             "drop": {
               "properties": {
                 "enabled": {
@@ -746,23 +765,16 @@
                     "type": "integer"
                   }
                 }
-              },
-              {
-                "properties": {
-                  "burst": {
-                    "type": "integer"
-                  },
-                  "limit": {
-                    "type": "integer"
-                  },
-                  "nodes": {
-                    "type": "integer"
-                  }
-                }
               }
             ]
           },
           "type": "array"
+        },
+        "sliceMode": {
+          "enum": [
+            "identity",
+            "fcfs"
+          ]
         }
       },
       "type": "object"
@@ -1224,6 +1236,10 @@
                     "string"
                   ]
                 },
+                "loadBalancerSourceRanges": {
+                  "items": {},
+                  "type": "array"
+                },
                 "nodePort": {
                   "type": "integer"
                 },
@@ -1411,6 +1427,9 @@
         "customConf": {
           "type": "boolean"
         },
+        "enableRouteMTUForCNIChaining": {
+          "type": "boolean"
+        },
         "exclusive": {
           "type": "boolean"
         },
@@ -1562,6 +1581,9 @@
         },
         "proxyResponseMaxDelay": {
           "type": "string"
+        },
+        "socketLingerTimeout": {
+          "type": "integer"
         }
       },
       "type": "object"
@@ -1886,7 +1908,10 @@
           ]
         },
         "enabled": {
-          "type": "boolean"
+          "type": [
+            "null",
+            "boolean"
+          ]
         },
         "extraArgs": {
           "items": {},
@@ -2289,6 +2314,14 @@
         "externalTrafficPolicy": {
           "type": "string"
         },
+        "gatewayClass": {
+          "properties": {
+            "create": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
         "hostNetwork": {
           "properties": {
             "enabled": {
@@ -2587,6 +2620,9 @@
                 "server": {
                   "properties": {
                     "cert": {
+                      "type": "string"
+                    },
+                    "existingSecret": {
                       "type": "string"
                     },
                     "extraDnsNames": {
@@ -2964,6 +3000,9 @@
                     "cert": {
                       "type": "string"
                     },
+                    "existingSecret": {
+                      "type": "string"
+                    },
                     "key": {
                       "type": "string"
                     }
@@ -2977,6 +3016,9 @@
                     },
                     "enabled": {
                       "type": "boolean"
+                    },
+                    "existingSecret": {
+                      "type": "string"
                     },
                     "extraDnsNames": {
                       "items": {},
@@ -3068,6 +3110,9 @@
             "server": {
               "properties": {
                 "cert": {
+                  "type": "string"
+                },
+                "existingSecret": {
                   "type": "string"
                 },
                 "extraDnsNames": {
@@ -3259,6 +3304,9 @@
               },
               "type": "object"
             },
+            "labels": {
+              "type": "object"
+            },
             "nodeSelector": {
               "properties": {
                 "kubernetes.io/os": {
@@ -3353,6 +3401,9 @@
                 "client": {
                   "properties": {
                     "cert": {
+                      "type": "string"
+                    },
+                    "existingSecret": {
                       "type": "string"
                     },
                     "key": {
@@ -3688,6 +3739,23 @@
             "integer"
           ]
         },
+        "operator": {
+          "properties": {
+            "burst": {
+              "type": [
+                "null",
+                "integer"
+              ]
+            },
+            "qps": {
+              "type": [
+                "null",
+                "integer"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "qps": {
           "type": [
             "null",
@@ -3707,6 +3775,18 @@
     },
     "k8sServiceHost": {
       "type": "string"
+    },
+    "k8sServiceLookupConfigMapName": {
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    "k8sServiceLookupNamespace": {
+      "type": [
+        "null",
+        "string"
+      ]
     },
     "k8sServicePort": {
       "type": [
@@ -3775,6 +3855,9 @@
         "acceleration": {
           "type": "string"
         },
+        "experimental": {
+          "type": "boolean"
+        },
         "l7": {
           "properties": {
             "algorithm": {
@@ -3812,6 +3895,17 @@
     },
     "name": {
       "type": "string"
+    },
+    "nat": {
+      "properties": {
+        "mapStatsEntries": {
+          "type": "integer"
+        },
+        "mapStatsInterval": {
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "nat46x64Gateway": {
       "properties": {

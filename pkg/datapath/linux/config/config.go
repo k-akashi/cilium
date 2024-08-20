@@ -53,6 +53,7 @@ import (
 	"github.com/cilium/cilium/pkg/maps/neighborsmap"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
+	"github.com/cilium/cilium/pkg/maps/ratelimitmetricsmap"
 	"github.com/cilium/cilium/pkg/maps/recorder"
 	"github.com/cilium/cilium/pkg/maps/signalmap"
 	"github.com/cilium/cilium/pkg/maps/tunnel"
@@ -229,6 +230,7 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *datapath.LocalNodeC
 	cDefinesMap["CT_REPORT_INTERVAL"] = fmt.Sprintf("%d", int64(option.Config.MonitorAggregationInterval.Seconds()))
 	cDefinesMap["CT_REPORT_FLAGS"] = fmt.Sprintf("%#04x", int64(option.Config.MonitorAggregationFlags))
 	cDefinesMap["RATELIMIT_MAP"] = "cilium_ratelimit"
+	cDefinesMap["RATELIMIT_METRICS_MAP"] = ratelimitmetricsmap.MapName
 	cDefinesMap["CT_TAIL_CALL_BUFFER4"] = "cilium_tail_call_buffer4"
 	cDefinesMap["CT_TAIL_CALL_BUFFER6"] = "cilium_tail_call_buffer6"
 	cDefinesMap["PER_CLUSTER_CT_TCP4"] = "cilium_per_cluster_ct_tcp4"
@@ -243,11 +245,9 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *datapath.LocalNodeC
 	}
 
 	cDefinesMap["EVENTS_MAP"] = eventsmap.MapName
+	cDefinesMap["EVENTS_MAP_RATE_LIMIT"] = fmt.Sprintf("%d", option.Config.BPFEventsDefaultRateLimit)
+	cDefinesMap["EVENTS_MAP_BURST_LIMIT"] = fmt.Sprintf("%d", option.Config.BPFEventsDefaultBurstLimit)
 	cDefinesMap["SIGNAL_MAP"] = signalmap.MapName
-	cDefinesMap["POLICY_CALL_MAP"] = policymap.PolicyCallMapName
-	if option.Config.EnableEnvoyConfig {
-		cDefinesMap["POLICY_EGRESSCALL_MAP"] = policymap.PolicyEgressCallMapName
-	}
 	cDefinesMap["LB6_REVERSE_NAT_MAP"] = "cilium_lb6_reverse_nat"
 	cDefinesMap["LB6_SERVICES_MAP_V2"] = "cilium_lb6_services_v2"
 	cDefinesMap["LB6_BACKEND_MAP"] = "cilium_lb6_backends_v3"
@@ -567,23 +567,42 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *datapath.LocalNodeC
 	cDefinesMap["HASH_INIT6_SEED"] = fmt.Sprintf("%d", maglev.SeedJhash1)
 
 	if option.Config.DirectRoutingDeviceRequired() {
+		drd := cfg.DirectRoutingDevice
 		if option.Config.EnableIPv4 {
-			ifindex, ip, ok := h.nodeAddressing.IPv4().DirectRouting()
-			if !ok {
+			if drd == nil {
 				return fmt.Errorf("IPv4 direct routing device not found")
 			}
-			ipv4 := byteorder.NetIPv4ToHost32(ip)
+			var ipv4 uint32
+			for _, addr := range drd.Addrs {
+				if addr.Addr.Is4() {
+					ipv4 = byteorder.NetIPv4ToHost32(addr.AsIP())
+					break
+				}
+			}
+			if ipv4 == 0 {
+				return fmt.Errorf("IPv4 direct routing device IP not found")
+			}
 			cDefinesMap["IPV4_DIRECT_ROUTING"] = fmt.Sprintf("%d", ipv4)
-			cDefinesMap["DIRECT_ROUTING_DEV_IFINDEX"] = fmt.Sprintf("%d", ifindex)
+			cDefinesMap["DIRECT_ROUTING_DEV_IFINDEX"] = fmt.Sprintf("%d", drd.Index)
 		}
 		if option.Config.EnableIPv6 {
-			ifindex, ip, ok := h.nodeAddressing.IPv6().DirectRouting()
-			if !ok {
+			if drd == nil {
 				return fmt.Errorf("IPv6 direct routing device not found")
+			}
+
+			var ip net.IP
+			for _, addr := range drd.Addrs {
+				if addr.Addr.Is6() {
+					ip = addr.AsIP()
+					break
+				}
+			}
+			if ip.IsUnspecified() {
+				return fmt.Errorf("IPv6 direct routing device IP not found")
 			}
 			extraMacrosMap["IPV6_DIRECT_ROUTING"] = ip.String()
 			fw.WriteString(FmtDefineAddress("IPV6_DIRECT_ROUTING", ip))
-			cDefinesMap["DIRECT_ROUTING_DEV_IFINDEX"] = fmt.Sprintf("%d", ifindex)
+			cDefinesMap["DIRECT_ROUTING_DEV_IFINDEX"] = fmt.Sprintf("%d", drd.Index)
 		}
 	} else {
 		var directRoutingIPv6 net.IP
@@ -633,7 +652,7 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *datapath.LocalNodeC
 					cDefinesMap["IP_MASQ_AGENT_IPV4"] = ipmasq.MapNameIPv4
 
 					// native-routing-cidr is optional with ip-masq-agent and may be nil
-					excludeCIDR = option.Config.GetIPv4NativeRoutingCIDR()
+					excludeCIDR = option.Config.IPv4NativeRoutingCIDR
 				} else {
 					excludeCIDR = datapath.RemoteSNATDstAddrExclusionCIDRv4()
 				}
@@ -653,7 +672,7 @@ func (h *HeaderfileWriter) WriteNodeConfig(w io.Writer, cfg *datapath.LocalNodeC
 					cDefinesMap["ENABLE_IP_MASQ_AGENT_IPV6"] = "1"
 					cDefinesMap["IP_MASQ_AGENT_IPV6"] = ipmasq.MapNameIPv6
 
-					excludeCIDR = option.Config.GetIPv6NativeRoutingCIDR()
+					excludeCIDR = option.Config.IPv6NativeRoutingCIDR
 				} else {
 					excludeCIDR = datapath.RemoteSNATDstAddrExclusionCIDRv6()
 				}
@@ -961,19 +980,18 @@ func (h *HeaderfileWriter) WriteNetdevConfig(w io.Writer, opts *option.IntOption
 // specified writer. This must be kept in sync with loader.ELFSubstitutions().
 func (h *HeaderfileWriter) writeStaticData(devices []string, fw io.Writer, e datapath.EndpointConfiguration) {
 	if e.IsHost() {
-		if option.Config.EnableNodePort {
-			// Values defined here are for the host datapath attached to the
-			// host device and therefore won't be used. We however need to set
-			// non-zero values to prevent the compiler from optimizing them
-			// out, because we need to substitute them for host datapaths
-			// attached to native devices.
-			// When substituting symbols in the object file, we will replace
-			// these values with zero for the host device and with the actual
-			// values for the native devices.
-			fmt.Fprint(fw, "/* Fake values, replaced by 0 for host device and by actual values for native devices. */\n")
-			fmt.Fprint(fw, defineUint32("NATIVE_DEV_IFINDEX", 1))
-			fmt.Fprint(fw, "\n")
-		}
+		// Values defined here are for the host datapath attached to the
+		// host device and therefore won't be used. We however need to set
+		// non-zero values to prevent the compiler from optimizing them
+		// out, because we need to substitute them for host datapaths
+		// attached to native devices.
+		// When substituting symbols in the object file, we will replace
+		// these values with zero for the host device and with the actual
+		// values for the native devices.
+		fmt.Fprint(fw, "/* Fake values, replaced by 0 for host device and by actual values for native devices. */\n")
+		fmt.Fprint(fw, defineUint32("NATIVE_DEV_IFINDEX", 1))
+		fmt.Fprint(fw, "\n")
+
 		if option.Config.EnableBPFMasquerade {
 			if option.Config.EnableIPv4Masquerade {
 				// NodePort comment above applies to IPV4_MASQUERADE too
@@ -1019,6 +1037,8 @@ func (h *HeaderfileWriter) writeStaticData(devices []string, fw io.Writer, e dat
 	}
 
 	fmt.Fprint(fw, defineMAC("THIS_INTERFACE_MAC", e.GetNodeMAC()))
+	fmt.Fprint(fw, defineUint32("THIS_INTERFACE_IFINDEX", uint32(e.GetIfIndex())))
+	fmt.Fprint(fw, defineUint64("ENDPOINT_NETNS_COOKIE", uint64(e.GetEndpointNetNsCookie())))
 
 	secID := e.GetIdentityLocked().Uint32()
 	fmt.Fprint(fw, defineUint32("SECLABEL", secID))
@@ -1052,10 +1072,10 @@ func (h *HeaderfileWriter) WriteEndpointConfig(w io.Writer, cfg *datapath.LocalN
 	writeIncludes(w)
 	h.writeStaticData(deviceNames, fw, e)
 
-	return h.writeTemplateConfig(fw, deviceNames, cfg.HostEndpointID, e)
+	return h.writeTemplateConfig(fw, deviceNames, cfg.HostEndpointID, e, cfg.DirectRoutingDevice)
 }
 
-func (h *HeaderfileWriter) writeTemplateConfig(fw *bufio.Writer, devices []string, hostEndpointID uint64, e datapath.EndpointConfiguration) error {
+func (h *HeaderfileWriter) writeTemplateConfig(fw *bufio.Writer, devices []string, hostEndpointID uint64, e datapath.EndpointConfiguration, drd *tables.Device) error {
 	if e.RequireEgressProg() {
 		fmt.Fprintf(fw, "#define USE_BPF_PROG_FOR_INGRESS_POLICY 1\n")
 	}
@@ -1064,16 +1084,13 @@ func (h *HeaderfileWriter) writeTemplateConfig(fw *bufio.Writer, devices []strin
 		fmt.Fprintf(fw, "#define ENABLE_ROUTING 1\n")
 	}
 
-	if !option.Config.EnableHostLegacyRouting && option.Config.DirectRoutingDevice != "" {
-		directRoutingIface := option.Config.DirectRoutingDevice
-		directRoutingIfIndex, err := link.GetIfIndex(directRoutingIface)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(fw, "#define DIRECT_ROUTING_DEV_IFINDEX %d\n", directRoutingIfIndex)
-		if len(devices) == 1 {
-			if e.IsHost() || !option.Config.EnforceLXCFibLookup() {
-				fmt.Fprintf(fw, "#define ENABLE_SKIP_FIB 1\n")
+	if !option.Config.EnableHostLegacyRouting {
+		if drd != nil {
+			fmt.Fprintf(fw, "#define DIRECT_ROUTING_DEV_IFINDEX %d\n", drd.Index)
+			if len(devices) == 1 {
+				if e.IsHost() || !option.Config.EnforceLXCFibLookup() {
+					fmt.Fprintf(fw, "#define ENABLE_SKIP_FIB 1\n")
+				}
 			}
 		}
 	}
@@ -1113,5 +1130,5 @@ func (h *HeaderfileWriter) writeTemplateConfig(fw *bufio.Writer, devices []strin
 // WriteTemplateConfig writes the BPF configuration for the template to a writer.
 func (h *HeaderfileWriter) WriteTemplateConfig(w io.Writer, cfg *datapath.LocalNodeConfiguration, e datapath.EndpointConfiguration) error {
 	fw := bufio.NewWriter(w)
-	return h.writeTemplateConfig(fw, cfg.DeviceNames(), cfg.HostEndpointID, e)
+	return h.writeTemplateConfig(fw, cfg.DeviceNames(), cfg.HostEndpointID, e, cfg.DirectRoutingDevice)
 }

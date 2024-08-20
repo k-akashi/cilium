@@ -4,10 +4,11 @@
 package common
 
 import (
+	"context"
 	"fmt"
+	"sync"
 
 	"github.com/cilium/hive/cell"
-	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/clustermesh/types"
@@ -17,21 +18,6 @@ import (
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
-
-const (
-	// configNotificationsChannelSize is the size of the channel used to
-	// notify a clustermesh of configuration changes
-	configNotificationsChannelSize = 512
-)
-
-type Config struct {
-	// ClusterMeshConfig is the path to the clustermesh configuration directory.
-	ClusterMeshConfig string
-}
-
-func (def Config) Flags(flags *pflag.FlagSet) {
-	flags.String("clustermesh-config", def.ClusterMeshConfig, "Path to the ClusterMesh configuration directory")
-}
 
 type StatusFunc func() *models.RemoteCluster
 type RemoteClusterCreatorFunc func(name string, status StatusFunc) RemoteCluster
@@ -76,17 +62,34 @@ type clusterMesh struct {
 	// conf is the configuration, it is immutable after NewClusterMesh()
 	conf Configuration
 
-	mutex         lock.RWMutex
+	mutex lock.RWMutex
+	wg    sync.WaitGroup
+
 	clusters      map[string]*remoteCluster
 	configWatcher *configDirectoryWatcher
+
+	// tombstones tracks the remote cluster configurations that have been removed,
+	// and whose cleanup process is being currently performed. This allows for
+	// asynchronously performing the appropriate tasks, while preventing the
+	// reconnection to the same cluster until the previously cleanup completed.
+	tombstones map[string]string
+
+	// rctx is a context that is used on cluster removal, to allow aborting
+	// the associated process if still running during shutdown (via rcancel).
+	rctx    context.Context
+	rcancel context.CancelFunc
 }
 
 // NewClusterMesh creates a new remote cluster cache based on the
 // provided configuration
 func NewClusterMesh(c Configuration) ClusterMesh {
+	rctx, rcancel := context.WithCancel(context.Background())
 	return &clusterMesh{
-		conf:     c,
-		clusters: map[string]*remoteCluster{},
+		conf:       c,
+		clusters:   map[string]*remoteCluster{},
+		tombstones: map[string]string{},
+		rctx:       rctx,
+		rcancel:    rcancel,
 	}
 }
 
@@ -108,12 +111,17 @@ func (cm *clusterMesh) Start(cell.HookContext) error {
 // Close stops watching for remote cluster configuration files to appear and
 // will close all connections to remote clusters
 func (cm *clusterMesh) Stop(cell.HookContext) error {
-	cm.mutex.Lock()
-	defer cm.mutex.Unlock()
-
 	if cm.configWatcher != nil {
 		cm.configWatcher.close()
 	}
+
+	// Wait until all in-progress removal processes have completed, if any.
+	// We must not hold the mutex at this point, as needed by the go routines.
+	cm.rcancel()
+	cm.wg.Wait()
+
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 
 	for name, cluster := range cm.clusters {
 		cluster.onStop()
@@ -136,10 +144,13 @@ func (cm *clusterMesh) newRemoteCluster(name, path string) *remoteCluster {
 			return nil
 		}(),
 
-		changed:     make(chan bool, configNotificationsChannelSize),
-		controllers: controller.NewManager(),
+		controllers:                    controller.NewManager(),
+		remoteConnectionControllerName: fmt.Sprintf("remote-etcd-%s", name),
 
 		logger: log.WithField(logfields.ClusterName, name),
+
+		backendFactory:     kvstore.NewClient,
+		clusterLockFactory: newClusterLock,
 
 		metricLastFailureTimestamp: cm.conf.Metrics.LastFailureTimestamp.WithLabelValues(cm.conf.ClusterInfo.Name, cm.conf.NodeName, name),
 		metricReadinessStatus:      cm.conf.Metrics.ReadinessStatus.WithLabelValues(cm.conf.ClusterInfo.Name, cm.conf.NodeName, name),
@@ -161,34 +172,70 @@ func (cm *clusterMesh) add(name, path string) {
 			Error("Remote cluster name is invalid. The connection will be forbidden starting from Cilium v1.17")
 	}
 
-	inserted := false
 	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	cm.addLocked(name, path)
+}
+
+func (cm *clusterMesh) addLocked(name, path string) {
+	if _, ok := cm.tombstones[name]; ok {
+		// The configuration for this cluster has been recreated before the cleanup
+		// of the same cluster completed. Let's queue it for delayed processing.
+		cm.tombstones[name] = path
+		log.WithField(fieldClusterName, name).Info("Delaying configuration of remote cluster, which is still being removed")
+		return
+	}
+
 	cluster, ok := cm.clusters[name]
 	if !ok {
 		cluster = cm.newRemoteCluster(name, path)
 		cm.clusters[name] = cluster
-		inserted = true
 	}
 
 	cm.conf.Metrics.TotalRemoteClusters.WithLabelValues(cm.conf.ClusterInfo.Name, cm.conf.NodeName).Set(float64(len(cm.clusters)))
-	cm.mutex.Unlock()
 
-	if inserted {
-		cluster.onInsert()
-	} else {
-		// signal a change in configuration
-		cluster.changed <- true
-	}
+	cluster.connect()
 }
 
 func (cm *clusterMesh) remove(name string) {
+	const removed = ""
+
 	cm.mutex.Lock()
-	if cluster, ok := cm.clusters[name]; ok {
-		cluster.onRemove()
-		delete(cm.clusters, name)
-		cm.conf.Metrics.TotalRemoteClusters.WithLabelValues(cm.conf.ClusterInfo.Name, cm.conf.NodeName).Set(float64(len(cm.clusters)))
+	defer cm.mutex.Unlock()
+
+	cluster, ok := cm.clusters[name]
+	if !ok {
+		if _, alreadyRemoving := cm.tombstones[name]; alreadyRemoving {
+			// Reset possibly queued add events
+			cm.tombstones[name] = removed
+		}
+
+		return
 	}
-	cm.mutex.Unlock()
+
+	cm.tombstones[name] = removed
+	delete(cm.clusters, name)
+	cm.conf.Metrics.TotalRemoteClusters.WithLabelValues(cm.conf.ClusterInfo.Name, cm.conf.NodeName).Set(float64(len(cm.clusters)))
+
+	cm.wg.Add(1)
+	go func() {
+		defer cm.wg.Done()
+
+		// Run onRemove in a separate go routing as potentially slow, to avoid
+		// blocking the processing of further events in the meanwhile.
+		cluster.onRemove(cm.rctx)
+
+		cm.mutex.Lock()
+		path := cm.tombstones[name]
+		delete(cm.tombstones, name)
+
+		if path != removed {
+			// Let's replay the queued add event.
+			log.WithField(fieldClusterName, name).Info("Replaying delayed configuration of new remote cluster after removal")
+			cm.addLocked(name, path)
+		}
+		cm.mutex.Unlock()
+	}()
 
 	log.WithField(fieldClusterName, name).Debug("Remote cluster configuration removed")
 }

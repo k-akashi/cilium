@@ -42,9 +42,12 @@ type Table[Obj any] interface {
 	// increments in a write transaction on each Insert and Delete.
 	Revision(ReadTxn) Revision
 
-	// All returns an iterator for all objects in the table and a watch
+	// All returns an iterator for all objects in the table.
+	All(ReadTxn) Iterator[Obj]
+
+	// AllWatch returns an iterator for all objects in the table and a watch
 	// channel that is closed when the table changes.
-	All(ReadTxn) (Iterator[Obj], <-chan struct{})
+	AllWatch(ReadTxn) (Iterator[Obj], <-chan struct{})
 
 	// List returns an iterator for all objects matching the given query.
 	List(ReadTxn, Query[Obj]) Iterator[Obj]
@@ -62,13 +65,21 @@ type Table[Obj any] interface {
 	GetWatch(ReadTxn, Query[Obj]) (obj Obj, rev Revision, watch <-chan struct{}, found bool)
 
 	// LowerBound returns an iterator for objects that have a key
+	// greater or equal to the query.
+	LowerBound(ReadTxn, Query[Obj]) Iterator[Obj]
+
+	// LowerBoundWatch returns an iterator for objects that have a key
 	// greater or equal to the query. The returned watch channel is closed
 	// when anything in the table changes as more fine-grained notifications
 	// are not possible with a lower bound search.
-	LowerBound(ReadTxn, Query[Obj]) (iter Iterator[Obj], watch <-chan struct{})
+	LowerBoundWatch(ReadTxn, Query[Obj]) (iter Iterator[Obj], watch <-chan struct{})
 
 	// Prefix searches the table by key prefix.
-	Prefix(ReadTxn, Query[Obj]) (iter Iterator[Obj], watch <-chan struct{})
+	Prefix(ReadTxn, Query[Obj]) Iterator[Obj]
+
+	// PrefixWatch searches the table by key prefix. Returns an iterator and a watch
+	// channel that closes when the query results have become stale.
+	PrefixWatch(ReadTxn, Query[Obj]) (iter Iterator[Obj], watch <-chan struct{})
 
 	// Changes returns an iterator for changes happening to the table.
 	// This uses the revision index to iterate over the objects in the order
@@ -139,6 +150,17 @@ type RWTable[Obj any] interface {
 	// Each inserted or updated object will be assigned a new unique
 	// revision.
 	Insert(WriteTxn, Obj) (oldObj Obj, hadOld bool, err error)
+
+	// Modify an existing object or insert a new object into the table. If an old object
+	// exists the [merge] function is called with the old and new objects.
+	//
+	// Modify is semantically equal to Get + Insert, but avoids extra lookups making
+	// it significantly more efficient.
+	//
+	// Possible errors:
+	// - ErrTableNotLockedForWriting: table was not locked for writing
+	// - ErrTransactionClosed: the write transaction already committed or aborted
+	Modify(txn WriteTxn, new Obj, merge func(old, new Obj) Obj) (oldObj Obj, hadOld bool, err error)
 
 	// CompareAndSwap compares the existing object's revision against the
 	// given revision and if equal it replaces the object.
@@ -379,10 +401,16 @@ type tableEntry struct {
 
 func (t *tableEntry) numObjects() int {
 	indexEntry := t.indexes[t.meta.indexPos(RevisionIndex)]
+	if indexEntry.txn != nil {
+		return indexEntry.txn.Len()
+	}
 	return indexEntry.tree.Len()
 }
 
 func (t *tableEntry) numDeletedObjects() int {
 	indexEntry := t.indexes[t.meta.indexPos(GraveyardIndex)]
+	if indexEntry.txn != nil {
+		return indexEntry.txn.Len()
+	}
 	return indexEntry.tree.Len()
 }

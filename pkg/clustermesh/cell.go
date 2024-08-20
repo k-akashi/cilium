@@ -30,11 +30,12 @@ var Cell = cell.Module(
 	}),
 	cell.ProvidePrivate(idsMgrProvider),
 
-	cell.Config(common.Config{}),
+	cell.Config(common.DefaultConfig),
 	cell.Config(wait.TimeoutConfigDefault),
 
 	metrics.Metric(NewMetrics),
 	metrics.Metric(common.MetricsProvider(subsystem)),
 
-	cell.Invoke(ipsetSyncer),
+	cell.Invoke(ipsetNotifier),
+	cell.Invoke(nodeManagerNotifier),
 )

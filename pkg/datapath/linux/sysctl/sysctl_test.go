@@ -139,7 +139,7 @@ func TestSysctl(t *testing.T) {
 		cell.Module(
 			"sysctl-test",
 			"sysctl-test",
-			cell.Config(Config{}),
+			cell.Config(defaultConfig),
 
 			cell.Provide(
 				func() afero.Fs {
@@ -149,8 +149,7 @@ func TestSysctl(t *testing.T) {
 			cell.Provide(
 				newReconcilingSysctl,
 				tables.NewSysctlTable,
-				reconciler.New[*tables.Sysctl],
-				newReconcilerConfig,
+				newReconciler,
 				newOps,
 			),
 		),
@@ -239,7 +238,7 @@ func TestSysctlIgnoreErr(t *testing.T) {
 		cell.Module(
 			"sysctl-test",
 			"sysctl-test",
-			cell.Config(Config{}),
+			cell.Config(defaultConfig),
 
 			cell.Provide(
 				func() afero.Fs {
@@ -249,8 +248,7 @@ func TestSysctlIgnoreErr(t *testing.T) {
 			cell.Provide(
 				newReconcilingSysctl,
 				tables.NewSysctlTable,
-				reconciler.New[*tables.Sysctl],
-				newReconcilerConfig,
+				newReconciler,
 				newOps,
 			),
 		),

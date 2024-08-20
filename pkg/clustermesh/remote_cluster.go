@@ -135,7 +135,7 @@ func (rc *remoteCluster) Stop() {
 	rc.synced.Stop()
 }
 
-func (rc *remoteCluster) Remove() {
+func (rc *remoteCluster) Remove(context.Context) {
 	// Draining shall occur only when the configuration for the remote cluster
 	// is removed, and not in case the agent is shutting down, otherwise we
 	// would break existing connections on restart.
@@ -209,6 +209,7 @@ func (rc *remoteCluster) ipCacheWatcherOpts(config *cmtypes.CiliumClusterConfig)
 
 	if config != nil {
 		opts = append(opts, ipcache.WithCachedPrefix(config.Capabilities.Cached))
+		opts = append(opts, ipcache.WithIdentityValidator(config.ID))
 	}
 
 	if rc.ipCacheWatcherExtraOpts != nil {

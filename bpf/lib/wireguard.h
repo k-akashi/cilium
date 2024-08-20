@@ -23,7 +23,6 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto)
 	void *data, *data_end;
 	struct ipv6hdr __maybe_unused *ip6;
 	struct iphdr __maybe_unused *ip4;
-	bool from_tunnel __maybe_unused = false;
 	__u32 magic __maybe_unused = 0;
 
 	if (!eth_is_supported_ethertype(proto))
@@ -64,33 +63,16 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto)
 		if (!revalidate_data(ctx, &data, &data_end, &ip4))
 			return DROP_INVALID;
 # if defined(HAVE_ENCAP)
-		/* A rudimentary check (inspired by is_enap()) whether a pkt
-		 * is coming from tunnel device. In tunneling mode WG needs to
-		 * encrypt such pkts, so that src sec ID can be transferred.
+		/* In tunneling mode WG needs to encrypt tunnel traffic,
+		 * so that src sec ID can be transferred.
 		 *
 		 * This also handles IPv6, as IPv6 pkts are encapsulated w/
 		 * IPv4 tunneling.
-		 *
-		 * TODO: in v1.17, we can trust that to-overlay will mark all
-		 * traffic. Then replace this with ctx_is_overlay().
 		 */
-		if (ip4->protocol == IPPROTO_UDP) {
-			int l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
-			__be16 dport;
-
-			if (l4_load_port(ctx, l4_off + UDP_DPORT_OFF, &dport) < 0) {
-				/* IP fragmentation is not expected after the
-				 * encap. So this is non-Cilium's pkt.
-				 */
-				break;
-			}
-
-			if (dport == bpf_htons(TUNNEL_PORT)) {
-				from_tunnel = true;
-				break;
-			}
-		}
+		if (ctx_is_overlay(ctx))
+			goto overlay_encrypt;
 # endif /* HAVE_ENCAP */
+
 		dst = lookup_ip4_remote_endpoint(ip4->daddr, 0);
 		src = lookup_ip4_remote_endpoint(ip4->saddr, 0);
 		break;
@@ -98,11 +80,6 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto)
 	default:
 		goto out;
 	}
-
-#if defined(HAVE_ENCAP)
-	if (from_tunnel)
-		goto encrypt;
-#endif /* HAVE_ENCAP */
 
 #ifndef ENABLE_NODE_ENCRYPTION
 	/* A pkt coming from L7 proxy (i.e., Envoy or the DNS proxy on behalf of
@@ -133,10 +110,7 @@ wg_maybe_redirect_to_encrypt(struct __ctx_buff *ctx, __be16 proto)
 #endif /* !ENABLE_NODE_ENCRYPTION */
 
 	/* We don't want to encrypt any traffic that originates from outside
-	 * the cluster.
-	 * Without this check, that may happen for the egress gateway, when
-	 * reply traffic arrives from the cluster-external server and goes to
-	 * the client pod.
+	 * the cluster. This check excludes DSR traffic from the LB node to a remote backend.
 	 */
 	if (!src || !identity_is_cluster(src->sec_identity))
 		goto out;
@@ -152,7 +126,9 @@ maybe_encrypt: __maybe_unused
 	 * required.
 	 */
 	if (dst && dst->key) {
-encrypt: __maybe_unused
+		if (src)
+			set_identity_mark(ctx, src->sec_identity, MARK_MAGIC_IDENTITY);
+overlay_encrypt: __maybe_unused
 		return ctx_redirect(ctx, WG_IFINDEX, 0);
 	}
 

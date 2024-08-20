@@ -70,7 +70,7 @@ func (d *Daemon) allocateRouterIPv4(family types.NodeAddressingFamily, fromK8s, 
 		if routerIP == nil {
 			return nil, fmt.Errorf("Invalid local-router-ip: %s", option.Config.LocalRouterIPv4)
 		}
-		if d.datapath.LocalNodeAddressing().IPv4().AllocationCIDR().Contains(routerIP) {
+		if d.nodeAddressing.IPv4().AllocationCIDR().Contains(routerIP) {
 			log.Warn("Specified router IP is within IPv4 podCIDR.")
 		}
 		return routerIP, nil
@@ -85,7 +85,7 @@ func (d *Daemon) allocateRouterIPv6(family types.NodeAddressingFamily, fromK8s, 
 		if routerIP == nil {
 			return nil, fmt.Errorf("Invalid local-router-ip: %s", option.Config.LocalRouterIPv6)
 		}
-		if d.datapath.LocalNodeAddressing().IPv6().AllocationCIDR().Contains(routerIP) {
+		if d.nodeAddressing.IPv6().AllocationCIDR().Contains(routerIP) {
 			log.Warn("Specified router IP is within IPv6 podCIDR.")
 		}
 		return routerIP, nil
@@ -95,10 +95,13 @@ func (d *Daemon) allocateRouterIPv6(family types.NodeAddressingFamily, fromK8s, 
 }
 
 // Coalesce CIDRS when allocating the DatapathIPs and healthIPs. GH #18868
-func coalesceCIDRs(rCIDRs []string) (result []string) {
+func coalesceCIDRs(rCIDRs []string) (result []string, err error) {
 	cidrs := make([]*net.IPNet, 0, len(rCIDRs))
 	for _, k := range rCIDRs {
-		ip, mask, _ := net.ParseCIDR(k)
+		ip, mask, err := net.ParseCIDR(k)
+		if err != nil {
+			return nil, err
+		}
 		cidrs = append(cidrs, &net.IPNet{IP: ip, Mask: mask.Mask})
 	}
 	ipv4cidr, ipv6cidr := iputil.CoalesceCIDRs(cidrs)
@@ -191,7 +194,10 @@ func (d *Daemon) allocateDatapathIPs(family types.NodeAddressingFamily, fromK8s,
 		option.Config.IPAM == ipamOption.IPAMENI &&
 		result != nil &&
 		len(result.CIDRs) > 0 {
-		result.CIDRs = coalesceCIDRs(result.CIDRs)
+		result.CIDRs, err = coalesceCIDRs(result.CIDRs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to coalesce CIDRs: %w", err)
+		}
 	}
 
 	if (option.Config.IPAM == ipamOption.IPAMENI ||
@@ -251,7 +257,10 @@ func (d *Daemon) allocateHealthIPs() error {
 			option.Config.IPAM == ipamOption.IPAMENI &&
 			result != nil &&
 			len(result.CIDRs) > 0 {
-			result.CIDRs = coalesceCIDRs(result.CIDRs)
+			result.CIDRs, err = coalesceCIDRs(result.CIDRs)
+			if err != nil {
+				return fmt.Errorf("failed to coalesce CIDRs: %w", err)
+			}
 		}
 
 		log.Debugf("IPv4 health endpoint address: %s", result.IP)
@@ -326,7 +335,10 @@ func (d *Daemon) allocateIngressIPs() error {
 				option.Config.IPAM == ipamOption.IPAMENI &&
 				result != nil &&
 				len(result.CIDRs) > 0 {
-				result.CIDRs = coalesceCIDRs(result.CIDRs)
+				result.CIDRs, err = coalesceCIDRs(result.CIDRs)
+				if err != nil {
+					return fmt.Errorf("failed to coalesce CIDRs: %w", err)
+				}
 			}
 
 			node.SetIngressIPv4(result.IP)
@@ -384,7 +396,10 @@ func (d *Daemon) allocateIngressIPs() error {
 				option.Config.IPAM == ipamOption.IPAMENI &&
 				result != nil &&
 				len(result.CIDRs) > 0 {
-				result.CIDRs = coalesceCIDRs(result.CIDRs)
+				result.CIDRs, err = coalesceCIDRs(result.CIDRs)
+				if err != nil {
+					return fmt.Errorf("failed to coalesce CIDRs: %w", err)
+				}
 			}
 
 			node.SetIngressIPv6(result.IP)
@@ -404,7 +419,7 @@ func (d *Daemon) allocateIPs(ctx context.Context, router restoredIPs) error {
 	bootstrapStats.ipam.Start()
 
 	if option.Config.EnableIPv4 {
-		routerIP, err := d.allocateRouterIPv4(d.datapath.LocalNodeAddressing().IPv4(), router.IPv4FromK8s, router.IPv4FromFS)
+		routerIP, err := d.allocateRouterIPv4(d.nodeAddressing.IPv4(), router.IPv4FromK8s, router.IPv4FromFS)
 		if err != nil {
 			return err
 		}
@@ -414,7 +429,7 @@ func (d *Daemon) allocateIPs(ctx context.Context, router restoredIPs) error {
 	}
 
 	if option.Config.EnableIPv6 {
-		routerIP, err := d.allocateRouterIPv6(d.datapath.LocalNodeAddressing().IPv6(), router.IPv6FromK8s, router.IPv6FromFS)
+		routerIP, err := d.allocateRouterIPv6(d.nodeAddressing.IPv6(), router.IPv6FromK8s, router.IPv6FromFS)
 		if err != nil {
 			return err
 		}
@@ -432,7 +447,7 @@ func (d *Daemon) allocateIPs(ctx context.Context, router restoredIPs) error {
 	log.Infof("  Local node-name: %s", nodeTypes.GetName())
 	log.Infof("  Node-IPv6: %s", node.GetIPv6())
 
-	iter, _ := d.nodeAddrs.All(d.db.ReadTxn())
+	iter := d.nodeAddrs.All(d.db.ReadTxn())
 	addrs := statedb.Collect(
 		statedb.Filter(
 			iter,
@@ -441,7 +456,7 @@ func (d *Daemon) allocateIPs(ctx context.Context, router restoredIPs) error {
 	if option.Config.EnableIPv6 {
 		log.Infof("  IPv6 allocation prefix: %s", node.GetIPv6AllocRange())
 
-		if c := option.Config.GetIPv6NativeRoutingCIDR(); c != nil {
+		if c := option.Config.IPv6NativeRoutingCIDR; c != nil {
 			log.Infof("  IPv6 native routing prefix: %s", c.String())
 		}
 
@@ -461,7 +476,7 @@ func (d *Daemon) allocateIPs(ctx context.Context, router restoredIPs) error {
 	if option.Config.EnableIPv4 {
 		log.Infof("  IPv4 allocation prefix: %s", node.GetIPv4AllocRange())
 
-		if c := option.Config.GetIPv4NativeRoutingCIDR(); c != nil {
+		if c := option.Config.IPv4NativeRoutingCIDR; c != nil {
 			log.Infof("  IPv4 native routing prefix: %s", c.String())
 		}
 
@@ -522,7 +537,12 @@ func (d *Daemon) configureIPAM() {
 		node.SetIPv6NodeRange(allocCIDR)
 	}
 
-	if err := node.AutoComplete(); err != nil {
+	device := ""
+	drd, _ := d.directRoutingDev.Get(d.ctx, d.db.ReadTxn())
+	if drd != nil {
+		device = drd.Name
+	}
+	if err := node.AutoComplete(device); err != nil {
 		log.WithError(err).Fatal("Cannot autocomplete node addresses")
 	}
 }

@@ -119,6 +119,7 @@ type HTTPRouteSpec struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=16
 	// +kubebuilder:default={{matches: {{path: {type: "PathPrefix", value: "/"}}}}}
+	// +kubebuilder:validation:XValidation:message="While 16 rules and 64 matches per rule are allowed, the total number of matches across all rules in a route must be less than 128",rule="(self.size() > 0 ? self[0].matches.size() : 0) + (self.size() > 1 ? self[1].matches.size() : 0) + (self.size() > 2 ? self[2].matches.size() : 0) + (self.size() > 3 ? self[3].matches.size() : 0) + (self.size() > 4 ? self[4].matches.size() : 0) + (self.size() > 5 ? self[5].matches.size() : 0) + (self.size() > 6 ? self[6].matches.size() : 0) + (self.size() > 7 ? self[7].matches.size() : 0) + (self.size() > 8 ? self[8].matches.size() : 0) + (self.size() > 9 ? self[9].matches.size() : 0) + (self.size() > 10 ? self[10].matches.size() : 0) + (self.size() > 11 ? self[11].matches.size() : 0) + (self.size() > 12 ? self[12].matches.size() : 0) + (self.size() > 13 ? self[13].matches.size() : 0) + (self.size() > 14 ? self[14].matches.size() : 0) + (self.size() > 15 ? self[15].matches.size() : 0) <= 128"
 	Rules []HTTPRouteRule `json:"rules,omitempty"`
 }
 
@@ -190,7 +191,7 @@ type HTTPRouteRule struct {
 	// parent a request is coming from, a HTTP 404 status code MUST be returned.
 	//
 	// +optional
-	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:default={{path:{ type: "PathPrefix", value: "/"}}}
 	Matches []HTTPRouteMatch `json:"matches,omitempty"`
 
@@ -263,6 +264,11 @@ type HTTPRouteRule struct {
 	// invalid, 50 percent of traffic must receive a 500. Implementations may
 	// choose how that 50 percent is determined.
 	//
+	// When a HTTPBackendRef refers to a Service that has no ready endpoints,
+	// implementations SHOULD return a 503 for requests to that backend instead.
+	// If an implementation chooses to do this, all of the above rules for 500 responses
+	// MUST also apply for responses that return a 503.
+	//
 	// Support: Core for Kubernetes Service
 	//
 	// Support: Extended for Kubernetes ServiceImport
@@ -280,7 +286,6 @@ type HTTPRouteRule struct {
 	// Support: Extended
 	//
 	// +optional
-	// <gateway:experimental>
 	Timeouts *HTTPRouteTimeouts `json:"timeouts,omitempty"`
 
 	// SessionPersistence defines and configures session persistence
@@ -316,7 +321,8 @@ type HTTPRouteTimeouts struct {
 	// request stream has been received instead of immediately after the transaction is
 	// initiated by the client.
 	//
-	// When this field is unspecified, request timeout behavior is implementation-specific.
+	// The value of Request is a Gateway API Duration string as defined by GEP-2257. When this
+	// field is unspecified, request timeout behavior is implementation-specific.
 	//
 	// Support: Extended
 	//
@@ -336,8 +342,10 @@ type HTTPRouteTimeouts struct {
 	// may result in more than one call from the gateway to the destination backend,
 	// for example, if automatic retries are supported.
 	//
-	// Because the Request timeout encompasses the BackendRequest timeout, the value of
-	// BackendRequest must be <= the value of Request timeout.
+	// The value of BackendRequest must be a Gateway API Duration string as defined by
+	// GEP-2257.  When this field is unspecified, its behavior is implementation-specific;
+	// when specified, the value of BackendRequest must be no more than the value of the
+	// Request timeout (since the Request timeout encompasses the BackendRequest timeout).
 	//
 	// Support: Extended
 	//

@@ -13,7 +13,6 @@ import (
 	smithytime "github.com/aws/smithy-go/time"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	smithywaiter "github.com/aws/smithy-go/waiter"
-	"github.com/jmespath/go-jmespath"
 	"time"
 )
 
@@ -153,6 +152,9 @@ func (c *Client) addOperationDescribeNatGatewaysMiddlewares(stack *middleware.St
 	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
+	if err = addUserAgentRetryMode(stack, options); err != nil {
+		return err
+	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeNatGateways(options.Region), middleware.Before); err != nil {
 		return err
 	}
@@ -172,101 +174,6 @@ func (c *Client) addOperationDescribeNatGatewaysMiddlewares(stack *middleware.St
 		return err
 	}
 	return nil
-}
-
-// DescribeNatGatewaysAPIClient is a client that implements the
-// DescribeNatGateways operation.
-type DescribeNatGatewaysAPIClient interface {
-	DescribeNatGateways(context.Context, *DescribeNatGatewaysInput, ...func(*Options)) (*DescribeNatGatewaysOutput, error)
-}
-
-var _ DescribeNatGatewaysAPIClient = (*Client)(nil)
-
-// DescribeNatGatewaysPaginatorOptions is the paginator options for
-// DescribeNatGateways
-type DescribeNatGatewaysPaginatorOptions struct {
-	// The maximum number of items to return for this request. To get the next page of
-	// items, make another request with the token returned in the output. For more
-	// information, see [Pagination].
-	//
-	// [Pagination]: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Query-Requests.html#api-pagination
-	Limit int32
-
-	// Set to true if pagination should stop if the service returns a pagination token
-	// that matches the most recent token provided to the service.
-	StopOnDuplicateToken bool
-}
-
-// DescribeNatGatewaysPaginator is a paginator for DescribeNatGateways
-type DescribeNatGatewaysPaginator struct {
-	options   DescribeNatGatewaysPaginatorOptions
-	client    DescribeNatGatewaysAPIClient
-	params    *DescribeNatGatewaysInput
-	nextToken *string
-	firstPage bool
-}
-
-// NewDescribeNatGatewaysPaginator returns a new DescribeNatGatewaysPaginator
-func NewDescribeNatGatewaysPaginator(client DescribeNatGatewaysAPIClient, params *DescribeNatGatewaysInput, optFns ...func(*DescribeNatGatewaysPaginatorOptions)) *DescribeNatGatewaysPaginator {
-	if params == nil {
-		params = &DescribeNatGatewaysInput{}
-	}
-
-	options := DescribeNatGatewaysPaginatorOptions{}
-	if params.MaxResults != nil {
-		options.Limit = *params.MaxResults
-	}
-
-	for _, fn := range optFns {
-		fn(&options)
-	}
-
-	return &DescribeNatGatewaysPaginator{
-		options:   options,
-		client:    client,
-		params:    params,
-		firstPage: true,
-		nextToken: params.NextToken,
-	}
-}
-
-// HasMorePages returns a boolean indicating whether more pages are available
-func (p *DescribeNatGatewaysPaginator) HasMorePages() bool {
-	return p.firstPage || (p.nextToken != nil && len(*p.nextToken) != 0)
-}
-
-// NextPage retrieves the next DescribeNatGateways page.
-func (p *DescribeNatGatewaysPaginator) NextPage(ctx context.Context, optFns ...func(*Options)) (*DescribeNatGatewaysOutput, error) {
-	if !p.HasMorePages() {
-		return nil, fmt.Errorf("no more pages available")
-	}
-
-	params := *p.params
-	params.NextToken = p.nextToken
-
-	var limit *int32
-	if p.options.Limit > 0 {
-		limit = &p.options.Limit
-	}
-	params.MaxResults = limit
-
-	result, err := p.client.DescribeNatGateways(ctx, &params, optFns...)
-	if err != nil {
-		return nil, err
-	}
-	p.firstPage = false
-
-	prevToken := p.nextToken
-	p.nextToken = result.NextToken
-
-	if p.options.StopOnDuplicateToken &&
-		prevToken != nil &&
-		p.nextToken != nil &&
-		*prevToken == *p.nextToken {
-		p.nextToken = nil
-	}
-
-	return result, nil
 }
 
 // NatGatewayAvailableWaiterOptions are waiter options for
@@ -386,7 +293,13 @@ func (w *NatGatewayAvailableWaiter) WaitForOutput(ctx context.Context, params *D
 		}
 
 		out, err := w.client.DescribeNatGateways(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
 			for _, opt := range options.ClientOptions {
 				opt(o)
 			}
@@ -425,29 +338,18 @@ func (w *NatGatewayAvailableWaiter) WaitForOutput(ctx context.Context, params *D
 func natGatewayAvailableStateRetryable(ctx context.Context, input *DescribeNatGatewaysInput, output *DescribeNatGatewaysOutput, err error) (bool, error) {
 
 	if err == nil {
-		pathValue, err := jmespath.Search("NatGateways[].State", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.NatGateways
+		var v2 []types.NatGatewayState
+		for _, v := range v1 {
+			v3 := v.State
+			v2 = append(v2, v3)
 		}
-
 		expectedValue := "available"
-		var match = true
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
-		}
-
-		if len(listOfValues) == 0 {
-			match = false
-		}
-		for _, v := range listOfValues {
-			value, ok := v.(types.NatGatewayState)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.NatGatewayState value, got %T", pathValue)
-			}
-
-			if string(value) != expectedValue {
+		match := len(v2) > 0
+		for _, v := range v2 {
+			if string(v) != expectedValue {
 				match = false
+				break
 			}
 		}
 
@@ -457,74 +359,65 @@ func natGatewayAvailableStateRetryable(ctx context.Context, input *DescribeNatGa
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("NatGateways[].State", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.NatGateways
+		var v2 []types.NatGatewayState
+		for _, v := range v1 {
+			v3 := v.State
+			v2 = append(v2, v3)
 		}
-
 		expectedValue := "failed"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v2 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.NatGatewayState)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.NatGatewayState value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("NatGateways[].State", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.NatGateways
+		var v2 []types.NatGatewayState
+		for _, v := range v1 {
+			v3 := v.State
+			v2 = append(v2, v3)
 		}
-
 		expectedValue := "deleting"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v2 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.NatGatewayState)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.NatGatewayState value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("NatGateways[].State", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.NatGateways
+		var v2 []types.NatGatewayState
+		for _, v := range v1 {
+			v3 := v.State
+			v2 = append(v2, v3)
 		}
-
 		expectedValue := "deleted"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v2 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.NatGatewayState)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.NatGatewayState value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
@@ -658,7 +551,13 @@ func (w *NatGatewayDeletedWaiter) WaitForOutput(ctx context.Context, params *Des
 		}
 
 		out, err := w.client.DescribeNatGateways(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
 			for _, opt := range options.ClientOptions {
 				opt(o)
 			}
@@ -697,29 +596,18 @@ func (w *NatGatewayDeletedWaiter) WaitForOutput(ctx context.Context, params *Des
 func natGatewayDeletedStateRetryable(ctx context.Context, input *DescribeNatGatewaysInput, output *DescribeNatGatewaysOutput, err error) (bool, error) {
 
 	if err == nil {
-		pathValue, err := jmespath.Search("NatGateways[].State", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.NatGateways
+		var v2 []types.NatGatewayState
+		for _, v := range v1 {
+			v3 := v.State
+			v2 = append(v2, v3)
 		}
-
 		expectedValue := "deleted"
-		var match = true
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
-		}
-
-		if len(listOfValues) == 0 {
-			match = false
-		}
-		for _, v := range listOfValues {
-			value, ok := v.(types.NatGatewayState)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.NatGatewayState value, got %T", pathValue)
-			}
-
-			if string(value) != expectedValue {
+		match := len(v2) > 0
+		for _, v := range v2 {
+			if string(v) != expectedValue {
 				match = false
+				break
 			}
 		}
 
@@ -742,6 +630,104 @@ func natGatewayDeletedStateRetryable(ctx context.Context, input *DescribeNatGate
 
 	return true, nil
 }
+
+// DescribeNatGatewaysPaginatorOptions is the paginator options for
+// DescribeNatGateways
+type DescribeNatGatewaysPaginatorOptions struct {
+	// The maximum number of items to return for this request. To get the next page of
+	// items, make another request with the token returned in the output. For more
+	// information, see [Pagination].
+	//
+	// [Pagination]: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Query-Requests.html#api-pagination
+	Limit int32
+
+	// Set to true if pagination should stop if the service returns a pagination token
+	// that matches the most recent token provided to the service.
+	StopOnDuplicateToken bool
+}
+
+// DescribeNatGatewaysPaginator is a paginator for DescribeNatGateways
+type DescribeNatGatewaysPaginator struct {
+	options   DescribeNatGatewaysPaginatorOptions
+	client    DescribeNatGatewaysAPIClient
+	params    *DescribeNatGatewaysInput
+	nextToken *string
+	firstPage bool
+}
+
+// NewDescribeNatGatewaysPaginator returns a new DescribeNatGatewaysPaginator
+func NewDescribeNatGatewaysPaginator(client DescribeNatGatewaysAPIClient, params *DescribeNatGatewaysInput, optFns ...func(*DescribeNatGatewaysPaginatorOptions)) *DescribeNatGatewaysPaginator {
+	if params == nil {
+		params = &DescribeNatGatewaysInput{}
+	}
+
+	options := DescribeNatGatewaysPaginatorOptions{}
+	if params.MaxResults != nil {
+		options.Limit = *params.MaxResults
+	}
+
+	for _, fn := range optFns {
+		fn(&options)
+	}
+
+	return &DescribeNatGatewaysPaginator{
+		options:   options,
+		client:    client,
+		params:    params,
+		firstPage: true,
+		nextToken: params.NextToken,
+	}
+}
+
+// HasMorePages returns a boolean indicating whether more pages are available
+func (p *DescribeNatGatewaysPaginator) HasMorePages() bool {
+	return p.firstPage || (p.nextToken != nil && len(*p.nextToken) != 0)
+}
+
+// NextPage retrieves the next DescribeNatGateways page.
+func (p *DescribeNatGatewaysPaginator) NextPage(ctx context.Context, optFns ...func(*Options)) (*DescribeNatGatewaysOutput, error) {
+	if !p.HasMorePages() {
+		return nil, fmt.Errorf("no more pages available")
+	}
+
+	params := *p.params
+	params.NextToken = p.nextToken
+
+	var limit *int32
+	if p.options.Limit > 0 {
+		limit = &p.options.Limit
+	}
+	params.MaxResults = limit
+
+	optFns = append([]func(*Options){
+		addIsPaginatorUserAgent,
+	}, optFns...)
+	result, err := p.client.DescribeNatGateways(ctx, &params, optFns...)
+	if err != nil {
+		return nil, err
+	}
+	p.firstPage = false
+
+	prevToken := p.nextToken
+	p.nextToken = result.NextToken
+
+	if p.options.StopOnDuplicateToken &&
+		prevToken != nil &&
+		p.nextToken != nil &&
+		*prevToken == *p.nextToken {
+		p.nextToken = nil
+	}
+
+	return result, nil
+}
+
+// DescribeNatGatewaysAPIClient is a client that implements the
+// DescribeNatGateways operation.
+type DescribeNatGatewaysAPIClient interface {
+	DescribeNatGateways(context.Context, *DescribeNatGatewaysInput, ...func(*Options)) (*DescribeNatGatewaysOutput, error)
+}
+
+var _ DescribeNatGatewaysAPIClient = (*Client)(nil)
 
 func newServiceMetadataMiddleware_opDescribeNatGateways(region string) *awsmiddleware.RegisterServiceMetadata {
 	return &awsmiddleware.RegisterServiceMetadata{

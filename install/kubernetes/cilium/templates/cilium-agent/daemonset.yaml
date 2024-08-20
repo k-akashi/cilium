@@ -9,6 +9,7 @@
 {{- end -}}
 
 {{- $kubeProxyReplacement := (coalesce .Values.kubeProxyReplacement "false") -}}
+{{- $envoyDS := eq (include "envoyDaemonSetEnabled" .) "true" -}}
 
 ---
 apiVersion: apps/v1
@@ -236,13 +237,13 @@ spec:
           containerPort: {{ .Values.prometheus.port }}
           hostPort: {{ .Values.prometheus.port }}
           protocol: TCP
-        {{- if and .Values.envoy.prometheus.enabled (not .Values.envoy.enabled) }}
+        {{- if and .Values.envoy.prometheus.enabled (not $envoyDS) }}
         - name: envoy-metrics
           containerPort: {{ .Values.envoy.prometheus.port }}
           hostPort: {{ .Values.envoy.prometheus.port }}
           protocol: TCP
         {{- end }}
-        {{- if and .Values.envoy.debug.admin.port (not .Values.envoy.enabled) }}
+        {{- if and .Values.envoy.debug.admin.port (not $envoyDS) }}
         - name: envoy-admin
           containerPort: {{ .Values.envoy.debug.admin.port }}
           hostPort: {{ .Values.envoy.debug.admin.port }}
@@ -279,7 +280,7 @@ spec:
           mountPath: {{ dir .Values.authentication.mutual.spire.adminSocketPath }}
           readOnly: false
         {{- end }}
-        {{- if .Values.envoy.enabled }}
+        {{- if $envoyDS }}
         - name: envoy-sockets
           mountPath: /var/run/cilium/envoy/sockets
           readOnly: false
@@ -314,6 +315,13 @@ spec:
         {{- end}}
         - name: cilium-run
           mountPath: /var/run/cilium
+        {{- /* mount the directory if socketLB.enabled is true and socketLB.terminatePodConnections is not explicitly set to false */ -}}
+        {{- if or (and (kindIs "invalid" .Values.socketLB.terminatePodConnections) .Values.socketLB.enabled)
+                  (and .Values.socketLB.enabled .Values.socketLB.terminatePodConnections)  }}
+        - name: cilium-netns
+          mountPath: /var/run/cilium/netns
+          mountPropagation: HostToContainer
+        {{- end}}
         - name: etc-cni-netd
           mountPath: {{ .Values.cni.hostConfDirMountPath }}
         {{- if .Values.etcd.enabled }}
@@ -789,6 +797,14 @@ spec:
         hostPath:
           path: {{ .Values.daemon.runPath }}
           type: DirectoryOrCreate
+      {{- if or (and (kindIs "invalid" .Values.socketLB.terminatePodConnections) .Values.socketLB.enabled)
+                (and .Values.socketLB.enabled .Values.socketLB.terminatePodConnections)  }}
+        # To exec into pod network namespaces
+      - name: cilium-netns
+        hostPath:
+          path: /var/run/netns
+          type: DirectoryOrCreate
+      {{- end }}
       {{- if .Values.bpf.autoMount.enabled }}
         # To keep state between restarts / upgrades for bpf maps
       - name: bpf-maps
@@ -833,7 +849,7 @@ spec:
           path: {{ dir .Values.authentication.mutual.spire.adminSocketPath }}
           type: DirectoryOrCreate
       {{- end }}
-      {{- if .Values.envoy.enabled }}
+      {{- if $envoyDS }}
       # Sharing socket with Cilium Envoy on the same node by using a host path
       - name: envoy-sockets
         hostPath:
@@ -968,7 +984,7 @@ spec:
           defaultMode: 0400
           sources:
           - secret:
-              name: hubble-server-certs
+              name: {{ .Values.hubble.tls.server.existingSecret | default "hubble-server-certs" }}
               optional: true
               items:
               - key: tls.crt
@@ -994,7 +1010,7 @@ spec:
           defaultMode: 0400
           sources:
           - secret:
-              name: hubble-metrics-server-certs
+              name: {{ .Values.hubble.tls.server.existingSecret | default "hubble-metrics-server-certs" }}
               optional: true
               items:
               - key: tls.crt

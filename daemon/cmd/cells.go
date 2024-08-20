@@ -34,21 +34,27 @@ import (
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/envoy"
 	"github.com/cilium/cilium/pkg/gops"
+	identity "github.com/cilium/cilium/pkg/identity/cache/cell"
+	"github.com/cilium/cilium/pkg/identity/identitymanager"
 	ipamcell "github.com/cilium/cilium/pkg/ipam/cell"
+	ipcache "github.com/cilium/cilium/pkg/ipcache/cell"
 	"github.com/cilium/cilium/pkg/k8s"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/k8s/watchers"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/l2announcer"
+	loadbalancer_experimental "github.com/cilium/cilium/pkg/loadbalancer/experimental"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/metricsmap"
 	natStats "github.com/cilium/cilium/pkg/maps/nat/stats"
+	"github.com/cilium/cilium/pkg/maps/ratelimitmetricsmap"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/node"
 	nodeManager "github.com/cilium/cilium/pkg/node/manager"
 	"github.com/cilium/cilium/pkg/nodediscovery"
 	"github.com/cilium/cilium/pkg/option"
+	policy "github.com/cilium/cilium/pkg/policy/cell"
 	policyDirectory "github.com/cilium/cilium/pkg/policy/directory"
 	policyK8s "github.com/cilium/cilium/pkg/policy/k8s"
 	"github.com/cilium/cilium/pkg/pprof"
@@ -78,10 +84,7 @@ var (
 
 		// Register the pprof HTTP handlers, to get runtime profiling data.
 		pprof.Cell,
-		cell.Config(pprof.Config{
-			PprofAddress: option.PprofAddressAgent,
-			PprofPort:    option.PprofPortAgent,
-		}),
+		cell.Config(pprofConfig),
 
 		// Runs the gops agent, a tool to diagnose Go processes.
 		gops.Cell(defaults.GopsPortAgent),
@@ -96,6 +99,9 @@ var (
 
 		// Provides cilium_datapath_drop/forward Prometheus metrics.
 		metricsmap.Cell,
+
+		// Provides cilium_bpf_ratelimit_dropped_total Prometheus metric.
+		ratelimitmetricsmap.Cell,
 
 		// Provide option.Config via hive so cells can depend on the agent config.
 		cell.Provide(func() *option.DaemonConfig { return option.Config }),
@@ -115,6 +121,14 @@ var (
 		// Store cell provides factory for creating watchStore/syncStore/storeManager
 		// useful for synchronizing data from/to kvstore.
 		store.Cell,
+
+		// Provide CRD resource names for 'k8sSynced.CRDSyncCell' below.
+		cell.Provide(func() k8sSynced.CRDSyncResourceNames { return k8sSynced.AgentCRDResourceNames() }),
+		// CRDSyncCell provides a promise that is resolved as soon as CRDs used by the
+		// agent have k8sSynced.
+		// Allows cells to wait for CRDs before trying to list Cilium resources.
+		// This is separate from k8sSynced.Cell as this one needs to be mocked for tests.
+		k8sSynced.CRDSyncCell,
 	)
 
 	// ControlPlane implement the per-node control functions. These are pure
@@ -148,6 +162,10 @@ var (
 		// be synced
 		k8sSynced.Cell,
 
+		// IdentityManager maintains the set of identities and a count of its
+		// users.
+		identitymanager.Cell,
+
 		// EndpointManager maintains a collection of the locally running endpoints.
 		endpointmanager.Cell,
 
@@ -169,6 +187,9 @@ var (
 
 		// daemonCell wraps the legacy daemon initialization and provides Promise[*Daemon].
 		daemonCell,
+
+		// Experimental control-plane for configuring service load-balancing.
+		loadbalancer_experimental.Cell,
 
 		// Service is a datapath service handler. Its main responsibility is to reflect
 		// service-related changes into BPF maps used by datapath BPF programs.
@@ -202,8 +223,11 @@ var (
 		// Auth is responsible for authenticating a request if required by a policy.
 		auth.Cell,
 
-		// IPCache, policy.Repository and CachingIdentityAllocator.
-		cell.Provide(newPolicyTrifecta),
+		// Provides IdentityAllocators (Responsible for allocating security identities)
+		identity.Cell,
+
+		// IPCache cell provides IPCache (IP to identity mappings)
+		ipcache.Cell,
 
 		// IPAM provides IP address management.
 		ipamcell.Cell,
@@ -214,7 +238,11 @@ var (
 		// ServiceCache holds the list of known services correlated with the matching endpoints.
 		k8s.ServiceCacheCell,
 
-		// K8s policy resource watcher cell.
+		// Provides PolicyRepository (List of policy rules)
+		policy.Cell,
+
+		// K8s policy resource watcher cell. It depends on the half-initialized daemon which is
+		// resolved by newDaemonPromise()
 		policyK8s.Cell,
 
 		// Directory policy watcher cell.
@@ -233,9 +261,6 @@ var (
 
 		// Redirect policy manages the Local Redirect Policies.
 		redirectpolicy.Cell,
-
-		// The device reloader reloads the datapath when the devices change at runtime.
-		cell.Invoke(registerDeviceReloader),
 
 		// The node discovery cell provides the local node configuration and node discovery
 		// which communicate changes in local node information to the API server or KVStore.
@@ -293,4 +318,10 @@ func configureAPIServer(cfg *option.DaemonConfig, s *server.Server, db *statedb.
 	mux.Handle("/", s.GetHandler())
 	mux.Handle("/statedb/", http.StripPrefix("/statedb", db.HTTPHandler()))
 	s.SetHandler(mux)
+}
+
+var pprofConfig = pprof.Config{
+	Pprof:        false,
+	PprofAddress: option.PprofAddressAgent,
+	PprofPort:    option.PprofPortAgent,
 }

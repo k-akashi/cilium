@@ -58,6 +58,10 @@ const (
 	// SupportGatewayHTTPListenerIsolation option indicates support for the isolation
 	// of HTTP listeners.
 	SupportGatewayHTTPListenerIsolation SupportedFeature = "GatewayHTTPListenerIsolation"
+
+	// SupportGatewayInfrastructureAnnotations option indicates support for
+	// spec.infrastructure.annotations and spec.infrastrucutre.labels
+	SupportGatewayInfrastructurePropagation SupportedFeature = "GatewayInfrastructurePropagation"
 )
 
 // GatewayExtendedFeatures are extra generic features that implementations may
@@ -66,6 +70,7 @@ var GatewayExtendedFeatures = sets.New(
 	SupportGatewayPort8080,
 	SupportGatewayStaticAddresses,
 	SupportGatewayHTTPListenerIsolation,
+	SupportGatewayInfrastructurePropagation,
 )
 
 // -----------------------------------------------------------------------------
@@ -144,6 +149,12 @@ const (
 
 	// This option indicates support for HTTPRoute parentRef port (extended conformance).
 	SupportHTTPRouteParentRefPort SupportedFeature = "HTTPRouteParentRefPort"
+
+	// This option indicates support for HTTPRoute with a backendref with an appProtocol 'kubernetes.io/h2c' (extended conformance)
+	SupportHTTPRouteBackendProtocolH2C SupportedFeature = "HTTPRouteBackendProtocolH2C"
+
+	// This option indicates support for HTTPRoute with a backendref with an appProtoocol 'kubernetes.io/ws' (extended conformance)
+	SupportHTTPRouteBackendProtocolWebSocket SupportedFeature = "HTTPRouteBackendProtocolWebSocket"
 )
 
 // HTTPRouteExtendedFeatures includes all extended features for HTTPRoute
@@ -164,6 +175,8 @@ var HTTPRouteExtendedFeatures = sets.New(
 	SupportHTTPRouteBackendTimeout,
 	SupportHTTPRouteParentRefPort,
 	SupportHTTPRouteBackendRequestHeaderModification,
+	SupportHTTPRouteBackendProtocolH2C,
+	SupportHTTPRouteBackendProtocolWebSocket,
 )
 
 // -----------------------------------------------------------------------------
@@ -173,12 +186,6 @@ var HTTPRouteExtendedFeatures = sets.New(
 const (
 	// This option indicates support for Destination Port matching.
 	SupportHTTPRouteDestinationPortMatching SupportedFeature = "HTTPRouteDestinationPortMatching"
-
-	// This option indicates support for HTTPRoute with a backendref with an appProtocol 'kubernetes.io/h2c'
-	SupportHTTPRouteBackendProtocolH2C SupportedFeature = "HTTPRouteBackendProtocolH2C"
-
-	// This option indicates support for HTTPRoute with a backendref with an appProtoocol 'kubernetes.io/ws'
-	SupportHTTPRouteBackendProtocolWebSocket SupportedFeature = "HTTPRouteBackendProtocolWebSocket"
 )
 
 // HTTPRouteExperimentalFeatures includes all the supported experimental features, currently only
@@ -186,8 +193,6 @@ const (
 // Implementations have the flexibility to opt-in for either specific features or the entire set.
 var HTTPRouteExperimentalFeatures = sets.New(
 	SupportHTTPRouteDestinationPortMatching,
-	SupportHTTPRouteBackendProtocolH2C,
-	SupportHTTPRouteBackendProtocolWebSocket,
 )
 
 // -----------------------------------------------------------------------------

@@ -25,6 +25,7 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/source"
@@ -196,6 +197,9 @@ func (n *NameManager) RegisterFQDNSelector(selector api.FQDNSelector) {
 		}
 
 		n.allSelectors[selector] = regex
+		if metrics.FQDNSelectors.IsEnabled() {
+			metrics.FQDNSelectors.Set(float64(len(n.allSelectors)))
+		}
 	}
 
 	// The newly added FQDN selector could match DNS Names in the cache. If
@@ -215,6 +219,9 @@ func (n *NameManager) UnregisterFQDNSelector(selector api.FQDNSelector) {
 
 	// Remove selector
 	delete(n.allSelectors, selector)
+	if metrics.FQDNSelectors.IsEnabled() {
+		metrics.FQDNSelectors.Set(float64(len(n.allSelectors)))
+	}
 
 	// Re-compute labels for affected names and IPs
 	selectedNamesAndIPs := n.mapSelectorsToNamesLocked(selector)
@@ -312,8 +319,7 @@ func (n *NameManager) updateDNSIPs(lookupTime time.Time, updatedDNSIPs map[strin
 	updatedMetadata := make(map[string]nameMetadata, len(updatedDNSIPs))
 
 	for dnsName, lookupIPs := range updatedDNSIPs {
-		addrs := ip.MustAddrsFromIPs(lookupIPs.IPs)
-		updated := n.updateIPsForName(lookupTime, dnsName, addrs, lookupIPs.TTL)
+		updated := n.updateIPsForName(lookupTime, dnsName, lookupIPs.IPs, lookupIPs.TTL)
 
 		// The IPs didn't change. No more to be done for this dnsName
 		if !updated && n.bootstrapCompleted {
@@ -325,7 +331,7 @@ func (n *NameManager) updateDNSIPs(lookupTime time.Time, updatedDNSIPs map[strin
 		}
 
 		// record the IPs that were different
-		updatedNames[dnsName] = addrs
+		updatedNames[dnsName] = lookupIPs.IPs
 
 		// accumulate the new labels affected by new IPs
 		if len(n.allSelectors) == 0 {
@@ -346,7 +352,7 @@ func (n *NameManager) updateDNSIPs(lookupTime time.Time, updatedDNSIPs map[strin
 		}
 
 		updatedMetadata[dnsName] = nameMetadata{
-			addrs:  addrs,
+			addrs:  lookupIPs.IPs,
 			labels: nameLabels,
 		}
 	}

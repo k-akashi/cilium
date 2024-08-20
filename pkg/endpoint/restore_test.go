@@ -15,10 +15,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	fake "github.com/cilium/cilium/pkg/datapath/fake/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/mac"
+	"github.com/cilium/cilium/pkg/option"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
 	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 )
@@ -77,17 +77,13 @@ func (s *EndpointSuite) endpointCreator(id uint16, secID identity.NumericIdentit
 
 func TestReadEPsFromDirNames(t *testing.T) {
 	s := setupEndpointSuite(t)
-	oldDatapath := s.datapath
-	defer func() {
-		s.datapath = oldDatapath
-	}()
-
-	s.datapath = fake.NewDatapath()
 	epsWanted, _ := s.createEndpoints()
 	tmpDir, err := os.MkdirTemp("", "cilium-tests")
 	defer func() {
 		os.RemoveAll(tmpDir)
 	}()
+
+	const unsupportedTestOption = "unsupported-test-only-option-xyz"
 
 	os.Chdir(tmpDir)
 	require.Nil(t, err)
@@ -99,8 +95,14 @@ func TestReadEPsFromDirNames(t *testing.T) {
 		err := os.MkdirAll(fullDirName, 0777)
 		require.Nil(t, err)
 
+		// Add an unsupported option and see that it is removed on "restart"
+		ep.Options.SetValidated(unsupportedTestOption, option.OptionEnabled)
+
 		err = ep.writeHeaderfile(fullDirName)
 		require.Nil(t, err)
+
+		// Remove unsupported option so that equality check works after restore
+		ep.Options.Delete(unsupportedTestOption)
 
 		switch ep.ID {
 		case 256, 257:
@@ -146,13 +148,6 @@ func TestReadEPsFromDirNames(t *testing.T) {
 
 func TestReadEPsFromDirNamesWithRestoreFailure(t *testing.T) {
 	s := setupEndpointSuite(t)
-
-	oldDatapath := s.datapath
-	defer func() {
-		s.datapath = oldDatapath
-	}()
-
-	s.datapath = fake.NewDatapath()
 
 	eps, _ := s.createEndpoints()
 	ep := eps[0]
@@ -216,12 +211,6 @@ func BenchmarkReadEPsFromDirNames(b *testing.B) {
 
 	// For this benchmark, the real linux datapath is necessary to properly
 	// serialize config files to disk and benchmark the restore.
-	oldDatapath := s.datapath
-	defer func() {
-		s.datapath = oldDatapath
-	}()
-
-	s.datapath = fake.NewDatapath()
 
 	epsWanted, _ := s.createEndpoints()
 	tmpDir, err := os.MkdirTemp("", "cilium-tests")

@@ -13,7 +13,6 @@ import (
 	smithytime "github.com/aws/smithy-go/time"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	smithywaiter "github.com/aws/smithy-go/waiter"
-	"github.com/jmespath/go-jmespath"
 	"strconv"
 	"time"
 )
@@ -149,6 +148,9 @@ func (c *Client) addOperationDescribeKeyPairsMiddlewares(stack *middleware.Stack
 	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
+	if err = addUserAgentRetryMode(stack, options); err != nil {
+		return err
+	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeKeyPairs(options.Region), middleware.Before); err != nil {
 		return err
 	}
@@ -169,14 +171,6 @@ func (c *Client) addOperationDescribeKeyPairsMiddlewares(stack *middleware.Stack
 	}
 	return nil
 }
-
-// DescribeKeyPairsAPIClient is a client that implements the DescribeKeyPairs
-// operation.
-type DescribeKeyPairsAPIClient interface {
-	DescribeKeyPairs(context.Context, *DescribeKeyPairsInput, ...func(*Options)) (*DescribeKeyPairsOutput, error)
-}
-
-var _ DescribeKeyPairsAPIClient = (*Client)(nil)
 
 // KeyPairExistsWaiterOptions are waiter options for KeyPairExistsWaiter
 type KeyPairExistsWaiterOptions struct {
@@ -293,7 +287,13 @@ func (w *KeyPairExistsWaiter) WaitForOutput(ctx context.Context, params *Describ
 		}
 
 		out, err := w.client.DescribeKeyPairs(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
 			for _, opt := range options.ClientOptions {
 				opt(o)
 			}
@@ -332,22 +332,23 @@ func (w *KeyPairExistsWaiter) WaitForOutput(ctx context.Context, params *Describ
 func keyPairExistsStateRetryable(ctx context.Context, input *DescribeKeyPairsInput, output *DescribeKeyPairsOutput, err error) (bool, error) {
 
 	if err == nil {
-		pathValue, err := jmespath.Search("length(KeyPairs[].KeyName) > `0`", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.KeyPairs
+		var v2 []string
+		for _, v := range v1 {
+			v3 := v.KeyName
+			if v3 != nil {
+				v2 = append(v2, *v3)
+			}
 		}
-
+		v4 := len(v2)
+		v5 := 0
+		v6 := int64(v4) > int64(v5)
 		expectedValue := "true"
 		bv, err := strconv.ParseBool(expectedValue)
 		if err != nil {
 			return false, fmt.Errorf("error parsing boolean from string %w", err)
 		}
-		value, ok := pathValue.(bool)
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected bool value got %T", pathValue)
-		}
-
-		if value == bv {
+		if v6 == bv {
 			return false, nil
 		}
 	}
@@ -366,6 +367,14 @@ func keyPairExistsStateRetryable(ctx context.Context, input *DescribeKeyPairsInp
 
 	return true, nil
 }
+
+// DescribeKeyPairsAPIClient is a client that implements the DescribeKeyPairs
+// operation.
+type DescribeKeyPairsAPIClient interface {
+	DescribeKeyPairs(context.Context, *DescribeKeyPairsInput, ...func(*Options)) (*DescribeKeyPairsOutput, error)
+}
+
+var _ DescribeKeyPairsAPIClient = (*Client)(nil)
 
 func newServiceMetadataMiddleware_opDescribeKeyPairs(region string) *awsmiddleware.RegisterServiceMetadata {
 	return &awsmiddleware.RegisterServiceMetadata{

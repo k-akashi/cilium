@@ -41,11 +41,11 @@ Listed below are the actively maintained release branches along with their lates
 patch release, corresponding image pull tags and their release notes:
 
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.15 <https://github.com/cilium/cilium/tree/v1.15>`__ | 2024-06-10 | ``quay.io/cilium/cilium:v1.15.6``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.15.6>`__  |
+| `v1.16 <https://github.com/cilium/cilium/tree/v1.16>`__ | 2024-08-13 | ``quay.io/cilium/cilium:v1.16.1``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.16.1>`__  |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.14 <https://github.com/cilium/cilium/tree/v1.14>`__ | 2024-06-10 | ``quay.io/cilium/cilium:v1.14.12`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.14.12>`__ |
+| `v1.15 <https://github.com/cilium/cilium/tree/v1.15>`__ | 2024-08-12 | ``quay.io/cilium/cilium:v1.15.8``  | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.15.8>`__  |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
-| `v1.13 <https://github.com/cilium/cilium/tree/v1.13>`__ | 2024-06-10 | ``quay.io/cilium/cilium:v1.13.17`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.13.17>`__ |
+| `v1.14 <https://github.com/cilium/cilium/tree/v1.14>`__ | 2024-08-12 | ``quay.io/cilium/cilium:v1.14.14`` | `Release Notes <https://github.com/cilium/cilium/releases/tag/v1.14.14>`__ |
 +---------------------------------------------------------+------------+------------------------------------+----------------------------------------------------------------------------+
 
 Architectures
@@ -80,7 +80,7 @@ corresponding image pull tags and their release notes where applicable:
 +--------------------------------------------------------------------------------------+------------+----------------------------------------------+-------------------------------------------------------------------------------------------+
 | `main <https://github.com/cilium/cilium/commits/main>`__                             | daily      | ``quay.io/cilium/cilium-ci:latest``          | N/A                                                                                       |
 +--------------------------------------------------------------------------------------+------------+----------------------------------------------+-------------------------------------------------------------------------------------------+
-| `v1.16.0-rc.0 <https://github.com/cilium/cilium/commits/v1.16.0-rc.0>`__             | 2024-06-17 | ``quay.io/cilium/cilium:v1.16.0-rc.0``       | `Release Candidate Notes <https://github.com/cilium/cilium/releases/tag/v1.16.0-rc.0>`__  |
+| `v1.16.0-rc.2 <https://github.com/cilium/cilium/commits/v1.16.0-rc.2>`__             | 2024-07-15 | ``quay.io/cilium/cilium:v1.16.0-rc.2``       | `Release Candidate Notes <https://github.com/cilium/cilium/releases/tag/v1.16.0-rc.2>`__  |
 +--------------------------------------------------------------------------------------+------------+----------------------------------------------+-------------------------------------------------------------------------------------------+
 
 Functionality Overview
@@ -277,7 +277,7 @@ Community
 Slack
 -----
 
-Join the Cilium `Slack channel <https://cilium.herokuapp.com/>`_ to chat with
+Join the Cilium `Slack channel <https://slack.cilium.io>`_ to chat with
 Cilium developers and other Cilium users. This is a good place to learn about
 Cilium, ask questions, and share your experiences.
 
@@ -367,7 +367,7 @@ and the `2-Clause BSD License <bsd-license_>`__
 
 .. |slack| image:: https://img.shields.io/badge/slack-cilium-brightgreen.svg?logo=slack
     :alt: Join the Cilium slack channel
-    :target: https://cilium.herokuapp.com/
+    :target: https://slack.cilium.io
 
 .. |cii| image:: https://bestpractices.coreinfrastructure.org/projects/1269/badge
     :alt: CII Best Practices

@@ -65,7 +65,7 @@ func (e *ErrLocalRedirectServiceExists) Is(target error) bool {
 	return e.frontend.DeepEqual(&t.frontend) && e.name == t.name
 }
 
-// healthServer is used to manage HealtCheckNodePort listeners
+// healthServer is used to manage HealthCheckNodePort listeners
 type healthServer interface {
 	UpsertService(svcID lb.ID, svcNS, svcName string, localEndpoints int, port uint16)
 	DeleteService(svcID lb.ID)
@@ -95,6 +95,8 @@ type svcInfo struct {
 	// The hashes of the backends restored from the datapath and
 	// not yet heard about from the service cache.
 	restoredBackendHashes sets.Set[string]
+
+	annotations map[string]string
 }
 
 func (svc *svcInfo) isL7LBService() bool {
@@ -114,10 +116,15 @@ func (svc *svcInfo) deepCopyToLBSVC() *lb.SVC {
 		IntTrafficPolicy:    svc.svcIntTrafficPolicy,
 		NatPolicy:           svc.svcNatPolicy,
 		HealthCheckNodePort: svc.svcHealthCheckNodePort,
+		Annotations:         svc.annotations,
 		Name:                svc.svcName,
 		L7LBProxyPort:       svc.l7LBProxyPort,
 		LoopbackHostport:    svc.LoopbackHostport,
 	}
+}
+
+func (svc *svcInfo) GetID() lb.ID {
+	return svc.frontend.ID
 }
 
 func (svc *svcInfo) isExtLocal() bool {
@@ -213,7 +220,10 @@ type L7LBInfo struct {
 // 'ports' is typically short for no point optimizing the search.
 func (i *L7LBInfo) isProtoAndPortMatch(fe *lb.L4Addr) bool {
 	// L7 LB redirect is only supported for TCP frontends
-	if fe.Protocol != lb.TCP {
+	// The below is to make sure that UDP and SCTP are not allowed instead of comparing with lb.TCP
+	// The reason is to avoid extra dependencies with ongoing work to differentiate protocols in datapath,
+	// which might add more values such as lb.Any, lb.None, etc.
+	if fe.Protocol == lb.UDP || fe.Protocol == lb.SCTP {
 		return false
 	}
 
@@ -261,6 +271,9 @@ type Service struct {
 	healthServer healthServer
 	monitorAgent monitorAgent.Agent
 
+	healthCheckers         []HealthChecker
+	healthCheckSubscribers []HealthSubscriber
+
 	lbmap         datapathTypes.LBMap
 	lastUpdatedTs atomic.Value
 
@@ -268,11 +281,12 @@ type Service struct {
 
 	backendConnectionHandler sockets.SocketDestroyer
 
-	backendDiscovery datapathTypes.NodeNeighbors
+	backendDiscovery       datapathTypes.NodeNeighbors
+	k8sControlplaneEnabled bool
 }
 
 // newService creates a new instance of the service handler.
-func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, backendDiscoveryHandler datapathTypes.NodeNeighbors) *Service {
+func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, backendDiscoveryHandler datapathTypes.NodeNeighbors, healthCheckers []HealthChecker, k8sControlplaneEnabled bool) *Service {
 	var localHealthServer healthServer
 	if option.Config.EnableHealthCheckNodePort {
 		localHealthServer = healthserver.New()
@@ -289,8 +303,14 @@ func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, back
 		l7lbSvcs:                 map[lb.ServiceName]*L7LBInfo{},
 		backendConnectionHandler: backendConnectionHandler{},
 		backendDiscovery:         backendDiscoveryHandler,
+		healthCheckers:           healthCheckers,
+		k8sControlplaneEnabled:   k8sControlplaneEnabled,
 	}
 	svc.lastUpdatedTs.Store(time.Now())
+
+	for _, hc := range healthCheckers {
+		hc.SetCallback(svc.HealthCheckCallback)
+	}
 
 	return svc
 }
@@ -798,10 +818,6 @@ func (s *Service) upsertService(params *lb.SVC) (bool, lb.ID, error) {
 		backendsCopy = append(backendsCopy, b.DeepCopy())
 	}
 
-	// TODO (Aditi) When we filter backends for LocalRedirect service, there
-	// might be some backend pods with active connections. We may need to
-	// defer filtering the backends list (thereby defer redirecting traffic)
-	// in such cases. GH #12859
 	// Update backends cache and allocate/release backend IDs
 	newBackends, obsoleteBackends, obsoleteSVCBackendIDs, err := s.updateBackendsCacheLocked(svc, backendsCopy)
 	if err != nil {
@@ -836,13 +852,23 @@ func (s *Service) upsertService(params *lb.SVC) (bool, lb.ID, error) {
 			// HealthCheckNodePort is used by external systems to poll the state of the Service,
 			// it should never take into consideration Terminating backends, even when there are only
 			// Terminating backends.
+			//
+			// There is one special case is L7 proxy service, which never have any
+			// backends because the traffic will be redirected.
 			activeBackends := 0
-			for _, b := range backendsCopy {
-				if b.State == lb.BackendStateActive {
-					activeBackends++
+			if l7lbInfo != nil {
+				// Set this to 1 because Envoy will be running in this case.
+				getScopedLog().WithField(logfields.ServiceHealthCheckNodePort, svc.svcHealthCheckNodePort).
+					Debug("L7 service with HealthcheckNodePort enabled")
+				activeBackends = 1
+			} else {
+				for _, b := range backendsCopy {
+					if b.State == lb.BackendStateActive {
+						activeBackends++
+					}
 				}
 			}
-			s.healthServer.UpsertService(lb.ID(svc.frontend.ID), svc.svcName.Namespace, svc.svcName.Name,
+			s.healthServer.UpsertService(svc.frontend.ID, svc.svcName.Namespace, svc.svcName.Name,
 				activeBackends, svc.svcHealthCheckNodePort)
 
 			if err = s.upsertNodePortHealthService(svc, &nodeMetaCollector{}); err != nil {
@@ -863,6 +889,10 @@ func (s *Service) upsertService(params *lb.SVC) (bool, lb.ID, error) {
 				svc.healthcheckFrontendHash = ""
 			}
 		}
+	}
+
+	for _, hc := range s.healthCheckers {
+		hc.UpsertService(svc.frontend.L3n4Addr, svc.svcName, svc.svcType, svc.annotations, backendsCopy)
 	}
 
 	if new {
@@ -975,16 +1005,14 @@ func (s *Service) upsertNodePortHealthService(svc *svcInfo, nodeMeta NodeMetaCol
 	return nil
 }
 
-// UpdateBackendsState updates all the service(s) with the updated state of
-// the given backends. It also persists the updated backend states to the BPF maps.
-//
-// Backend state transitions are validated before processing.
-//
-// In case of duplicated backends in the list, the state will be updated to the
-// last duplicate entry.
-func (s *Service) UpdateBackendsState(backends []*lb.Backend) error {
+// UpdateBackendsStateMultiple updates all the service(s) with the updated
+// state of the given backends, and returns a list of updated service(s).
+// It also persists the updated backend states to the BPF maps. Backend state
+// transitions are validated before processing. In case of duplicated
+// backends in the list, the state will be updated to the last duplicate entry.
+func (s *Service) UpdateBackendsStateMultiple(svcMapping map[lb.ID]*svcInfo, backends []*lb.Backend, updateBackendMap bool) ([]lb.L3n4Addr, error) {
 	if len(backends) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	if logging.CanLogAt(log.Logger, logrus.DebugLevel) {
@@ -1002,6 +1030,7 @@ func (s *Service) UpdateBackendsState(backends []*lb.Backend) error {
 		updatedBackends []*lb.Backend
 	)
 	updateSvcs := make(map[lb.ID]*datapathTypes.UpsertServiceParams)
+	svcAddrs := make([]lb.L3n4Addr, 0)
 
 	s.Lock()
 	defer s.Unlock()
@@ -1026,7 +1055,7 @@ func (s *Service) UpdateBackendsState(backends []*lb.Backend) error {
 		be.State = updatedB.State
 		be.Preferred = updatedB.Preferred
 
-		for id, info := range s.svcByID {
+		for id, info := range svcMapping {
 			var p *datapathTypes.UpsertServiceParams
 			for i, b := range info.backends {
 				if b.L3n4Addr.String() != updatedB.L3n4Addr.String() {
@@ -1060,6 +1089,7 @@ func (s *Service) UpdateBackendsState(backends []*lb.Backend) error {
 				}
 				p.PreferredBackends, p.ActiveBackends, p.NonActiveBackends = segregateBackends(info.backends)
 				updateSvcs[id] = p
+				svcAddrs = append(svcAddrs, info.frontend.L3n4Addr)
 				log.WithFields(logrus.Fields{
 					logfields.ServiceID:        p.ID,
 					logfields.BackendID:        b.ID,
@@ -1073,24 +1103,42 @@ func (s *Service) UpdateBackendsState(backends []*lb.Backend) error {
 		}
 		updatedBackends = append(updatedBackends, be)
 	}
-
-	// Update the persisted backend state in BPF maps.
-	for _, b := range updatedBackends {
-		log.WithFields(logrus.Fields{
-			logfields.BackendID:        b.ID,
-			logfields.L3n4Addr:         b.L3n4Addr.String(),
-			logfields.BackendState:     b.State,
-			logfields.BackendPreferred: b.Preferred,
-		}).Info("Persisting updated backend state for backend")
-		if err := s.lbmap.UpdateBackendWithState(b); err != nil {
-			errs = errors.Join(errs, fmt.Errorf("failed to update backend %+v: %w", b, err))
+	if updateBackendMap {
+		// Update the persisted backend state in BPF maps.
+		for _, b := range updatedBackends {
+			log.WithFields(logrus.Fields{
+				logfields.BackendID:        b.ID,
+				logfields.L3n4Addr:         b.L3n4Addr.String(),
+				logfields.BackendState:     b.State,
+				logfields.BackendPreferred: b.Preferred,
+			}).Info("Persisting updated backend state for backend")
+			if err := s.lbmap.UpdateBackendWithState(b); err != nil {
+				errs = errors.Join(errs, fmt.Errorf("failed to update backend %+v: %w", b, err))
+			}
 		}
 	}
-
 	for i := range updateSvcs {
 		errs = errors.Join(errs, s.lbmap.UpsertService(updateSvcs[i]))
 	}
-	return errs
+	return svcAddrs, errs
+}
+
+func (s *Service) UpdateBackendsState(backends []*lb.Backend) ([]lb.L3n4Addr, error) {
+	return s.UpdateBackendsStateMultiple(s.svcByID, backends, true)
+}
+
+func (s *Service) UpdateBackendStateServiceOnly(svc lb.L3n4Addr, backend *lb.Backend) ([]lb.L3n4Addr, error) {
+	svcMap := make(map[lb.ID]*svcInfo)
+	s.Lock()
+	info, found := s.svcByHash[svc.Hash()]
+	if !found {
+		// Service not found in case it was deleted.
+		s.Unlock()
+		return nil, nil
+	}
+	svcMap[info.GetID()] = info
+	s.Unlock()
+	return s.UpdateBackendsStateMultiple(svcMap, []*lb.Backend{backend}, false)
 }
 
 // DeleteServiceByID removes a service identified by the given ID.
@@ -1141,6 +1189,19 @@ func (s *Service) GetDeepCopyServices() []*lb.SVC {
 	svcs := make([]*lb.SVC, 0, len(s.svcByHash))
 	for _, svc := range s.svcByHash {
 		svcs = append(svcs, svc.deepCopyToLBSVC())
+	}
+
+	return svcs
+}
+
+// GetServiceIDs returns a list of IDs of all installed services.
+func (s *Service) GetServiceIDs() []lb.ServiceID {
+	s.RLock()
+	defer s.RUnlock()
+
+	svcs := make([]lb.ServiceID, 0, len(s.svcByID))
+	for _, svc := range s.svcByID {
+		svcs = append(svcs, lb.ServiceID(svc.frontend.ID))
 	}
 
 	return svcs
@@ -1371,6 +1432,8 @@ func (s *Service) createSVCInfoIfNotExist(p *lb.SVC) (*svcInfo, bool, bool,
 			loadBalancerSourceRanges: p.LoadBalancerSourceRanges,
 			l7LBProxyPort:            p.L7LBProxyPort,
 			LoopbackHostport:         p.LoopbackHostport,
+
+			annotations: p.Annotations,
 		}
 		s.svcByID[p.Frontend.ID] = svc
 		s.svcByHash[hash] = svc
@@ -1400,6 +1463,8 @@ func (s *Service) createSVCInfoIfNotExist(p *lb.SVC) (*svcInfo, bool, bool,
 		svc.sessionAffinity = p.SessionAffinity
 		svc.sessionAffinityTimeoutSec = p.SessionAffinityTimeoutSec
 		svc.loadBalancerSourceRanges = p.LoadBalancerSourceRanges
+		svc.annotations = p.Annotations
+
 		// Name, namespace and cluster are optional and intended for exposure via
 		// API. They they are not part of any BPF maps and cannot be restored
 		// from datapath.
@@ -1772,7 +1837,8 @@ func (s *Service) restoreServicesLocked(svcBackendsById map[lb.BackendID]struct{
 			svcBackendsById[backend.ID] = struct{}{}
 		}
 
-		if len(newSVC.backendByHash) > 0 {
+		// There is no way to synchronize backends in standalone L4LB case with external control plane, so don't block their removal
+		if len(newSVC.backendByHash) > 0 && s.k8sControlplaneEnabled {
 			// Indicate that these backends were restored from BPF maps,
 			// so that they are not removed until SyncWithK8sFinished()
 			// is executed (if not observed in the meanwhile) to prevent
@@ -1874,6 +1940,10 @@ func (s *Service) deleteServiceLocked(svc *svcInfo) error {
 
 	if option.Config.EnableHealthCheckNodePort {
 		s.healthServer.DeleteService(lb.ID(svc.frontend.ID))
+	}
+
+	for _, hc := range s.healthCheckers {
+		hc.DeleteService(svc.frontend.L3n4Addr, svc.svcName)
 	}
 
 	metrics.ServicesEventsCount.WithLabelValues("delete").Inc()

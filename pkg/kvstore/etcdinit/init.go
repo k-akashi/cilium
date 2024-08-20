@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -42,18 +43,11 @@ func ClusterMeshEtcdInit(ctx context.Context, log *logrus.Entry, client *clientv
 	// with additional context. So this function only performs the relevant operations, and is more or less a 1:1
 	// translation of the shell script that this function replaced.
 
-	// Pre setup
-	log.Info("Performing pre-init tasks")
-	err := ic.putHasConfigKey(ctx)
-	if err != nil {
-		return err
-	}
-
 	// Root user
 	rootUsername := username("root")
 	log.WithField("etcdUsername", rootUsername).
 		Info("Configuring root user")
-	err = ic.addNoPasswordUser(ctx, rootUsername)
+	err := ic.addNoPasswordUser(ctx, rootUsername)
 	if err != nil {
 		return err
 	}
@@ -189,28 +183,6 @@ type rolename string
 // rootRolename refers to a special "root" role that exists by default in etcd.
 const rootRolename = rolename("root")
 
-// put sets a key to a value. It's a wrapper around the etcd client's put method.
-func (ic initClient) put(ctx context.Context, key, val string) error {
-	ic.log.WithField("etcdKey", key).
-		WithField("etcdValue", val).
-		Debug("Setting key in etcd")
-	_, err := ic.client.Put(ctx, key, val)
-	if err != nil {
-		return fmt.Errorf("setting path '%s' to '%s': %w", key, val, err)
-	}
-	return nil
-}
-
-// putHasConfigKey sets the specialised etcd "has config" key to be true.
-func (ic initClient) putHasConfigKey(ctx context.Context) error {
-	ic.log.Debug("Setting the key to indicate that config has already been set")
-	err := ic.put(ctx, kvstore.HasClusterConfigPath, "true")
-	if err != nil {
-		return fmt.Errorf("setting key to indicate config is already set: %w", err)
-	}
-	return nil
-}
-
 // addNoPasswordUser adds a new user to etcd with no password. This is expected as later on we'll enable auth which will
 // require other forms of authentication. This is a wrapper around the client's UserAddWithOptions method.
 func (ic initClient) addNoPasswordUser(ctx context.Context, username username) error {
@@ -253,6 +225,14 @@ type keyRange struct {
 	end   string
 }
 
+// krOpt represents a keyRange option.
+type krOpt int
+
+const (
+	// withoutTrailingSlash disables adding a trailing slash to a prefix.
+	withoutTrailingSlash krOpt = iota
+)
+
 // rangeForKey generates a keyRange for a single key.
 func rangeForKey(key string) keyRange {
 	return keyRange{key, ""}
@@ -260,11 +240,11 @@ func rangeForKey(key string) keyRange {
 
 // rangeForPrefix generates a keyRange for a given prefix. This is a wrapper around the client's GetPrefixRangeEnd
 // function.
-func rangeForPrefix(prefix string) keyRange {
+func rangeForPrefix(prefix string, opts ...krOpt) keyRange {
 	// For a **prefix** range, we need a trailing slash. Without it, the behaviour of clientv3.GetPrefixRangeEnd is
 	// slightly different. For example on `cilium/.initlock` the given range end is `cilium/.initlocl`, while on
 	// `cilium/.initlock/` it's `cilium/.initlock0`.
-	if !strings.HasSuffix(prefix, "/") {
+	if !strings.HasSuffix(prefix, "/") && !slices.Contains(opts, withoutTrailingSlash) {
 		prefix += "/"
 	}
 	return keyRange{prefix, clientv3.GetPrefixRangeEnd(prefix)}
@@ -317,8 +297,7 @@ func (ic initClient) enableAuth(ctx context.Context) error {
 // rangesForLocalRole returns the set of etcd key ranges allowed to be accessed by the local user.
 func rangesForLocalRole() []keyRange {
 	return []keyRange{
-		rangeForKey(kvstore.HeartbeatPath),
-		rangeForKey(kvstore.HasClusterConfigPath),
+		rangeForPrefix(kvstore.HeartbeatPath, withoutTrailingSlash),
 		rangeForPrefix(kvstore.CachePrefix),
 		rangeForPrefix(kvstore.ClusterConfigPrefix),
 		rangeForPrefix(kvstore.SyncedPrefix),
@@ -328,15 +307,9 @@ func rangesForLocalRole() []keyRange {
 // rangesForLocalUser returns the set of etcd key ranges allowed to be accessed by the remote user.
 func rangesForRemoteRole(clusterName string) []keyRange {
 	return []keyRange{
-		rangeForKey(kvstore.HeartbeatPath),
-		rangeForKey(kvstore.HasClusterConfigPath),
+		rangeForPrefix(kvstore.HeartbeatPath, withoutTrailingSlash),
 		rangeForPrefix(kvstore.StatePrefix),
 		rangeForKey(path.Join(kvstore.ClusterConfigPrefix, clusterName)),
 		rangeForPrefix(path.Join(kvstore.SyncedPrefix, clusterName)),
-
-		// kvstoremesh-specific prefixes still allowed for backward compatibility
-		rangeForPrefix(kvstore.CachePrefix),
-		rangeForPrefix(kvstore.ClusterConfigPrefix),
-		rangeForPrefix(kvstore.SyncedPrefix),
 	}
 }

@@ -65,6 +65,7 @@ docker exec -t lb-node \
     cilium-agent \
     --enable-ipv4=true \
     --enable-ipv6=false \
+    --enable-k8s=false \
     --datapath-mode=lb-only \
     --bpf-lb-algorithm=maglev \
     --bpf-lb-dsr-dispatch=ipip \

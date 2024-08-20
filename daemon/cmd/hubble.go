@@ -133,6 +133,7 @@ func (d *Daemon) launchHubble() {
 			option.Config.HubbleDropEventsInterval,
 			option.Config.HubbleDropEventsReasons,
 			d.clientset,
+			d.k8sWatcher,
 		)
 
 		observerOpts = append(observerOpts,
@@ -148,7 +149,11 @@ func (d *Daemon) launchHubble() {
 
 	// fill in the local node information after the dropEventEmitter logique,
 	// but before anything else (e.g. metrics).
-	localNodeWatcher := observer.NewLocalNodeWatcher(d.ctx, d.nodeLocalStore)
+	localNodeWatcher, err := observer.NewLocalNodeWatcher(d.ctx, d.nodeLocalStore)
+	if err != nil {
+		logger.WithError(err).Error("Failed to retrieve local node information")
+		return
+	}
 	observerOpts = append(observerOpts, observeroption.WithOnDecodedFlow(localNodeWatcher))
 
 	grpcMetrics := grpc_prometheus.NewServerMetrics()

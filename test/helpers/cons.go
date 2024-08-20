@@ -176,9 +176,9 @@ const (
 
 	// CiliumStableHelmChartVersion should be the chart version that points
 	// to the v1.X branch
-	CiliumStableHelmChartVersion = "1.15"
+	CiliumStableHelmChartVersion = "1.16"
 	CiliumStableVersion          = "v" + CiliumStableHelmChartVersion
-	CiliumLatestHelmChartVersion = "1.16.0-dev"
+	CiliumLatestHelmChartVersion = "1.17.0-dev"
 
 	MonitorLogFileName = "monitor.log"
 
@@ -241,7 +241,7 @@ const (
 	failedToListCRDs           = "the server could not find the requested resource"                   // cf. https://github.com/cilium/cilium/issues/16425
 	retrieveResLock            = "retrieving resource lock kube-system/cilium-operator-resource-lock" // cf. https://github.com/cilium/cilium/issues/16402#issuecomment-871155492
 	failedToRelLockEmptyName   = "Failed to release lock: resource name may not be empty"             // cf. https://github.com/cilium/cilium/issues/16402#issuecomment-985819560
-	failedToUpdateLock         = "Failed to update lock:"
+	failedToUpdateLock         = "Failed to update lock"
 	failedToReleaseLock        = "Failed to release lock:"
 	errorCreatingInitialLeader = "error initially creating leader election record:"
 	cantEnableJIT              = "bpf_jit_enable: no such file or directory"                             // Because we run tests in Kind.
@@ -304,6 +304,7 @@ var (
 	IsCiliumV1_14 = versioncheck.MustCompile(">=1.13.90 <1.15.0")
 	IsCiliumV1_15 = versioncheck.MustCompile(">=1.14.90 <1.16.0")
 	IsCiliumV1_16 = versioncheck.MustCompile(">=1.15.90 <1.17.0")
+	IsCiliumV1_17 = versioncheck.MustCompile(">=1.16.90 <1.18.0")
 )
 
 // badLogMessages is a map which key is a part of a log message which indicates

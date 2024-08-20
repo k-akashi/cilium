@@ -13,7 +13,6 @@ import (
 	smithytime "github.com/aws/smithy-go/time"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	smithywaiter "github.com/aws/smithy-go/waiter"
-	"github.com/jmespath/go-jmespath"
 	"time"
 )
 
@@ -248,6 +247,9 @@ func (c *Client) addOperationDescribeNetworkInterfacesMiddlewares(stack *middlew
 	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
+	if err = addUserAgentRetryMode(stack, options); err != nil {
+		return err
+	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeNetworkInterfaces(options.Region), middleware.Before); err != nil {
 		return err
 	}
@@ -267,103 +269,6 @@ func (c *Client) addOperationDescribeNetworkInterfacesMiddlewares(stack *middlew
 		return err
 	}
 	return nil
-}
-
-// DescribeNetworkInterfacesAPIClient is a client that implements the
-// DescribeNetworkInterfaces operation.
-type DescribeNetworkInterfacesAPIClient interface {
-	DescribeNetworkInterfaces(context.Context, *DescribeNetworkInterfacesInput, ...func(*Options)) (*DescribeNetworkInterfacesOutput, error)
-}
-
-var _ DescribeNetworkInterfacesAPIClient = (*Client)(nil)
-
-// DescribeNetworkInterfacesPaginatorOptions is the paginator options for
-// DescribeNetworkInterfaces
-type DescribeNetworkInterfacesPaginatorOptions struct {
-	// The maximum number of items to return for this request. To get the next page of
-	// items, make another request with the token returned in the output. You cannot
-	// specify this parameter and the network interface IDs parameter in the same
-	// request. For more information, see [Pagination].
-	//
-	// [Pagination]: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Query-Requests.html#api-pagination
-	Limit int32
-
-	// Set to true if pagination should stop if the service returns a pagination token
-	// that matches the most recent token provided to the service.
-	StopOnDuplicateToken bool
-}
-
-// DescribeNetworkInterfacesPaginator is a paginator for DescribeNetworkInterfaces
-type DescribeNetworkInterfacesPaginator struct {
-	options   DescribeNetworkInterfacesPaginatorOptions
-	client    DescribeNetworkInterfacesAPIClient
-	params    *DescribeNetworkInterfacesInput
-	nextToken *string
-	firstPage bool
-}
-
-// NewDescribeNetworkInterfacesPaginator returns a new
-// DescribeNetworkInterfacesPaginator
-func NewDescribeNetworkInterfacesPaginator(client DescribeNetworkInterfacesAPIClient, params *DescribeNetworkInterfacesInput, optFns ...func(*DescribeNetworkInterfacesPaginatorOptions)) *DescribeNetworkInterfacesPaginator {
-	if params == nil {
-		params = &DescribeNetworkInterfacesInput{}
-	}
-
-	options := DescribeNetworkInterfacesPaginatorOptions{}
-	if params.MaxResults != nil {
-		options.Limit = *params.MaxResults
-	}
-
-	for _, fn := range optFns {
-		fn(&options)
-	}
-
-	return &DescribeNetworkInterfacesPaginator{
-		options:   options,
-		client:    client,
-		params:    params,
-		firstPage: true,
-		nextToken: params.NextToken,
-	}
-}
-
-// HasMorePages returns a boolean indicating whether more pages are available
-func (p *DescribeNetworkInterfacesPaginator) HasMorePages() bool {
-	return p.firstPage || (p.nextToken != nil && len(*p.nextToken) != 0)
-}
-
-// NextPage retrieves the next DescribeNetworkInterfaces page.
-func (p *DescribeNetworkInterfacesPaginator) NextPage(ctx context.Context, optFns ...func(*Options)) (*DescribeNetworkInterfacesOutput, error) {
-	if !p.HasMorePages() {
-		return nil, fmt.Errorf("no more pages available")
-	}
-
-	params := *p.params
-	params.NextToken = p.nextToken
-
-	var limit *int32
-	if p.options.Limit > 0 {
-		limit = &p.options.Limit
-	}
-	params.MaxResults = limit
-
-	result, err := p.client.DescribeNetworkInterfaces(ctx, &params, optFns...)
-	if err != nil {
-		return nil, err
-	}
-	p.firstPage = false
-
-	prevToken := p.nextToken
-	p.nextToken = result.NextToken
-
-	if p.options.StopOnDuplicateToken &&
-		prevToken != nil &&
-		p.nextToken != nil &&
-		*prevToken == *p.nextToken {
-		p.nextToken = nil
-	}
-
-	return result, nil
 }
 
 // NetworkInterfaceAvailableWaiterOptions are waiter options for
@@ -484,7 +389,13 @@ func (w *NetworkInterfaceAvailableWaiter) WaitForOutput(ctx context.Context, par
 		}
 
 		out, err := w.client.DescribeNetworkInterfaces(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
 			for _, opt := range options.ClientOptions {
 				opt(o)
 			}
@@ -523,29 +434,18 @@ func (w *NetworkInterfaceAvailableWaiter) WaitForOutput(ctx context.Context, par
 func networkInterfaceAvailableStateRetryable(ctx context.Context, input *DescribeNetworkInterfacesInput, output *DescribeNetworkInterfacesOutput, err error) (bool, error) {
 
 	if err == nil {
-		pathValue, err := jmespath.Search("NetworkInterfaces[].Status", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.NetworkInterfaces
+		var v2 []types.NetworkInterfaceStatus
+		for _, v := range v1 {
+			v3 := v.Status
+			v2 = append(v2, v3)
 		}
-
 		expectedValue := "available"
-		var match = true
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
-		}
-
-		if len(listOfValues) == 0 {
-			match = false
-		}
-		for _, v := range listOfValues {
-			value, ok := v.(types.NetworkInterfaceStatus)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.NetworkInterfaceStatus value, got %T", pathValue)
-			}
-
-			if string(value) != expectedValue {
+		match := len(v2) > 0
+		for _, v := range v2 {
+			if string(v) != expectedValue {
 				match = false
+				break
 			}
 		}
 
@@ -568,6 +468,106 @@ func networkInterfaceAvailableStateRetryable(ctx context.Context, input *Describ
 
 	return true, nil
 }
+
+// DescribeNetworkInterfacesPaginatorOptions is the paginator options for
+// DescribeNetworkInterfaces
+type DescribeNetworkInterfacesPaginatorOptions struct {
+	// The maximum number of items to return for this request. To get the next page of
+	// items, make another request with the token returned in the output. You cannot
+	// specify this parameter and the network interface IDs parameter in the same
+	// request. For more information, see [Pagination].
+	//
+	// [Pagination]: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Query-Requests.html#api-pagination
+	Limit int32
+
+	// Set to true if pagination should stop if the service returns a pagination token
+	// that matches the most recent token provided to the service.
+	StopOnDuplicateToken bool
+}
+
+// DescribeNetworkInterfacesPaginator is a paginator for DescribeNetworkInterfaces
+type DescribeNetworkInterfacesPaginator struct {
+	options   DescribeNetworkInterfacesPaginatorOptions
+	client    DescribeNetworkInterfacesAPIClient
+	params    *DescribeNetworkInterfacesInput
+	nextToken *string
+	firstPage bool
+}
+
+// NewDescribeNetworkInterfacesPaginator returns a new
+// DescribeNetworkInterfacesPaginator
+func NewDescribeNetworkInterfacesPaginator(client DescribeNetworkInterfacesAPIClient, params *DescribeNetworkInterfacesInput, optFns ...func(*DescribeNetworkInterfacesPaginatorOptions)) *DescribeNetworkInterfacesPaginator {
+	if params == nil {
+		params = &DescribeNetworkInterfacesInput{}
+	}
+
+	options := DescribeNetworkInterfacesPaginatorOptions{}
+	if params.MaxResults != nil {
+		options.Limit = *params.MaxResults
+	}
+
+	for _, fn := range optFns {
+		fn(&options)
+	}
+
+	return &DescribeNetworkInterfacesPaginator{
+		options:   options,
+		client:    client,
+		params:    params,
+		firstPage: true,
+		nextToken: params.NextToken,
+	}
+}
+
+// HasMorePages returns a boolean indicating whether more pages are available
+func (p *DescribeNetworkInterfacesPaginator) HasMorePages() bool {
+	return p.firstPage || (p.nextToken != nil && len(*p.nextToken) != 0)
+}
+
+// NextPage retrieves the next DescribeNetworkInterfaces page.
+func (p *DescribeNetworkInterfacesPaginator) NextPage(ctx context.Context, optFns ...func(*Options)) (*DescribeNetworkInterfacesOutput, error) {
+	if !p.HasMorePages() {
+		return nil, fmt.Errorf("no more pages available")
+	}
+
+	params := *p.params
+	params.NextToken = p.nextToken
+
+	var limit *int32
+	if p.options.Limit > 0 {
+		limit = &p.options.Limit
+	}
+	params.MaxResults = limit
+
+	optFns = append([]func(*Options){
+		addIsPaginatorUserAgent,
+	}, optFns...)
+	result, err := p.client.DescribeNetworkInterfaces(ctx, &params, optFns...)
+	if err != nil {
+		return nil, err
+	}
+	p.firstPage = false
+
+	prevToken := p.nextToken
+	p.nextToken = result.NextToken
+
+	if p.options.StopOnDuplicateToken &&
+		prevToken != nil &&
+		p.nextToken != nil &&
+		*prevToken == *p.nextToken {
+		p.nextToken = nil
+	}
+
+	return result, nil
+}
+
+// DescribeNetworkInterfacesAPIClient is a client that implements the
+// DescribeNetworkInterfaces operation.
+type DescribeNetworkInterfacesAPIClient interface {
+	DescribeNetworkInterfaces(context.Context, *DescribeNetworkInterfacesInput, ...func(*Options)) (*DescribeNetworkInterfacesOutput, error)
+}
+
+var _ DescribeNetworkInterfacesAPIClient = (*Client)(nil)
 
 func newServiceMetadataMiddleware_opDescribeNetworkInterfaces(region string) *awsmiddleware.RegisterServiceMetadata {
 	return &awsmiddleware.RegisterServiceMetadata{

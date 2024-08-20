@@ -4,7 +4,7 @@ description: Setup cilium connection disruption test
 inputs:
   cilium-cli:
     required: false
-    default: "./cilium-cli"
+    default: "/usr/local/bin/cilium"
     description: 'Path to the Cilium CLI binary'
 
 runs:
@@ -18,4 +18,6 @@ runs:
         # interruption in such flows.
         ${{ inputs.cilium-cli }} connectivity test --include-conn-disrupt-test --conn-disrupt-test-setup \
           --conn-disrupt-dispatch-interval 0ms \
+          --conn-disrupt-test-restarts-path "./cilium-conn-disrupt-restarts" \
+          --conn-disrupt-test-xfrm-errors-path "./cilium-conn-disrupt-xfrm-errors" \
           --expected-xfrm-errors "+inbound_no_state"

@@ -13,7 +13,6 @@ import (
 	smithytime "github.com/aws/smithy-go/time"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	smithywaiter "github.com/aws/smithy-go/waiter"
-	"github.com/jmespath/go-jmespath"
 	"strconv"
 	"time"
 )
@@ -553,6 +552,9 @@ func (c *Client) addOperationDescribeInstancesMiddlewares(stack *middleware.Stac
 	if err = addTimeOffsetBuild(stack, c); err != nil {
 		return err
 	}
+	if err = addUserAgentRetryMode(stack, options); err != nil {
+		return err
+	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opDescribeInstances(options.Region), middleware.Before); err != nil {
 		return err
 	}
@@ -572,103 +574,6 @@ func (c *Client) addOperationDescribeInstancesMiddlewares(stack *middleware.Stac
 		return err
 	}
 	return nil
-}
-
-// DescribeInstancesAPIClient is a client that implements the DescribeInstances
-// operation.
-type DescribeInstancesAPIClient interface {
-	DescribeInstances(context.Context, *DescribeInstancesInput, ...func(*Options)) (*DescribeInstancesOutput, error)
-}
-
-var _ DescribeInstancesAPIClient = (*Client)(nil)
-
-// DescribeInstancesPaginatorOptions is the paginator options for DescribeInstances
-type DescribeInstancesPaginatorOptions struct {
-	// The maximum number of items to return for this request. To get the next page of
-	// items, make another request with the token returned in the output. For more
-	// information, see [Pagination].
-	//
-	// You cannot specify this parameter and the instance IDs parameter in the same
-	// request.
-	//
-	// [Pagination]: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Query-Requests.html#api-pagination
-	Limit int32
-
-	// Set to true if pagination should stop if the service returns a pagination token
-	// that matches the most recent token provided to the service.
-	StopOnDuplicateToken bool
-}
-
-// DescribeInstancesPaginator is a paginator for DescribeInstances
-type DescribeInstancesPaginator struct {
-	options   DescribeInstancesPaginatorOptions
-	client    DescribeInstancesAPIClient
-	params    *DescribeInstancesInput
-	nextToken *string
-	firstPage bool
-}
-
-// NewDescribeInstancesPaginator returns a new DescribeInstancesPaginator
-func NewDescribeInstancesPaginator(client DescribeInstancesAPIClient, params *DescribeInstancesInput, optFns ...func(*DescribeInstancesPaginatorOptions)) *DescribeInstancesPaginator {
-	if params == nil {
-		params = &DescribeInstancesInput{}
-	}
-
-	options := DescribeInstancesPaginatorOptions{}
-	if params.MaxResults != nil {
-		options.Limit = *params.MaxResults
-	}
-
-	for _, fn := range optFns {
-		fn(&options)
-	}
-
-	return &DescribeInstancesPaginator{
-		options:   options,
-		client:    client,
-		params:    params,
-		firstPage: true,
-		nextToken: params.NextToken,
-	}
-}
-
-// HasMorePages returns a boolean indicating whether more pages are available
-func (p *DescribeInstancesPaginator) HasMorePages() bool {
-	return p.firstPage || (p.nextToken != nil && len(*p.nextToken) != 0)
-}
-
-// NextPage retrieves the next DescribeInstances page.
-func (p *DescribeInstancesPaginator) NextPage(ctx context.Context, optFns ...func(*Options)) (*DescribeInstancesOutput, error) {
-	if !p.HasMorePages() {
-		return nil, fmt.Errorf("no more pages available")
-	}
-
-	params := *p.params
-	params.NextToken = p.nextToken
-
-	var limit *int32
-	if p.options.Limit > 0 {
-		limit = &p.options.Limit
-	}
-	params.MaxResults = limit
-
-	result, err := p.client.DescribeInstances(ctx, &params, optFns...)
-	if err != nil {
-		return nil, err
-	}
-	p.firstPage = false
-
-	prevToken := p.nextToken
-	p.nextToken = result.NextToken
-
-	if p.options.StopOnDuplicateToken &&
-		prevToken != nil &&
-		p.nextToken != nil &&
-		*prevToken == *p.nextToken {
-		p.nextToken = nil
-	}
-
-	return result, nil
 }
 
 // InstanceExistsWaiterOptions are waiter options for InstanceExistsWaiter
@@ -786,7 +691,13 @@ func (w *InstanceExistsWaiter) WaitForOutput(ctx context.Context, params *Descri
 		}
 
 		out, err := w.client.DescribeInstances(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
 			for _, opt := range options.ClientOptions {
 				opt(o)
 			}
@@ -825,22 +736,16 @@ func (w *InstanceExistsWaiter) WaitForOutput(ctx context.Context, params *Descri
 func instanceExistsStateRetryable(ctx context.Context, input *DescribeInstancesInput, output *DescribeInstancesOutput, err error) (bool, error) {
 
 	if err == nil {
-		pathValue, err := jmespath.Search("length(Reservations[]) > `0`", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
-		}
-
+		v1 := output.Reservations
+		v2 := len(v1)
+		v3 := 0
+		v4 := int64(v2) > int64(v3)
 		expectedValue := "true"
 		bv, err := strconv.ParseBool(expectedValue)
 		if err != nil {
 			return false, fmt.Errorf("error parsing boolean from string %w", err)
 		}
-		value, ok := pathValue.(bool)
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected bool value got %T", pathValue)
-		}
-
-		if value == bv {
+		if v4 == bv {
 			return false, nil
 		}
 	}
@@ -975,7 +880,13 @@ func (w *InstanceRunningWaiter) WaitForOutput(ctx context.Context, params *Descr
 		}
 
 		out, err := w.client.DescribeInstances(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
 			for _, opt := range options.ClientOptions {
 				opt(o)
 			}
@@ -1014,29 +925,28 @@ func (w *InstanceRunningWaiter) WaitForOutput(ctx context.Context, params *Descr
 func instanceRunningStateRetryable(ctx context.Context, input *DescribeInstancesInput, output *DescribeInstancesOutput, err error) (bool, error) {
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "running"
-		var match = true
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
-		}
-
-		if len(listOfValues) == 0 {
-			match = false
-		}
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) != expectedValue {
+		match := len(v5) > 0
+		for _, v := range v5 {
+			if string(v) != expectedValue {
 				match = false
+				break
 			}
 		}
 
@@ -1046,74 +956,95 @@ func instanceRunningStateRetryable(ctx context.Context, input *DescribeInstances
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "shutting-down"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v5 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "terminated"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v5 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "stopping"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v5 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
@@ -1247,7 +1178,13 @@ func (w *InstanceStoppedWaiter) WaitForOutput(ctx context.Context, params *Descr
 		}
 
 		out, err := w.client.DescribeInstances(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
 			for _, opt := range options.ClientOptions {
 				opt(o)
 			}
@@ -1286,29 +1223,28 @@ func (w *InstanceStoppedWaiter) WaitForOutput(ctx context.Context, params *Descr
 func instanceStoppedStateRetryable(ctx context.Context, input *DescribeInstancesInput, output *DescribeInstancesOutput, err error) (bool, error) {
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "stopped"
-		var match = true
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
-		}
-
-		if len(listOfValues) == 0 {
-			match = false
-		}
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) != expectedValue {
+		match := len(v5) > 0
+		for _, v := range v5 {
+			if string(v) != expectedValue {
 				match = false
+				break
 			}
 		}
 
@@ -1318,50 +1254,64 @@ func instanceStoppedStateRetryable(ctx context.Context, input *DescribeInstances
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "pending"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v5 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "terminated"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v5 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
@@ -1483,7 +1433,13 @@ func (w *InstanceTerminatedWaiter) WaitForOutput(ctx context.Context, params *De
 		}
 
 		out, err := w.client.DescribeInstances(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
 			for _, opt := range options.ClientOptions {
 				opt(o)
 			}
@@ -1522,29 +1478,28 @@ func (w *InstanceTerminatedWaiter) WaitForOutput(ctx context.Context, params *De
 func instanceTerminatedStateRetryable(ctx context.Context, input *DescribeInstancesInput, output *DescribeInstancesOutput, err error) (bool, error) {
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "terminated"
-		var match = true
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
-		}
-
-		if len(listOfValues) == 0 {
-			match = false
-		}
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) != expectedValue {
+		match := len(v5) > 0
+		for _, v := range v5 {
+			if string(v) != expectedValue {
 				match = false
+				break
 			}
 		}
 
@@ -1554,55 +1509,169 @@ func instanceTerminatedStateRetryable(ctx context.Context, input *DescribeInstan
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "pending"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v5 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
 	if err == nil {
-		pathValue, err := jmespath.Search("Reservations[].Instances[].State.Name", output)
-		if err != nil {
-			return false, fmt.Errorf("error evaluating waiter state: %w", err)
+		v1 := output.Reservations
+		var v2 [][]types.Instance
+		for _, v := range v1 {
+			v3 := v.Instances
+			v2 = append(v2, v3)
 		}
-
+		var v4 []types.Instance
+		for _, v := range v2 {
+			v4 = append(v4, v...)
+		}
+		var v5 []types.InstanceStateName
+		for _, v := range v4 {
+			v6 := v.State
+			v7 := v6.Name
+			v5 = append(v5, v7)
+		}
 		expectedValue := "stopping"
-		listOfValues, ok := pathValue.([]interface{})
-		if !ok {
-			return false, fmt.Errorf("waiter comparator expected list got %T", pathValue)
+		var match bool
+		for _, v := range v5 {
+			if string(v) == expectedValue {
+				match = true
+				break
+			}
 		}
 
-		for _, v := range listOfValues {
-			value, ok := v.(types.InstanceStateName)
-			if !ok {
-				return false, fmt.Errorf("waiter comparator expected types.InstanceStateName value, got %T", pathValue)
-			}
-
-			if string(value) == expectedValue {
-				return false, fmt.Errorf("waiter state transitioned to Failure")
-			}
+		if match {
+			return false, fmt.Errorf("waiter state transitioned to Failure")
 		}
 	}
 
 	return true, nil
 }
+
+// DescribeInstancesPaginatorOptions is the paginator options for DescribeInstances
+type DescribeInstancesPaginatorOptions struct {
+	// The maximum number of items to return for this request. To get the next page of
+	// items, make another request with the token returned in the output. For more
+	// information, see [Pagination].
+	//
+	// You cannot specify this parameter and the instance IDs parameter in the same
+	// request.
+	//
+	// [Pagination]: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/Query-Requests.html#api-pagination
+	Limit int32
+
+	// Set to true if pagination should stop if the service returns a pagination token
+	// that matches the most recent token provided to the service.
+	StopOnDuplicateToken bool
+}
+
+// DescribeInstancesPaginator is a paginator for DescribeInstances
+type DescribeInstancesPaginator struct {
+	options   DescribeInstancesPaginatorOptions
+	client    DescribeInstancesAPIClient
+	params    *DescribeInstancesInput
+	nextToken *string
+	firstPage bool
+}
+
+// NewDescribeInstancesPaginator returns a new DescribeInstancesPaginator
+func NewDescribeInstancesPaginator(client DescribeInstancesAPIClient, params *DescribeInstancesInput, optFns ...func(*DescribeInstancesPaginatorOptions)) *DescribeInstancesPaginator {
+	if params == nil {
+		params = &DescribeInstancesInput{}
+	}
+
+	options := DescribeInstancesPaginatorOptions{}
+	if params.MaxResults != nil {
+		options.Limit = *params.MaxResults
+	}
+
+	for _, fn := range optFns {
+		fn(&options)
+	}
+
+	return &DescribeInstancesPaginator{
+		options:   options,
+		client:    client,
+		params:    params,
+		firstPage: true,
+		nextToken: params.NextToken,
+	}
+}
+
+// HasMorePages returns a boolean indicating whether more pages are available
+func (p *DescribeInstancesPaginator) HasMorePages() bool {
+	return p.firstPage || (p.nextToken != nil && len(*p.nextToken) != 0)
+}
+
+// NextPage retrieves the next DescribeInstances page.
+func (p *DescribeInstancesPaginator) NextPage(ctx context.Context, optFns ...func(*Options)) (*DescribeInstancesOutput, error) {
+	if !p.HasMorePages() {
+		return nil, fmt.Errorf("no more pages available")
+	}
+
+	params := *p.params
+	params.NextToken = p.nextToken
+
+	var limit *int32
+	if p.options.Limit > 0 {
+		limit = &p.options.Limit
+	}
+	params.MaxResults = limit
+
+	optFns = append([]func(*Options){
+		addIsPaginatorUserAgent,
+	}, optFns...)
+	result, err := p.client.DescribeInstances(ctx, &params, optFns...)
+	if err != nil {
+		return nil, err
+	}
+	p.firstPage = false
+
+	prevToken := p.nextToken
+	p.nextToken = result.NextToken
+
+	if p.options.StopOnDuplicateToken &&
+		prevToken != nil &&
+		p.nextToken != nil &&
+		*prevToken == *p.nextToken {
+		p.nextToken = nil
+	}
+
+	return result, nil
+}
+
+// DescribeInstancesAPIClient is a client that implements the DescribeInstances
+// operation.
+type DescribeInstancesAPIClient interface {
+	DescribeInstances(context.Context, *DescribeInstancesInput, ...func(*Options)) (*DescribeInstancesOutput, error)
+}
+
+var _ DescribeInstancesAPIClient = (*Client)(nil)
 
 func newServiceMetadataMiddleware_opDescribeInstances(region string) *awsmiddleware.RegisterServiceMetadata {
 	return &awsmiddleware.RegisterServiceMetadata{

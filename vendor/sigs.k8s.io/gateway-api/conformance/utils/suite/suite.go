@@ -40,6 +40,7 @@ import (
 	confv1 "sigs.k8s.io/gateway-api/conformance/apis/v1"
 	"sigs.k8s.io/gateway-api/conformance/utils/config"
 	"sigs.k8s.io/gateway-api/conformance/utils/flags"
+	"sigs.k8s.io/gateway-api/conformance/utils/grpc"
 	"sigs.k8s.io/gateway-api/conformance/utils/kubernetes"
 	"sigs.k8s.io/gateway-api/conformance/utils/roundtripper"
 	"sigs.k8s.io/gateway-api/conformance/utils/tlog"
@@ -59,6 +60,7 @@ type ConformanceTestSuite struct {
 	RESTClient               *rest.RESTClient
 	RestConfig               *rest.Config
 	RoundTripper             roundtripper.RoundTripper
+	GRPCClient               grpc.Client
 	GatewayClassName         string
 	ControllerName           string
 	Debug                    bool
@@ -125,6 +127,7 @@ type ConformanceOptions struct {
 	GatewayClassName     string
 	Debug                bool
 	RoundTripper         roundtripper.RoundTripper
+	GRPCClient           grpc.Client
 	BaseManifests        string
 	MeshManifests        string
 	NamespaceLabels      map[string]string
@@ -189,6 +192,8 @@ func NewConformanceTestSuite(options ConformanceOptions) (*ConformanceTestSuite,
 		roundTripper = &roundtripper.DefaultRoundTripper{Debug: options.Debug, TimeoutConfig: options.TimeoutConfig}
 	}
 
+	grpcClient := options.GRPCClient
+
 	installedCRDs := &apiextensionsv1.CustomResourceDefinitionList{}
 	err := options.Client.List(context.TODO(), installedCRDs)
 	if err != nil {
@@ -229,6 +234,7 @@ func NewConformanceTestSuite(options ConformanceOptions) (*ConformanceTestSuite,
 		Clientset:        options.Clientset,
 		RestConfig:       options.RestConfig,
 		RoundTripper:     roundTripper,
+		GRPCClient:       grpcClient,
 		GatewayClassName: options.GatewayClassName,
 		Debug:            options.Debug,
 		Cleanup:          options.CleanupBaseResources,
@@ -301,6 +307,10 @@ func NewConformanceTestSuite(options ConformanceOptions) (*ConformanceTestSuite,
 // Conformance Test Suite - Public Methods
 // -----------------------------------------------------------------------------
 
+const (
+	testSuiteUserAgentPrefix = "gateway-api-conformance.test"
+)
+
 // Setup ensures the base resources required for conformance tests are installed
 // in the cluster. It also ensures that all relevant resources are ready.
 func (suite *ConformanceTestSuite) Setup(t *testing.T, tests []ConformanceTest) {
@@ -368,6 +378,35 @@ func (suite *ConformanceTestSuite) Setup(t *testing.T, tests []ConformanceTest) 
 	}
 }
 
+func (suite *ConformanceTestSuite) setClientsetForTest(test ConformanceTest) error {
+	featureNames := []string{}
+	for _, v := range test.Features {
+		featureNames = append(featureNames, string(v))
+	}
+	if len(test.Features) == 0 {
+		featureNames = []string{"unknownFeature"}
+	}
+	suite.RestConfig.UserAgent = strings.Join(
+		[]string{
+			testSuiteUserAgentPrefix,
+			suite.apiVersion,
+			test.ShortName,
+			strings.Join(featureNames, ","),
+		},
+		"::")
+	client, err := client.New(suite.RestConfig, client.Options{})
+	if err != nil {
+		return err
+	}
+	clientset, err := clientset.NewForConfig(suite.RestConfig)
+	if err != nil {
+		return err
+	}
+	suite.Client = client
+	suite.Clientset = clientset
+	return nil
+}
+
 // Run runs the provided set of conformance tests.
 func (suite *ConformanceTestSuite) Run(t *testing.T, tests []ConformanceTest) error {
 	// verify that the test suite isn't already running, don't start a new run
@@ -386,10 +425,8 @@ func (suite *ConformanceTestSuite) Run(t *testing.T, tests []ConformanceTest) er
 
 	// run all tests and collect the test results for conformance reporting
 	results := make(map[string]testResult)
+	sleepForTestIsolation := false
 	for _, test := range tests {
-		succeeded := t.Run(test.ShortName, func(t *testing.T) {
-			test.Run(t, suite)
-		})
 		res := testSucceeded
 		if suite.SkipTests.Has(test.ShortName) {
 			res = testSkipped
@@ -398,6 +435,18 @@ func (suite *ConformanceTestSuite) Run(t *testing.T, tests []ConformanceTest) er
 			res = testNotSupported
 		}
 
+		// TODO(wstcliyu): need a better long term solution for test isolation
+		// https://github.com/kubernetes-sigs/gateway-api/issues/3233
+		if res != testSkipped && res != testNotSupported && sleepForTestIsolation {
+			tlog.Logf(t, "Sleeping %v for test isolation", suite.TimeoutConfig.TestIsolation)
+			time.Sleep(suite.TimeoutConfig.TestIsolation)
+		}
+
+		succeeded := t.Run(test.ShortName, func(t *testing.T) {
+			err := suite.setClientsetForTest(test)
+			require.NoError(t, err, "failed to create new clientset for test")
+			test.Run(t, suite)
+		})
 		if !succeeded {
 			res = testFailed
 		}
@@ -405,6 +454,9 @@ func (suite *ConformanceTestSuite) Run(t *testing.T, tests []ConformanceTest) er
 		results[test.ShortName] = testResult{
 			test:   test,
 			result: res,
+		}
+		if res == testSucceeded || res == testFailed {
+			sleepForTestIsolation = true
 		}
 	}
 
@@ -449,7 +501,7 @@ func (suite *ConformanceTestSuite) Report() (*confv1.ConformanceReport, error) {
 
 	return &confv1.ConformanceReport{
 		TypeMeta: v1.TypeMeta{
-			APIVersion: "gateway.networking.k8s.io/v1alpha1",
+			APIVersion: confv1.GroupVersion.String(),
 			Kind:       "ConformanceReport",
 		},
 		Date:              time.Now().Format(time.RFC3339),

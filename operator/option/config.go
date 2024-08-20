@@ -21,26 +21,6 @@ const (
 	// EndpointGCIntervalDefault is the default time for the CEP GC
 	EndpointGCIntervalDefault = 5 * time.Minute
 
-	// CESMaxCEPsInCESDefault is the maximum number of cilium endpoints allowed in a CES
-	CESMaxCEPsInCESDefault = 100
-
-	// CESSlicingModeDefault is default method for grouping CEP in a CES.
-	CESSlicingModeDefault = "cesSliceModeIdentity"
-
-	// CESWriteQPSLimitDefault is the default rate limit for the CES work queue.
-	CESWriteQPSLimitDefault = 10
-
-	// CESWriteQPSLimitMax is the maximum rate limit for the CES work queue.
-	// CES work queue QPS limit cannot exceed this value, regardless of other config.
-	CESWriteQPSLimitMax = 50
-
-	// CESWriteQPSBurstDefault is the default burst rate for the CES work queue.
-	CESWriteQPSBurstDefault = 20
-
-	// CESWriteQPSBurstMax is the maximum burst rate for the CES work queue.
-	// CES work queue QPS burst cannot exceed this value, regardless of other config.
-	CESWriteQPSBurstMax = 100
-
 	// PprofAddressOperator is the default value for pprof in the operator
 	PprofAddressOperator = "localhost"
 
@@ -94,7 +74,8 @@ const (
 	// IPAMSubnetsTags are optional tags used to filter subnets, and interfaces within those subnets
 	IPAMSubnetsTags = "subnet-tags-filter"
 
-	// IPAMInstanceTagFilter are optional tags used to filter instances for ENI discovery ; only used with AWS IPAM mode for now
+	// IPAMInstanceTags are optional tags used to filter instances for ENI discovery.
+	// Only used with AWS and Alibabacloud IPAM mode for now
 	IPAMInstanceTags = "instance-tags-filter"
 
 	// IPAMAutoCreateCiliumPodIPPools contains pre-defined IP pools to be auto-created on startup.
@@ -132,12 +113,9 @@ const (
 	// Defaults to 180 secs
 	ExcessIPReleaseDelay = "excess-ip-release-delay"
 
-	// AWSEnablePrefixDelegation allows operator to allocate IPv4 prefixes to ENIs on nitro instances instead of individual
+	// AWSEnablePrefixDelegation allows operator to allocate prefixes to ENIs on nitro instances instead of individual
 	// IP addresses. Allows for increased pod density on nodes.
 	AWSEnablePrefixDelegation = "aws-enable-prefix-delegation"
-
-	// AWSEnableIPv6PrefixDelegation allows operator to allocate IPv6 prefixes to ENIs on nitro instances.
-	AWSEnableIPv6PrefixDelegation = "aws-enable-ipv6-prefix-delegation"
 
 	// ENITags are the tags that will be added to every ENI created by the
 	// AWS ENI IPAM.
@@ -296,7 +274,8 @@ type OperatorConfig struct {
 	// IPAMSubnetsTags are optional tags used to filter subnets, and interfaces within those subnets
 	IPAMSubnetsTags map[string]string
 
-	// IPAMUInstanceTags are optional tags used to filter AWS EC2 instances, and interfaces (ENI) attached to them
+	// IPAMInstanceTags are optional tags used to filter instances for ENI discovery.
+	// Only used with AWS and Alibabacloud IPAM mode for now
 	IPAMInstanceTags map[string]string
 
 	// IPAM Operator options
@@ -347,12 +326,9 @@ type OperatorConfig struct {
 	// the number of API calls to AWS EC2 service.
 	AWSReleaseExcessIPs bool
 
-	// AWSEnablePrefixDelegation allows operator to allocate IPv4 prefixes to ENIs on nitro instances instead of individual
+	// AWSEnablePrefixDelegation allows operator to allocate prefixes to ENIs on nitro instances instead of individual
 	// IP addresses. Allows for increased pod density on nodes.
 	AWSEnablePrefixDelegation bool
-
-	// AWSEnablePrefixDelegation allows operator to allocate IPv6 prefixes to ENIs on nitro instances.
-	AWSEnableIPv6PrefixDelegation bool
 
 	// AWSUsePrimaryAddress specifies whether an interface's primary address should be available for allocations on
 	// node
@@ -483,7 +459,6 @@ func (c *OperatorConfig) Populate(vp *viper.Viper) {
 
 	c.AWSReleaseExcessIPs = vp.GetBool(AWSReleaseExcessIPs)
 	c.AWSEnablePrefixDelegation = vp.GetBool(AWSEnablePrefixDelegation)
-	c.AWSEnableIPv6PrefixDelegation = vp.GetBool(AWSEnableIPv6PrefixDelegation)
 	c.AWSUsePrimaryAddress = vp.GetBool(AWSUsePrimaryAddress)
 	c.UpdateEC2AdapterLimitViaAPI = vp.GetBool(UpdateEC2AdapterLimitViaAPI)
 	c.EC2APIEndpoint = vp.GetString(EC2APIEndpoint)

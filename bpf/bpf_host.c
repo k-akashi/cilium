@@ -285,7 +285,7 @@ handle_ipv6_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 			ret = __ipv6_host_policy_ingress(ctx, ip6, ct_buffer, &remote_id, &trace,
 							 ext_err);
 		}
-		if (IS_ERR(ret))
+		if (IS_ERR(ret) || ret == CTX_ACT_REDIRECT)
 			return ret;
 	}
 #endif /* ENABLE_HOST_FIREWALL */
@@ -330,8 +330,6 @@ handle_ipv6_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 	/* Lookup IPv6 address in list of local endpoints */
 	ep = lookup_ip6_endpoint(ip6);
 	if (ep) {
-		bool l2_hdr_required __maybe_unused = true;
-
 		/* Let through packets to the node-ip so they are
 		 * processed by the local ip stack.
 		 */
@@ -340,12 +338,16 @@ handle_ipv6_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 
 #ifdef ENABLE_HOST_ROUTING
 		/* add L2 header for L2-less interface, such as cilium_wg0 */
-		ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
-		if (ret != 0)
-			return ret;
-		if (l2_hdr_required && ETH_HLEN == 0) {
-			/* l2 header is added */
-			l3_off += __ETH_HLEN;
+		if (!from_host) {
+			bool l2_hdr_required = true;
+
+			ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
+			if (ret != 0)
+				return ret;
+			if (l2_hdr_required && ETH_HLEN == 0) {
+				/* l2 header is added */
+				l3_off += __ETH_HLEN;
+			}
 		}
 #endif
 		return ipv6_local_delivery(ctx, l3_off, secctx, magic, ep,
@@ -714,7 +716,7 @@ handle_ipv4_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 			ret = __ipv4_host_policy_ingress(ctx, ip4, ct_buffer, &remote_id, &trace,
 							 ext_err);
 		}
-		if (IS_ERR(ret))
+		if (IS_ERR(ret) || ret == CTX_ACT_REDIRECT)
 			return ret;
 	}
 #endif /* ENABLE_HOST_FIREWALL */
@@ -748,8 +750,7 @@ handle_ipv4_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 	/* Lookup IPv4 address in list of local endpoints and host IPs */
 	ep = lookup_ip4_endpoint(ip4);
 	if (ep) {
-		bool l2_hdr_required __maybe_unused = true;
-		int l3_off __maybe_unused = ETH_HLEN;
+		int l3_off = ETH_HLEN;
 
 		/* Let through packets to the node-ip so they are processed by
 		 * the local ip stack.
@@ -759,16 +760,20 @@ handle_ipv4_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
 
 #ifdef ENABLE_HOST_ROUTING
 		/* add L2 header for L2-less interface, such as cilium_wg0 */
-		ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
-		if (ret != 0)
-			return ret;
-		if (l2_hdr_required && ETH_HLEN == 0) {
-			/* l2 header is added */
-			l3_off += __ETH_HLEN;
-			if (!____revalidate_data_pull(ctx, &data, &data_end,
-						      (void **)&ip4, sizeof(*ip4),
-						      false, l3_off))
-				return DROP_INVALID;
+		if (!from_host) {
+			bool l2_hdr_required = true;
+
+			ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
+			if (ret != 0)
+				return ret;
+			if (l2_hdr_required && ETH_HLEN == 0) {
+				/* l2 header is added */
+				l3_off += __ETH_HLEN;
+				if (!____revalidate_data_pull(ctx, &data, &data_end,
+							      (void **)&ip4, sizeof(*ip4),
+							      false, l3_off))
+					return DROP_INVALID;
+			}
 		}
 #endif
 
@@ -1421,6 +1426,9 @@ int cil_to_netdev(struct __ctx_buff *ctx __maybe_unused)
 		break;
 	}
 
+	if (ret == CTX_ACT_REDIRECT)
+		return ret;
+
 	if (IS_ERR(ret))
 		goto drop_err;
 
@@ -1453,7 +1461,7 @@ skip_host_firewall:
 			 */
 			send_trace_notify(ctx, TRACE_TO_STACK, src_sec_identity,
 					  dst_sec_identity,
-					  TRACE_EP_ID_UNKNOWN, TRACE_IFINDEX_UNKNOWN,
+					  TRACE_EP_ID_UNKNOWN, NATIVE_DEV_IFINDEX,
 					  TRACE_REASON_ENCRYPT_OVERLAY, 0);
 			return ret;
 		}
@@ -1595,7 +1603,7 @@ exit:
 
 	send_trace_notify(ctx, TRACE_TO_NETWORK, src_sec_identity, dst_sec_identity,
 			  TRACE_EP_ID_UNKNOWN,
-			  TRACE_IFINDEX_UNKNOWN, trace.reason, trace.monitor);
+			  NATIVE_DEV_IFINDEX, trace.reason, trace.monitor);
 
 	return ret;
 
@@ -1866,15 +1874,17 @@ from_host_to_lxc(struct __ctx_buff *ctx, __s8 *ext_err)
 
 	return ret;
 }
+#endif /* ENABLE_HOST_FIREWALL */
 
 /* When per-endpoint routes are enabled, packets to and from local endpoints
  * will tail call into this program to enforce egress and ingress host policies.
  * Packets to the local endpoints will then tail call back to the original
  * bpf_lxc program.
  */
-__section_tail(CILIUM_MAP_POLICY, TEMPLATE_HOST_EP_ID)
-int handle_lxc_traffic(struct __ctx_buff *ctx)
+__section_entry
+int handle_lxc_traffic(struct __ctx_buff *ctx __maybe_unused)
 {
+#ifdef ENABLE_HOST_FIREWALL
 	bool from_host = ctx_load_meta(ctx, CB_FROM_HOST);
 	__u32 lxc_id;
 	int ret;
@@ -1894,7 +1904,9 @@ int handle_lxc_traffic(struct __ctx_buff *ctx)
 	}
 
 	return to_host_from_lxc(ctx);
-}
+#else
+	return 0;
 #endif /* ENABLE_HOST_FIREWALL */
+}
 
 BPF_LICENSE("Dual BSD/GPL");

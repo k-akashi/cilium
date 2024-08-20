@@ -47,6 +47,9 @@ var (
 	// ExcludedCIDRIPv4 is a special IP value used as gatewayIP in the BPF policy map
 	// to indicate the entry is for an excluded CIDR and should skip egress gateway
 	ExcludedCIDRIPv4 = netip.MustParseAddr("0.0.0.1")
+	// EgressIPNotFoundIPv4 is a special IP value used as egressIP in the BPF policy map
+	// to indicate no egressIP was found for the given policy
+	EgressIPNotFoundIPv4 = netip.IPv4Unspecified()
 )
 
 // Cell provides a [Manager] for consumption with hive.
@@ -171,8 +174,8 @@ func NewEgressGatewayManager(p Params) (out struct {
 		return out, nil
 	}
 
-	if dcfg.IdentityAllocationMode == option.IdentityAllocationModeKVstore {
-		return out, errors.New("egress gateway is not supported in KV store identity allocation mode")
+	if dcfg.IdentityAllocationMode != option.IdentityAllocationModeCRD {
+		return out, fmt.Errorf("egress gateway is not supported in %s identity allocation mode", dcfg.IdentityAllocationMode)
 	}
 
 	if dcfg.EnableHighScaleIPcache {
@@ -433,6 +436,11 @@ func (manager *Manager) addEndpoint(endpoint *k8sTypes.CiliumEndpoint) error {
 		logfields.K8sNamespace:    endpoint.Namespace,
 		logfields.K8sUID:          endpoint.UID,
 	})
+
+	if endpoint.Identity == nil {
+		logger.Warning("Endpoint is missing identity metadata, skipping update to egress policy.")
+		return nil
+	}
 
 	if identityLabels, err = manager.getIdentityLabels(uint32(endpoint.Identity.ID)); err != nil {
 		logger.WithError(err).

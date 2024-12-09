@@ -163,6 +163,8 @@ type Collector struct {
 	NodeList []string
 	// CiliumPods is a list of Cilium agent pods running on nodes in NodeList.
 	CiliumPods []*corev1.Pod
+	// CiliumOperatorPods is the list of Cilium operator pods.
+	CiliumOperatorPods []*corev1.Pod
 	// CiliumConfigMap is a pointer to cilium-config ConfigMap.
 	CiliumConfigMap *corev1.ConfigMap
 	// additionalTasks keeps track of additional tasks added via AddTasks.
@@ -172,8 +174,13 @@ type Collector struct {
 }
 
 // NewCollector returns a new sysdump collector.
-func NewCollector(k KubernetesClient, o Options, startTime time.Time, cliVersion string) (*Collector, error) {
-	c := Collector{
+func NewCollector(
+	k KubernetesClient,
+	o Options,
+	hooks Hooks,
+	startTime time.Time,
+) (*Collector, error) {
+	c := &Collector{
 		Client:     k,
 		Options:    o,
 		startTime:  startTime,
@@ -191,7 +198,7 @@ func NewCollector(k KubernetesClient, o Options, startTime time.Time, cliVersion
 		return nil, err
 	}
 	c.logDebug("Using %v as a temporary directory", c.sysdumpDir)
-	c.logTask("Collecting sysdump with cilium-cli version: %s, args: %s", cliVersion, os.Args[1:])
+	c.logTask("Collecting sysdump with cilium-cli version: %s, args: %s", defaults.CLIVersion, os.Args[1:])
 
 	if c.Options.CiliumNamespace == "" {
 		ns, err := detectCiliumNamespace(k)
@@ -293,7 +300,21 @@ func NewCollector(k KubernetesClient, o Options, startTime time.Time, cliVersion
 		}
 	}
 
-	return &c, nil
+	if c.Options.CiliumOperatorNamespace != "" {
+		pods, err := c.Client.ListPods(context.Background(), c.Options.CiliumOperatorNamespace, metav1.ListOptions{
+			LabelSelector: c.Options.CiliumOperatorLabelSelector,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get Cilium operator pods: %w", err)
+		}
+		c.CiliumOperatorPods = AllPods(pods)
+	}
+
+	if err := hooks.AddSysdumpTasks(c); err != nil {
+		return nil, fmt.Errorf("failed to add custom sysdump tasks: %w", err)
+	}
+
+	return c, nil
 }
 
 // GatherResourceUnstructured queries resources with the given GroupVersionResource, storing them in the file specified by fname.
@@ -511,6 +532,20 @@ func (c *Collector) Run() error {
 			},
 		},
 		{
+			Description: "Collecting Kubernetes endpointslices",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListEndpointSlices(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Kubernetes endpointslices: %w", err)
+				}
+				if err := c.WriteYAML(kubernetesEndpointSlicesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Kubernetes endpointslices: %w", err)
+				}
+				return nil
+			},
+		},
+		{
 			Description: "Collecting Kubernetes leases",
 			Quick:       true,
 			Task: func(ctx context.Context) error {
@@ -535,6 +570,30 @@ func (c *Collector) Run() error {
 				}
 				if err := c.WriteString(kubernetesMetricsFileName, result); err != nil {
 					return fmt.Errorf("failed to collect Kubernetes metrics: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting crashed test pod logs",
+			Quick:       false,
+			Task: func(ctx context.Context) error {
+				namespaces, err := c.Client.ListNamespaces(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to get namespaces")
+				}
+				for _, namespace := range namespaces.Items {
+					if !strings.HasPrefix(namespace.Name, defaults.ConnectivityCheckNamespace) {
+						continue
+					}
+
+					p, err := c.Client.ListPods(ctx, namespace.Name, metav1.ListOptions{})
+					if err != nil {
+						return fmt.Errorf("failed to get logs from Hubble certgen pods")
+					}
+					if err := c.SubmitLogsTasks(filterCrashedPods(p), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+						return fmt.Errorf("failed to collect logs from Hubble certgen pods")
+					}
 				}
 				return nil
 			},
@@ -729,20 +788,6 @@ func (c *Collector) Run() error {
 				}
 				if err := c.WriteYAML(ingressClassesFileName, v); err != nil {
 					return fmt.Errorf("failed to collect IngressClasses: %w", err)
-				}
-				return nil
-			},
-		},
-		{
-			Description: "Collecting Cilium BGP Peering Policies",
-			Quick:       true,
-			Task: func(ctx context.Context) error {
-				v, err := c.Client.ListCiliumBGPPeeringPolicies(ctx, metav1.ListOptions{})
-				if err != nil {
-					return fmt.Errorf("failed to collect Cilium BGP Peering policies: %w", err)
-				}
-				if err := c.WriteYAML(ciliumBPGPeeringPoliciesFileName, v); err != nil {
-					return fmt.Errorf("failed to collect Cilium BGP Peering policies: %w", err)
 				}
 				return nil
 			},
@@ -1007,12 +1052,8 @@ func (c *Collector) Run() error {
 			CreatesSubtasks: true,
 			Description:     "Collecting the Cilium operator metrics",
 			Quick:           false,
-			Task: func(ctx context.Context) error {
-				pods, err := c.Client.ListPods(ctx, c.Options.CiliumOperatorNamespace, metav1.ListOptions{LabelSelector: defaults.OperatorPodSelector})
-				if err != nil {
-					return fmt.Errorf("failed to get the Cilium operator pods: %w", err)
-				}
-				err = c.submitMetricsSubtask(pods, defaults.OperatorContainerName, defaults.OperatorMetricsPortName)
+			Task: func(_ context.Context) error {
+				err := c.SubmitMetricsSubtask(c.CiliumOperatorPods, defaults.OperatorContainerName, defaults.OperatorMetricsPortName)
 				if err != nil {
 					return fmt.Errorf("failed to collect the Cilium operator metrics: %w", err)
 				}
@@ -1025,25 +1066,27 @@ func (c *Collector) Run() error {
 			Quick:           false,
 			Task: func(ctx context.Context) error {
 				// clustermesh-apiserver runs in the same namespace as operator
-				pods, err := c.Client.ListPods(ctx, c.Options.CiliumOperatorNamespace, metav1.ListOptions{LabelSelector: defaults.ClusterMeshPodSelector})
+				p, err := c.Client.ListPods(ctx, c.Options.CiliumOperatorNamespace, metav1.ListOptions{LabelSelector: defaults.ClusterMeshPodSelector})
 				if err != nil {
 					return fmt.Errorf("failed to get the Cilium clustermesh pods: %w", err)
 				}
+
+				pods := AllPods(p)
 
 				err = c.submitClusterMeshAPIServerDbgTasks(pods)
 				if err != nil {
 					return fmt.Errorf("failed to collect the Cilium clustermesh debug information: %w", err)
 				}
 
-				err = c.submitMetricsSubtask(pods, defaults.ClusterMeshContainerName, defaults.ClusterMeshMetricsPortName)
+				err = c.SubmitMetricsSubtask(pods, defaults.ClusterMeshContainerName, defaults.ClusterMeshMetricsPortName)
 				if err != nil {
 					return fmt.Errorf("failed to collect the Cilium clustermesh metrics: %w", err)
 				}
-				err = c.submitMetricsSubtask(pods, defaults.ClusterMeshKVStoreMeshContainerName, defaults.ClusterMeshKVStoreMeshMetricsPortName)
+				err = c.SubmitMetricsSubtask(pods, defaults.ClusterMeshKVStoreMeshContainerName, defaults.ClusterMeshKVStoreMeshMetricsPortName)
 				if err != nil {
 					return fmt.Errorf("failed to collect the Cilium clustermesh metrics: %w", err)
 				}
-				err = c.submitMetricsSubtask(pods, defaults.ClusterMeshEtcdContainerName, defaults.ClusterMeshEtcdMetricsPortName)
+				err = c.SubmitMetricsSubtask(pods, defaults.ClusterMeshEtcdContainerName, defaults.ClusterMeshEtcdMetricsPortName)
 				if err != nil {
 					return fmt.Errorf("failed to collect the Cilium clustermesh metrics: %w", err)
 				}
@@ -1052,13 +1095,13 @@ func (c *Collector) Run() error {
 					defaults.ClusterMeshContainerName:            ciliumdef.GopsPortApiserver,
 					defaults.ClusterMeshKVStoreMeshContainerName: ciliumdef.GopsPortKVStoreMesh,
 				} {
-					err = c.SubmitGopsSubtasks(AllPods(pods), container)
+					err = c.SubmitGopsSubtasks(pods, container)
 					if err != nil {
 						return fmt.Errorf("failed to collect the Cilium clustermesh gops stats: %w", err)
 					}
 
 					if c.Options.Profiling {
-						err = c.SubmitStreamProfilingGopsSubtasks(AllPods(pods), container, port)
+						err = c.SubmitStreamProfilingGopsSubtasks(pods, container, port)
 						if err != nil {
 							return fmt.Errorf("failed to collect the Cilium clustermesh profiles: %w", err)
 						}
@@ -1131,14 +1174,8 @@ func (c *Collector) Run() error {
 			Description:     "Collecting gops stats from Cilium-operator pods",
 			Quick:           true,
 			Task: func(ctx context.Context) error {
-				p, err := c.Client.ListPods(ctx, c.Options.CiliumNamespace, metav1.ListOptions{
-					LabelSelector: c.Options.CiliumOperatorLabelSelector,
-				})
-				if err != nil {
-					return fmt.Errorf("failed to get cilium-operator pods: %w", err)
-				}
-				if err := c.SubmitGopsSubtasks(FilterPods(p, c.NodeList), ciliumOperatorContainerName); err != nil {
-					return fmt.Errorf("failed to collect Cilium gops: %w", err)
+				if err := c.SubmitGopsSubtasks(c.CiliumOperatorPods, ciliumOperatorContainerName); err != nil {
+					return fmt.Errorf("failed to collect cilium-operator gops stats: %w", err)
 				}
 				return nil
 			},
@@ -1190,14 +1227,16 @@ func (c *Collector) Run() error {
 		},
 		{
 			CreatesSubtasks: true,
-			Description:     "Collecting profiling data from Cilium pods",
+			Description:     "Collecting profiling data from Cilium Operator pods",
 			Quick:           false,
 			Task: func(_ context.Context) error {
 				if !c.Options.Profiling {
 					return nil
 				}
-				if err := c.SubmitProfilingGopsSubtasks(c.CiliumPods, ciliumAgentContainerName); err != nil {
-					return fmt.Errorf("failed to collect profiling data from Cilium pods: %w", err)
+
+				err := c.SubmitStreamProfilingGopsSubtasks(c.CiliumOperatorPods, ciliumOperatorContainerName, ciliumdef.GopsPortOperator)
+				if err != nil {
+					return fmt.Errorf("failed to collect cilium-operator profiles: %w", err)
 				}
 				return nil
 			},
@@ -1252,13 +1291,7 @@ func (c *Collector) Run() error {
 			Description:     "Collecting logs from Cilium operator pods",
 			Quick:           false,
 			Task: func(ctx context.Context) error {
-				p, err := c.Client.ListPods(ctx, c.Options.CiliumNamespace, metav1.ListOptions{
-					LabelSelector: c.Options.CiliumOperatorLabelSelector,
-				})
-				if err != nil {
-					return fmt.Errorf("failed to get logs from Cilium operator pods")
-				}
-				if err := c.SubmitLogsTasks(AllPods(p), c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
+				if err := c.SubmitLogsTasks(c.CiliumOperatorPods, c.Options.LogsSinceTime, c.Options.LogsLimitBytes); err != nil {
 					return fmt.Errorf("failed to collect logs from Cilium operator pods")
 				}
 				return nil
@@ -1409,6 +1442,19 @@ func (c *Collector) Run() error {
 		tasks = append(tasks, ciliumTasks...)
 
 		serialTasks = append(serialTasks, Task{
+			CreatesSubtasks: true,
+			Description:     "Collecting profiling data from Cilium pods",
+			Quick:           false,
+			Task: func(_ context.Context) error {
+				if !c.Options.Profiling {
+					return nil
+				}
+				if err := c.SubmitProfilingGopsSubtasks(c.CiliumPods, ciliumAgentContainerName); err != nil {
+					return fmt.Errorf("failed to collect profiling data from Cilium pods: %w", err)
+				}
+				return nil
+			},
+		}, Task{
 			CreatesSubtasks: true,
 			Description:     "Collecting tracing data from Cilium pods",
 			Quick:           false,
@@ -1616,6 +1662,9 @@ func (c *Collector) Run() error {
 	if c.FeatureSet[features.EnableEnvoyConfig].Enabled {
 		tasks = append(tasks, c.getEnvoyConfigTasks()...)
 	}
+	if c.FeatureSet[features.BGPControlPlane].Enabled {
+		tasks = append(tasks, c.getBGPControlPlaneTasks()...)
+	}
 
 	// First, run each serial task in its own workerpool.
 	var r []workerpool.Task
@@ -1633,7 +1682,7 @@ func (c *Collector) Run() error {
 
 		// Adjust the worker count to make enough headroom for tasks that submit sub-tasks.
 		// This is necessary because 'Submit' is blocking.
-		wc := 1
+		wc := max(1, c.Options.WorkerCount)
 		if t.CreatesSubtasks {
 			wc++
 		}
@@ -1667,16 +1716,8 @@ func (c *Collector) Run() error {
 
 	// Adjust the worker count to make enough headroom for tasks that submit sub-tasks.
 	// This is necessary because 'Submit' is blocking.
-	wc := 1
-	for _, t := range tasks {
-		if t.CreatesSubtasks && !c.shouldSkipTask(t) {
-			wc++
-		}
-	}
-	// Take the maximum between the specified worker count and the minimum number of workers required.
-	if wc < c.Options.WorkerCount {
-		wc = c.Options.WorkerCount
-	}
+	wc := max(2, c.Options.WorkerCount)
+
 	c.Pool = workerpool.New(wc)
 	c.logDebug("Using %d workers (requested: %d)", wc, c.Options.WorkerCount)
 
@@ -1700,10 +1741,13 @@ func (c *Collector) Run() error {
 		}); err != nil {
 			return fmt.Errorf("failed to submit task to the worker pool: %w", err)
 		}
+
+		if t.CreatesSubtasks {
+			c.subtasksWg.Wait()
+		}
 	}
 
-	// Wait for the all subtasks to be submitted and then call 'Drain' to wait for everything to finish.
-	c.subtasksWg.Wait()
+	// Wait for all tasks to finish.
 	results, err := c.Pool.Drain()
 	if err != nil {
 		return fmt.Errorf("failed to drain the worker pool: %w", err)
@@ -2034,6 +2078,95 @@ func (c *Collector) getEnvoyConfigTasks() []Task {
 	}
 }
 
+func (c *Collector) getBGPControlPlaneTasks() []Task {
+	return []Task{
+		{
+			Description: "Collecting Cilium BGP Peering Policies",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListCiliumBGPPeeringPolicies(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Peering policies: %w", err)
+				}
+				if err := c.WriteYAML(ciliumBPGPeeringPoliciesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Peering policies: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting Cilium BGP Cluster Configs",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListCiliumBGPClusterConfigs(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Cluster Configs: %w", err)
+				}
+				if err := c.WriteYAML(ciliumBPGClusterConfigsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Cluster Configs: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting Cilium BGP Peer Configs",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListCiliumBGPPeerConfigs(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Peer Configs: %w", err)
+				}
+				if err := c.WriteYAML(ciliumBPGPeerConfigsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Peer Configs: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting Cilium BGP Advertisements",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListCiliumBGPAdvertisements(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Advertisements: %w", err)
+				}
+				if err := c.WriteYAML(ciliumBPGAdvertisementsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Advertisements: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting Cilium BGP Node Configs",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListCiliumBGPNodeConfigs(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Node Configs: %w", err)
+				}
+				if err := c.WriteYAML(ciliumBPGNodeConfigsFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Node Configs: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			Description: "Collecting Cilium BGP Node Config Overrides",
+			Quick:       true,
+			Task: func(ctx context.Context) error {
+				v, err := c.Client.ListCiliumBGPNodeConfigOverrides(ctx, metav1.ListOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Node Config Overrides: %w", err)
+				}
+				if err := c.WriteYAML(ciliumBPGNodeConfigOverridesFileName, v); err != nil {
+					return fmt.Errorf("failed to collect Cilium BGP Node Config Overrides: %w", err)
+				}
+				return nil
+			},
+		},
+	}
+}
+
 func (c *Collector) log(msg string, args ...interface{}) {
 	fmt.Fprintf(c.logWriter, msg+"\n", args...)
 }
@@ -2225,7 +2358,7 @@ func zipDirectory(src string, dst string) error {
 func (c *Collector) submitCiliumBugtoolTasks(pods []*corev1.Pod) error {
 	for _, p := range pods {
 		p := p
-		if err := c.Pool.Submit(fmt.Sprintf("cilium-bugtool-"+p.Name), func(ctx context.Context) error {
+		if err := c.Pool.Submit("cilium-bugtool-"+p.Name, func(ctx context.Context) error {
 			p, containerName, cleanupFunc, err := c.ensureExecTarget(ctx, p, ciliumAgentContainerName)
 			if err != nil {
 				return fmt.Errorf("failed to pick exec target: %w", err)
@@ -2298,7 +2431,7 @@ func (c *Collector) submitHubbleFlowsTasks(_ context.Context, pods []*corev1.Pod
 	hubbleFlowsTimeout := strconv.FormatInt(int64(c.Options.HubbleFlowsTimeout/time.Second), 10)
 	for _, p := range pods {
 		p := p
-		if err := c.Pool.Submit(fmt.Sprintf("hubble-flows-"+p.Name), func(ctx context.Context) error {
+		if err := c.Pool.Submit("hubble-flows-"+p.Name, func(ctx context.Context) error {
 			b, e, err := c.Client.ExecInPodWithStderr(ctx, p.Namespace, p.Name, containerName, []string{
 				"timeout", "--signal", "SIGINT", "--preserve-status", hubbleFlowsTimeout, "bash", "-c",
 				fmt.Sprintf("hubble observe --last %d --debug -o jsonpb", c.Options.HubbleFlowsCount),
@@ -2326,7 +2459,7 @@ func (c *Collector) submitHubbleFlowsTasks(_ context.Context, pods []*corev1.Pod
 func (c *Collector) submitSpireEntriesTasks(pods []*corev1.Pod) error {
 	for _, p := range pods {
 		p := p
-		if err := c.Pool.Submit(fmt.Sprintf("spire-entries-"+p.Name), func(ctx context.Context) error {
+		if err := c.Pool.Submit("spire-entries-"+p.Name, func(ctx context.Context) error {
 			p, containerName, cleanupFunc, err := c.ensureExecTarget(ctx, p, spireServerContainerName)
 			if err != nil {
 				return fmt.Errorf("failed to pick exec target: %w", err)
@@ -2740,11 +2873,11 @@ func (c *Collector) submitKVStoreTasks(ctx context.Context, pod *corev1.Pod) err
 	return nil
 }
 
-// submitMetricsSubtask submits tasks to collect metrics from pods.
-func (c *Collector) submitMetricsSubtask(pods *corev1.PodList, containerName, portName string) error {
-	for _, p := range pods.Items {
+// SubmitMetricsSubtask submits tasks to collect metrics from pods.
+func (c *Collector) SubmitMetricsSubtask(pods []*corev1.Pod, containerName, portName string) error {
+	for _, p := range pods {
 		p := p
-		if !podIsRunningAndHasContainer(&p, containerName) {
+		if !podIsRunningAndHasContainer(p, containerName) {
 			continue
 		}
 		err := c.Pool.Submit(fmt.Sprintf("metrics-%s-%s-%s", p.Name, containerName, portName), func(ctx context.Context) error {
@@ -2768,7 +2901,7 @@ func (c *Collector) submitMetricsSubtask(pods *corev1.PodList, containerName, po
 	return nil
 }
 
-func (c *Collector) submitClusterMeshAPIServerDbgTasks(pods *corev1.PodList) error {
+func (c *Collector) submitClusterMeshAPIServerDbgTasks(pods []*corev1.Pod) error {
 	tasks := []struct {
 		name      string
 		ext       string
@@ -2812,10 +2945,9 @@ func (c *Collector) submitClusterMeshAPIServerDbgTasks(pods *corev1.PodList) err
 		},
 	}
 
-	for _, pod := range pods.Items {
-		pod := pod
+	for _, pod := range pods {
 		for _, task := range tasks {
-			if !podIsRunningAndHasContainer(&pod, task.container) {
+			if !podIsRunningAndHasContainer(pod, task.container) {
 				continue
 			}
 
@@ -2850,7 +2982,7 @@ func (c *Collector) submitClusterMeshAPIServerDbgTasks(pods *corev1.PodList) err
 	return nil
 }
 
-func getPodMetricsPort(pod corev1.Pod, containerName, portName string) (int32, error) {
+func getPodMetricsPort(pod *corev1.Pod, containerName, portName string) (int32, error) {
 	for _, container := range pod.Spec.Containers {
 		if container.Name != containerName {
 			continue
@@ -2869,13 +3001,10 @@ func getPodMetricsPort(pod corev1.Pod, containerName, portName string) (int32, e
 // and includes the specified container.
 func podIsRunningAndHasContainer(pod *corev1.Pod, container string) bool {
 	if pod.Status.Phase == corev1.PodRunning {
-		for i := range pod.Spec.Containers {
-			if pod.Spec.Containers[i].Name == container {
-				return true
-			}
-		}
+		return slices.ContainsFunc(pod.Spec.Containers, func(c corev1.Container) bool {
+			return c.Name == container
+		})
 	}
-
 	return false
 }
 
@@ -2903,6 +3032,17 @@ func AllPods(l *corev1.PodList) []*corev1.Pod {
 // FilterPods filters a list of pods by node names.
 func FilterPods(l *corev1.PodList, n []string) []*corev1.Pod {
 	return filterPods(l, func(po *corev1.Pod) bool { return slices.Contains(n, po.Spec.NodeName) })
+}
+
+func filterCrashedPods(l *corev1.PodList) []*corev1.Pod {
+	return filterPods(l, func(po *corev1.Pod) bool {
+		for _, containerStatus := range po.Status.ContainerStatuses {
+			if containerStatus.State.Waiting != nil && containerStatus.State.Waiting.Reason == "CrashLoopBackOff" {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 func filterPods(l *corev1.PodList, filter func(po *corev1.Pod) bool) []*corev1.Pod {

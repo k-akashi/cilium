@@ -250,6 +250,7 @@ func NewService4Key(ip net.IP, port uint16, proto u8proto.U8proto, scope uint8, 
 func (k *Service4Key) String() string {
 	kHost := k.ToHost().(*Service4Key)
 	addr := net.JoinHostPort(kHost.Address.String(), fmt.Sprintf("%d", kHost.Port))
+	addr += fmt.Sprintf("/%s", u8proto.U8proto(kHost.Proto).String())
 	if kHost.Scope == loadbalancer.ScopeInternal {
 		addr += "/i"
 	}
@@ -268,6 +269,7 @@ func (k *Service4Key) SetScope(scope uint8)    { k.Scope = scope }
 func (k *Service4Key) GetScope() uint8         { return k.Scope }
 func (k *Service4Key) GetAddress() net.IP      { return k.Address.IP() }
 func (k *Service4Key) GetPort() uint16         { return k.Port }
+func (k *Service4Key) GetProtocol() uint8      { return k.Proto }
 func (k *Service4Key) MapDelete() error        { return k.Map().Delete(k.ToNetwork()) }
 
 func (k *Service4Key) RevNatValue() RevNatValue {
@@ -325,8 +327,9 @@ func (s *Service4Value) GetFlags() uint16 {
 
 func (s *Service4Value) SetSessionAffinityTimeoutSec(t uint32) {
 	// Go doesn't support union types, so we use BackendID to access the
-	// lb4_service.affinity_timeout field
-	s.BackendID = t
+	// lb4_service.affinity_timeout field. Also, for the master entry the
+	// LB algorithm was set beforehand, so we need to binary OR here.
+	s.BackendID |= t
 }
 
 func (s *Service4Value) SetL7LBProxyPort(port uint16) {
@@ -340,6 +343,14 @@ func (s *Service4Value) SetBackendID(id loadbalancer.BackendID) {
 }
 func (s *Service4Value) GetBackendID() loadbalancer.BackendID {
 	return loadbalancer.BackendID(s.BackendID)
+}
+
+func (s *Service4Value) GetLbAlg() uint8 {
+	return uint8(uint32(s.BackendID) >> 24)
+}
+
+func (s *Service4Value) SetLbAlg(lb uint8) {
+	s.BackendID = uint32(lb) << 24
 }
 
 func (s *Service4Value) ToNetwork() ServiceValue {
@@ -415,9 +426,10 @@ func (b *Backend4Value) GetAddress() net.IP { return b.Address.IP() }
 func (b *Backend4Value) GetIPCluster() cmtypes.AddrCluster {
 	return cmtypes.AddrClusterFrom(b.Address.Addr(), 0)
 }
-func (b *Backend4Value) GetPort() uint16 { return b.Port }
-func (b *Backend4Value) GetFlags() uint8 { return b.Flags }
-func (b *Backend4Value) GetZone() uint8  { return 0 }
+func (b *Backend4Value) GetPort() uint16    { return b.Port }
+func (b *Backend4Value) GetProtocol() uint8 { return uint8(b.Proto) }
+func (b *Backend4Value) GetFlags() uint8    { return b.Flags }
+func (b *Backend4Value) GetZone() uint8     { return 0 }
 
 func (v *Backend4Value) ToNetwork() BackendValue {
 	n := *v
@@ -483,9 +495,10 @@ func (b *Backend4ValueV3) GetAddress() net.IP { return b.Address.IP() }
 func (b *Backend4ValueV3) GetIPCluster() cmtypes.AddrCluster {
 	return cmtypes.AddrClusterFrom(b.Address.Addr(), uint32(b.ClusterID))
 }
-func (b *Backend4ValueV3) GetPort() uint16 { return b.Port }
-func (b *Backend4ValueV3) GetFlags() uint8 { return b.Flags }
-func (b *Backend4ValueV3) GetZone() uint8  { return b.Zone }
+func (b *Backend4ValueV3) GetPort() uint16    { return b.Port }
+func (b *Backend4ValueV3) GetProtocol() uint8 { return uint8(b.Proto) }
+func (b *Backend4ValueV3) GetFlags() uint8    { return b.Flags }
+func (b *Backend4ValueV3) GetZone() uint8     { return b.Zone }
 
 func (v *Backend4ValueV3) ToNetwork() BackendValue {
 	n := *v

@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
 	"github.com/cilium/cilium/pkg/u8proto"
@@ -40,7 +41,7 @@ func TestExpandNestedJSON(t *testing.T) {
 	buf = bytes.NewBufferString(`{"foo": ["{\n  \"port\": 8080,\n  \"protocol\": \"TCP\"\n}"]}`)
 	res, err = expandNestedJSON(*buf)
 	require.NoError(t, err)
-	require.EqualValues(t, `{"foo": [{
+	require.JSONEq(t, `{"foo": [{
   "port": 8080,
   "protocol": "TCP"
 }]}`, res.String())
@@ -285,7 +286,7 @@ func TestExpandNestedJSON(t *testing.T) {
 ]`)
 	res, err = expandNestedJSON(*buf)
 	require.NoError(t, err)
-	require.EqualValues(t, `[
+	require.JSONEq(t, `[
   {
     "id": 2669,
     "spec": {
@@ -553,15 +554,15 @@ func TestParseTrafficString(t *testing.T) {
 }
 
 func TestParsePolicyUpdateArgsHelper(t *testing.T) {
-	sortProtos := func(ints []uint8) {
+	sortProtos := func(ints []u8proto.U8proto) {
 		sort.Slice(ints, func(i, j int) bool {
 			return ints[i] < ints[j]
 		})
 	}
 
-	allProtos := []uint8{}
+	allProtos := []u8proto.U8proto{}
 	for _, proto := range u8proto.ProtoIDs {
-		allProtos = append(allProtos, uint8(proto))
+		allProtos = append(allProtos, proto)
 	}
 
 	tests := []struct {
@@ -569,33 +570,33 @@ func TestParsePolicyUpdateArgsHelper(t *testing.T) {
 		invalid          bool
 		mapBaseName      string
 		trafficDirection trafficdirection.TrafficDirection
-		peerLbl          uint32
+		peerLbl          identity.NumericIdentity
 		port             uint16
-		protos           []uint8
+		protos           []u8proto.U8proto
 		isDeny           bool
 	}{
 		{
 			args:             []string{labels.IDNameHost, "ingress", "12345"},
 			invalid:          false,
-			mapBaseName:      "cilium_policy_reserved_1",
+			mapBaseName:      "cilium_policy_v2_reserved_1",
 			trafficDirection: trafficdirection.Ingress,
 			peerLbl:          12345,
 			port:             0,
-			protos:           []uint8{0},
+			protos:           []u8proto.U8proto{u8proto.ANY},
 		},
 		{
 			args:             []string{"123", "egress", "12345", "1/tcp"},
 			invalid:          false,
-			mapBaseName:      "cilium_policy_00123",
+			mapBaseName:      "cilium_policy_v2_00123",
 			trafficDirection: trafficdirection.Egress,
 			peerLbl:          12345,
 			port:             1,
-			protos:           []uint8{uint8(u8proto.TCP)},
+			protos:           []u8proto.U8proto{u8proto.TCP},
 		},
 		{
 			args:             []string{"123", "ingress", "12345", "1"},
 			invalid:          false,
-			mapBaseName:      "cilium_policy_00123",
+			mapBaseName:      "cilium_policy_v2_00123",
 			trafficDirection: trafficdirection.Ingress,
 			peerLbl:          12345,
 			port:             1,
@@ -615,27 +616,27 @@ func TestParsePolicyUpdateArgsHelper(t *testing.T) {
 			args:             []string{labels.IDNameHost, "ingress", "12345"},
 			invalid:          false,
 			isDeny:           true,
-			mapBaseName:      "cilium_policy_reserved_1",
+			mapBaseName:      "cilium_policy_v2_reserved_1",
 			trafficDirection: trafficdirection.Ingress,
 			peerLbl:          12345,
 			port:             0,
-			protos:           []uint8{0},
+			protos:           []u8proto.U8proto{u8proto.ANY},
 		},
 		{
 			args:             []string{"123", "egress", "12345", "1/tcp"},
 			invalid:          false,
 			isDeny:           true,
-			mapBaseName:      "cilium_policy_00123",
+			mapBaseName:      "cilium_policy_v2_00123",
 			trafficDirection: trafficdirection.Egress,
 			peerLbl:          12345,
 			port:             1,
-			protos:           []uint8{uint8(u8proto.TCP)},
+			protos:           []u8proto.U8proto{u8proto.TCP},
 		},
 		{
 			args:             []string{"123", "ingress", "12345", "1"},
 			invalid:          false,
 			isDeny:           true,
-			mapBaseName:      "cilium_policy_00123",
+			mapBaseName:      "cilium_policy_v2_00123",
 			trafficDirection: trafficdirection.Ingress,
 			peerLbl:          12345,
 			port:             1,

@@ -6,9 +6,6 @@
 #include <bpf/ctx/skb.h>
 #include "pktgen.h"
 
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
-
 /* Enable code paths under test */
 #define ENABLE_IPV4			1
 #define ENABLE_IPSEC			1
@@ -111,7 +108,7 @@ int tc_host_encrypted_overlay_01_setup(struct __ctx_buff *ctx)
 	__u32 encrypt_key = 0;
 
 	endpoint_v4_add_entry(POD1_IP, POD1_IFACE, 0, 0, POD1_SEC_IDENTITY,
-			      (__u8 *)pod1_mac, (__u8 *)node1_mac);
+			      0, (__u8 *)pod1_mac, (__u8 *)node1_mac);
 	node_v4_add_entry(NODE2_IP, NODE2_ID, NODE2_SPI);
 	map_update_elem(&ENCRYPT_MAP, &encrypt_key, &encrypt_value, BPF_ANY);
 
@@ -173,7 +170,7 @@ int tc_host_encrypted_overlay_01_check(const struct __ctx_buff *ctx)
 		test_fatal("dst IP has changed");
 
 	if (l3->check != bpf_htons(0x7da4))
-		test_fatal("L3 checksum is invalid: %d", bpf_htons(l3->check));
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
 
 	if (l4->source != NODE1_TUNNEL_SPORT)
 		test_fatal("src port has changed");

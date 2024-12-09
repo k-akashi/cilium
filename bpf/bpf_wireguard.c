@@ -13,6 +13,7 @@
 #include "lib/trace.h"
 #include "lib/drop.h"
 #include "lib/nodeport.h"
+#include "lib/nodeport_egress.h"
 
 /* to-wireguard is attached as a tc egress filter to the cilium_wg0 device.
  */
@@ -39,7 +40,7 @@ int cil_to_wireguard(struct __ctx_buff *ctx)
 	if (magic == MARK_MAGIC_OVERLAY)
 		goto out;
 
-	ret = handle_nat_fwd(ctx, 0, proto, &trace, &ext_err);
+	ret = handle_nat_fwd(ctx, 0, proto, true, &trace, &ext_err);
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, src_sec_identity, ret, ext_err,
 						  CTX_ACT_DROP, METRIC_EGRESS);

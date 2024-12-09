@@ -18,6 +18,7 @@ type onDemandXdsStarter struct {
 
 	runDir                   string
 	envoyLogPath             string
+	envoyDefaultLogLevel     string
 	envoyBaseID              uint64
 	keepCapNetBindService    bool
 	metricsListenerPort      int
@@ -26,18 +27,19 @@ type onDemandXdsStarter struct {
 	maxRequestsPerConnection uint32
 	maxConnectionDuration    time.Duration
 	idleTimeout              time.Duration
+	maxConcurrentRetries     uint32
 
 	envoyOnce sync.Once
 }
 
 var _ XDSServer = &onDemandXdsStarter{}
 
-func (o *onDemandXdsStarter) AddListener(name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup) {
+func (o *onDemandXdsStarter) AddListener(name string, kind policy.L7ParserType, port uint16, isIngress bool, mayUseOriginalSourceAddr bool, wg *completion.WaitGroup, cb func(err error)) error {
 	if err := o.startEmbeddedEnvoy(nil); err != nil {
 		log.WithError(err).Error("Envoy: Failed to start embedded Envoy proxy on demand")
 	}
 
-	o.XDSServer.AddListener(name, kind, port, isIngress, mayUseOriginalSourceAddr, wg)
+	return o.XDSServer.AddListener(name, kind, port, isIngress, mayUseOriginalSourceAddr, wg, cb)
 }
 
 func (o *onDemandXdsStarter) UpsertEnvoyResources(ctx context.Context, resources Resources) error {
@@ -64,12 +66,14 @@ func (o *onDemandXdsStarter) startEmbeddedEnvoy(wg *completion.WaitGroup) error 
 		_, startErr = startEmbeddedEnvoy(embeddedEnvoyConfig{
 			runDir:                   o.runDir,
 			logPath:                  o.envoyLogPath,
+			defaultLogLevel:          o.envoyDefaultLogLevel,
 			baseID:                   o.envoyBaseID,
 			keepCapNetBindService:    o.keepCapNetBindService,
 			connectTimeout:           o.connectTimeout,
 			maxRequestsPerConnection: o.maxRequestsPerConnection,
 			maxConnectionDuration:    o.maxConnectionDuration,
 			idleTimeout:              o.idleTimeout,
+			maxConcurrentRetries:     o.maxConcurrentRetries,
 		})
 
 		// Add Prometheus listener if the port is (properly) configured

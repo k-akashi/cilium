@@ -122,7 +122,15 @@ var (
 			return index.NewKeySet(NodeAddressKey{a.Addr, a.DeviceName}.Key())
 		},
 		FromKey: NodeAddressKey.Key,
-		Unique:  true,
+		FromString: func(key string) (index.Key, error) {
+			addrS, device, _ := strings.Cut(key, "/")
+			addr, err := netip.ParseAddr(addrS)
+			if err != nil {
+				return index.Key{}, nil
+			}
+			return NodeAddressKey{Addr: addr, DeviceName: device}.Key(), nil
+		},
+		Unique: true,
 	}
 
 	NodeAddressDeviceNameIndex = statedb.Index[NodeAddress, string]{
@@ -130,8 +138,9 @@ var (
 		FromObject: func(a NodeAddress) index.KeySet {
 			return index.NewKeySet(index.String(a.DeviceName))
 		},
-		FromKey: index.String,
-		Unique:  false,
+		FromKey:    index.String,
+		FromString: index.FromString,
+		Unique:     false,
 	}
 
 	NodeAddressNodePortIndex = statedb.Index[NodeAddress, bool]{
@@ -139,8 +148,9 @@ var (
 		FromObject: func(a NodeAddress) index.KeySet {
 			return index.NewKeySet(index.Bool(a.NodePort))
 		},
-		FromKey: index.Bool,
-		Unique:  false,
+		FromKey:    index.Bool,
+		FromString: index.BoolString,
+		Unique:     false,
 	}
 
 	NodeAddressTableName statedb.TableName = "node-addresses"
@@ -265,8 +275,7 @@ func (n *nodeAddressController) register() {
 				}
 
 				// Do an immediate update to populate the table before it is read from.
-				devices := n.Devices.All(txn)
-				for dev, _, ok := devices.Next(); ok; dev, _, ok = devices.Next() {
+				for dev := range n.Devices.All(txn) {
 					n.update(txn, n.getAddressesFromDevice(dev), nil, dev.Name)
 					n.updateWildcardDevice(txn, dev, false)
 				}
@@ -302,15 +311,14 @@ func (n *nodeAddressController) updateK8sNodeIPs(node node.LocalNode) (updated b
 }
 
 func (n *nodeAddressController) run(ctx context.Context, reporter cell.Health) error {
-	defer n.deviceChanges.Close()
-
 	localNodeChanges := stream.ToChannel(ctx, n.LocalNode)
 	n.updateK8sNodeIPs(<-localNodeChanges)
 
 	limiter := rate.NewLimiter(nodeAddressControllerMinInterval, 1)
 	for {
 		txn := n.DB.WriteTxn(n.NodeAddresses)
-		for change, _, ok := n.deviceChanges.Next(); ok; change, _, ok = n.deviceChanges.Next() {
+		changes, watch := n.deviceChanges.Next(txn)
+		for change := range changes {
 			dev := change.Object
 
 			var new []NodeAddress
@@ -325,7 +333,7 @@ func (n *nodeAddressController) run(ctx context.Context, reporter cell.Health) e
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-n.deviceChanges.Watch(n.DB.ReadTxn()):
+		case <-watch:
 		case localNode, ok := <-localNodeChanges:
 			if !ok {
 				localNodeChanges = nil
@@ -335,8 +343,7 @@ func (n *nodeAddressController) run(ctx context.Context, reporter cell.Health) e
 				// Recompute the node addresses as the k8s node IP has changed, which
 				// affects the prioritization.
 				txn := n.DB.WriteTxn(n.NodeAddresses)
-				devices := n.Devices.All(txn)
-				for dev, _, ok := devices.Next(); ok; dev, _, ok = devices.Next() {
+				for dev := range n.Devices.All(txn) {
 					n.update(txn, n.getAddressesFromDevice(dev), nil, dev.Name)
 					n.updateWildcardDevice(txn, dev, false)
 				}
@@ -365,7 +372,7 @@ func (n *nodeAddressController) updateWildcardDevice(txn statedb.WriteTxn, dev *
 
 	// Clear existing fallback addresses.
 	iter := n.NodeAddresses.List(txn, NodeAddressDeviceNameIndex.Query(WildcardDeviceName))
-	for addr, _, ok := iter.Next(); ok; addr, _, ok = iter.Next() {
+	for addr := range iter {
 		n.NodeAddresses.Delete(txn, addr)
 	}
 
@@ -395,8 +402,7 @@ func (n *nodeAddressController) updateFallbacks(txn statedb.ReadTxn, dev *Device
 	fallbacks := &n.fallbackAddresses
 	if deleted && fallbacks.fromDevice(dev) {
 		fallbacks.clear()
-		devices := n.Devices.All(txn)
-		for dev, _, ok := devices.Next(); ok; dev, _, ok = devices.Next() {
+		for dev := range n.Devices.All(txn) {
 			if strings.HasPrefix(dev.Name, "lxc") {
 				// Never pick the fallback from lxc* devices.
 				continue
@@ -585,7 +591,7 @@ func showAddresses(addrs []NodeAddress) string {
 			ss = append(ss, addr.Addr.String())
 		}
 	}
-	sort.Strings(ss)
+	slices.Sort(ss)
 	return strings.Join(ss, ", ")
 }
 

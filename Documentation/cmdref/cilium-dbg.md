@@ -28,6 +28,7 @@ CLI for interacting with the local Cilium Agent
 * [cilium-dbg debuginfo](cilium-dbg_debuginfo.md)	 - Request available debugging information from agent
 * [cilium-dbg encrypt](cilium-dbg_encrypt.md)	 - Manage transparent encryption
 * [cilium-dbg endpoint](cilium-dbg_endpoint.md)	 - Manage endpoints
+* [cilium-dbg envoy](cilium-dbg_envoy.md)	 - Manage Envoy Proxy
 * [cilium-dbg fqdn](cilium-dbg_fqdn.md)	 - Manage fqdn proxy
 * [cilium-dbg identity](cilium-dbg_identity.md)	 - Manage security identities
 * [cilium-dbg ip](cilium-dbg_ip.md)	 - Manage IP addresses and associated information
@@ -45,8 +46,10 @@ CLI for interacting with the local Cilium Agent
 * [cilium-dbg preflight](cilium-dbg_preflight.md)	 - Cilium upgrade helper
 * [cilium-dbg recorder](cilium-dbg_recorder.md)	 - Introspect or mangle pcap recorder
 * [cilium-dbg service](cilium-dbg_service.md)	 - Manage services & loadbalancers
-* [cilium-dbg statedb](cilium-dbg_statedb.md)	 - Inspect StateDB
+* [cilium-dbg shell](cilium-dbg_shell.md)	 - Connect to the Cilium shell
+* [cilium-dbg statedb](cilium-dbg_statedb.md)	 - Inspect StateDB (deprecated)
 * [cilium-dbg status](cilium-dbg_status.md)	 - Display status of daemon
+* [cilium-dbg sysdump](cilium-dbg_sysdump.md)	 - Provide instructions on dumping cluster-wide system state
 * [cilium-dbg troubleshoot](cilium-dbg_troubleshoot.md)	 - Run troubleshooting utilities to check control-plane connectivity
 * [cilium-dbg version](cilium-dbg_version.md)	 - Print version information
 

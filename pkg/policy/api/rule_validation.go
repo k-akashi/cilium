@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/cilium/cilium/pkg/iana"
+	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -21,23 +22,35 @@ const (
 
 var (
 	ErrFromToNodesRequiresNodeSelectorOption = fmt.Errorf("FromNodes/ToNodes rules can only be applied when the %q flag is set", option.EnableNodeSelectorLabels)
+
+	enableDefaultDenyDefault = true
 )
 
 // Sanitize validates and sanitizes a policy rule. Minor edits such as
 // capitalization of the protocol name are automatically fixed up. More
 // fundamental violations will cause an error to be returned.
+//
+// Note: this function is called from both the operator and the agent;
+// make sure any configuration flags are bound in **both** binaries.
 func (r *Rule) Sanitize() error {
-	// Fill in the default traffic posture of this Rule.
-	// Default posture is per-direction (ingress or egress),
-	// if there is a peer selector for that direction, the
-	// default is deny, else allow.
-	if r.EnableDefaultDeny.Egress == nil {
-		x := len(r.Egress) > 0 || len(r.EgressDeny) > 0
-		r.EnableDefaultDeny.Egress = &x
-	}
-	if r.EnableDefaultDeny.Ingress == nil {
-		x := len(r.Ingress) > 0 || len(r.IngressDeny) > 0
-		r.EnableDefaultDeny.Ingress = &x
+	if option.Config.EnableNonDefaultDenyPolicies {
+		// Fill in the default traffic posture of this Rule.
+		// Default posture is per-direction (ingress or egress),
+		// if there is a peer selector for that direction, the
+		// default is deny, else allow.
+		if r.EnableDefaultDeny.Egress == nil {
+			x := len(r.Egress) > 0 || len(r.EgressDeny) > 0
+			r.EnableDefaultDeny.Egress = &x
+		}
+		if r.EnableDefaultDeny.Ingress == nil {
+			x := len(r.Ingress) > 0 || len(r.IngressDeny) > 0
+			r.EnableDefaultDeny.Ingress = &x
+		}
+	} else {
+		// Since Non Default Deny Policies is disabled by flag, set EnableDefaultDeny to true
+		r.EnableDefaultDeny.Egress = &enableDefaultDenyDefault
+		r.EnableDefaultDeny.Ingress = &enableDefaultDenyDefault
+
 	}
 
 	if r.EndpointSelector.LabelSelector == nil && r.NodeSelector.LabelSelector == nil {
@@ -209,13 +222,30 @@ func countNonGeneratedCIDRRules(s CIDRRuleSlice) int {
 	return n
 }
 
+// countNonGeneratedEndpoints counts the number of EndpointSelector items which are not
+// `Generated`, i.e. were directly provided by the user.
+// The `Generated` field is currently only set by the `ToServices`
+// implementation, which extracts service endpoints and translates them as
+// ToEndpoints rules before the CNP is passed to the policy repository.
+// Therefore, we want to allow the combination of ToEndpoints and ToServices
+// rules, if (and only if) the ToEndpoints only contains `Generated` entries.
+func countNonGeneratedEndpoints(s []EndpointSelector) int {
+	n := 0
+	for _, c := range s {
+		if !c.Generated {
+			n++
+		}
+	}
+	return n
+}
+
 func (e *EgressRule) sanitize(hostPolicy bool) error {
 	var retErr error
 
 	l3Members := map[string]int{
 		"ToCIDR":      len(e.ToCIDR),
 		"ToCIDRSet":   countNonGeneratedCIDRRules(e.ToCIDRSet),
-		"ToEndpoints": len(e.ToEndpoints),
+		"ToEndpoints": countNonGeneratedEndpoints(e.ToEndpoints),
 		"ToEntities":  len(e.ToEntities),
 		"ToServices":  len(e.ToServices),
 		"ToFQDNs":     len(e.ToFQDNs),
@@ -227,7 +257,7 @@ func (e *EgressRule) sanitize(hostPolicy bool) error {
 		"ToCIDRSet":   true,
 		"ToEndpoints": true,
 		"ToEntities":  true,
-		"ToServices":  false, // see https://github.com/cilium/cilium/issues/20067
+		"ToServices":  true,
 		"ToFQDNs":     true,
 		"ToGroups":    true,
 		"ToNodes":     true,
@@ -528,10 +558,32 @@ func (c CIDR) sanitize() error {
 // valid, and ensuring that all of the exception CIDR prefixes are contained
 // within the allowed CIDR prefix.
 func (c *CIDRRule) sanitize() error {
-	if c.CIDRGroupRef != "" {
-		// When a CIDRGroupRef is set, we don't need to validate the CIDR
-		return nil
+	// Exactly one of CIDR, CIDRGroupRef, or CIDRGroupSelector must be set
+	cnt := 0
+	if len(c.CIDRGroupRef) > 0 {
+		cnt++
 	}
+	if len(c.Cidr) > 0 {
+		cnt++
+	}
+	if c.CIDRGroupSelector != nil {
+		cnt++
+		es := NewESFromK8sLabelSelector(labels.LabelSourceCIDRGroupKeyPrefix, c.CIDRGroupSelector)
+		if err := es.sanitize(); err != nil {
+			return fmt.Errorf("failed to parse cidrGroupSelector %v: %w", c.CIDRGroupSelector.String(), err)
+		}
+	}
+	if cnt == 0 {
+		return fmt.Errorf("one of cidr, cidrGroupRef, or cidrGroupSelector is required")
+	}
+	if cnt > 1 {
+		return fmt.Errorf("more than one of cidr, cidrGroupRef, or cidrGroupSelector may not be set")
+	}
+
+	if len(c.CIDRGroupRef) > 0 || c.CIDRGroupSelector != nil {
+		return nil // these are selectors;
+	}
+
 	// Only allow notation <IP address>/<prefix>. Note that this differs from
 	// the logic in api.CIDR.Sanitize().
 	prefix, err := netip.ParsePrefix(string(c.Cidr))

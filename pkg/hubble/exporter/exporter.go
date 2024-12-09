@@ -5,48 +5,63 @@ package exporter
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
-	"os"
 
-	"github.com/cilium/lumberjack/v2"
 	"github.com/sirupsen/logrus"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
 	observerpb "github.com/cilium/cilium/api/v1/observer"
 	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	"github.com/cilium/cilium/pkg/hubble/exporter/exporteroption"
 	"github.com/cilium/cilium/pkg/hubble/filters"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 )
 
+var _ FlowLogExporter = (*exporter)(nil)
+
+// OnExportEvent is a hook that can be registered on an exporter and is invoked for each event.
+//
+// Returning false will stop the export pipeline for the current event, meaning the default export
+// logic as well as the following hooks will not run.
+type OnExportEvent interface {
+	OnExportEvent(ctx context.Context, ev *v1.Event, encoder Encoder) (stop bool, err error)
+}
+
+// OnExportEventFunc implements OnExportEvent for a single function.
+type OnExportEventFunc func(ctx context.Context, ev *v1.Event, encoder Encoder) (stop bool, err error)
+
+// OnExportEventFunc implements OnExportEvent.
+func (f OnExportEventFunc) OnExportEvent(ctx context.Context, ev *v1.Event, encoder Encoder) (bool, error) {
+	return f(ctx, ev, encoder)
+}
+
 // exporter is an implementation of OnDecodedEvent interface that writes Hubble events to a file.
 type exporter struct {
-	FlowLogExporter
-	ctx     context.Context
 	logger  logrus.FieldLogger
-	encoder *json.Encoder
+	encoder Encoder
 	writer  io.WriteCloser
 	flow    *flowpb.Flow
 
+<<<<<<< HEAD
 	evch []chan *v1.Event
 	opts exporteroption.Options
+=======
+	opts Options
+>>>>>>> upstream/main
 }
 
-// NewExporter initializes an exporter.
-func NewExporter(
-	ctx context.Context,
-	logger logrus.FieldLogger,
-	options ...exporteroption.Option) (*exporter, error) {
-	opts := exporteroption.Default // start with defaults
+// NewExporter initializes an
+// NOTE: Stopped instances cannot be restarted and should be re-created.
+func NewExporter(logger logrus.FieldLogger, options ...Option) (*exporter, error) {
+	opts := DefaultOptions // start with defaults
 	for _, opt := range options {
 		if err := opt(&opts); err != nil {
 			return nil, fmt.Errorf("failed to apply option: %w", err)
 		}
 	}
 	logger.WithField("options", opts).Info("Configuring Hubble event exporter")
+<<<<<<< HEAD
 	var writer io.WriteCloser
 	// If hubble-export-file-path is set to "stdout", use os.Stdout as the writer.
 	if opts.Path == "stdout" {
@@ -65,11 +80,21 @@ func NewExporter(
 	}
 	return exporter, err
 	//return newExporter(ctx, logger, writer, opts)
+=======
+	return newExporter(logger, opts)
+>>>>>>> upstream/main
 }
 
 // newExporter let's you supply your own WriteCloser for tests.
-func newExporter(ctx context.Context, logger logrus.FieldLogger, writer io.WriteCloser, opts exporteroption.Options) (*exporter, error) {
-	encoder := json.NewEncoder(writer)
+func newExporter(logger logrus.FieldLogger, opts Options) (*exporter, error) {
+	writer, err := opts.NewWriterFunc()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create writer: %w", err)
+	}
+	encoder, err := opts.NewEncoderFunc(writer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create encoder: %w", err)
+	}
 	var flow *flowpb.Flow
 	if opts.FieldMask.Active() {
 		flow = new(flowpb.Flow)
@@ -81,7 +106,6 @@ func newExporter(ctx context.Context, logger logrus.FieldLogger, writer io.Write
 		ch[i] = make(chan *v1.Event, 10000)
 	}
 	return &exporter{
-		ctx:     ctx,
 		logger:  logger,
 		encoder: encoder,
 		writer:  writer,
@@ -89,6 +113,53 @@ func newExporter(ctx context.Context, logger logrus.FieldLogger, writer io.Write
 		opts:    opts,
 		evch:    ch,
 	}, nil
+}
+
+// Export implements the FlowLogExporter interface.
+//
+// It takes care of applying filters on the received event, and if allowed, proceeds to invoke the
+// registered OnExportEvent hooks. If none of the hooks return true (abort signal) the event is then
+// wrapped in observerpb.ExportEvent before being encoded and written to its underlying writer.
+func (e *exporter) Export(ctx context.Context, ev *v1.Event) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	if !filters.Apply(e.opts.AllowFilters(), e.opts.DenyFilters(), ev) {
+		return nil
+	}
+
+	// Process OnExportEvent hooks
+	for _, f := range e.opts.OnExportEvent {
+		stop, err := f.OnExportEvent(ctx, ev, e.encoder)
+		if err != nil {
+			e.logger.WithError(err).Warn("OnExportEvent failed")
+		}
+		if stop {
+			// abort exporter pipeline by returning early but do not prevent
+			// other OnDecodedEvent hooks from firing
+			return nil
+		}
+	}
+
+	res := e.eventToExportEvent(ev)
+	if res == nil {
+		return nil
+	}
+	return e.encoder.Encode(res)
+}
+
+// Stop implements the FlowLogExporter interface.
+func (e *exporter) Stop() error {
+	e.logger.Debug("hubble flow exporter stopping")
+	if e.writer == nil {
+		// Already stoppped
+		return nil
+	}
+	err := e.writer.Close()
+	e.writer = nil
+	return err
 }
 
 // eventToExportEvent converts Event to ExportEvent.
@@ -134,6 +205,7 @@ func (e *exporter) eventToExportEvent(event *v1.Event) *observerpb.ExportEvent {
 		return nil
 	}
 }
+<<<<<<< HEAD
 
 func (e *exporter) Stop() error {
 	if e.writer == nil {
@@ -189,3 +261,5 @@ func (e *exporter) DecodeEvent(evc chan *v1.Event) {
 		e.eventToExportEvent(ev)
 	}
 }
+=======
+>>>>>>> upstream/main

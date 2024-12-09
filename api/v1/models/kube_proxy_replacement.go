@@ -41,7 +41,7 @@ type KubeProxyReplacement struct {
 	Features *KubeProxyReplacementFeatures `json:"features,omitempty"`
 
 	// mode
-	// Enum: [True False]
+	// Enum: ["True","False"]
 	Mode string `json:"mode,omitempty"`
 }
 
@@ -286,6 +286,9 @@ func (m *KubeProxyReplacementDeviceListItems0) UnmarshalBinary(b []byte) error {
 //
 // swagger:model KubeProxyReplacementFeatures
 type KubeProxyReplacementFeatures struct {
+
+	// annotations
+	Annotations []string `json:"annotations"`
 
 	// flag bpf-lb-sock-hostns-only
 	BpfSocketLBHostnsOnly bool `json:"bpfSocketLBHostnsOnly,omitempty"`
@@ -1187,15 +1190,15 @@ func (m *KubeProxyReplacementFeaturesNat46X64Service) UnmarshalBinary(b []byte) 
 type KubeProxyReplacementFeaturesNodePort struct {
 
 	// acceleration
-	// Enum: [None Native Generic Best-Effort]
+	// Enum: ["None","Native","Generic","Best-Effort"]
 	Acceleration string `json:"acceleration,omitempty"`
 
 	// algorithm
-	// Enum: [Random Maglev]
+	// Enum: ["Random","Maglev"]
 	Algorithm string `json:"algorithm,omitempty"`
 
 	// dsr mode
-	// Enum: [IP Option/Extension IPIP Geneve]
+	// Enum: ["IP Option/Extension","IPIP","Geneve"]
 	DsrMode string `json:"dsrMode,omitempty"`
 
 	// enabled
@@ -1205,7 +1208,7 @@ type KubeProxyReplacementFeaturesNodePort struct {
 	LutSize int64 `json:"lutSize,omitempty"`
 
 	// mode
-	// Enum: [SNAT DSR Hybrid]
+	// Enum: ["SNAT","DSR","Hybrid"]
 	Mode string `json:"mode,omitempty"`
 
 	// port max

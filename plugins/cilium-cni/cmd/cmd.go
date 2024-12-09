@@ -23,6 +23,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
 	"github.com/vishvananda/netlink"
+	"go4.org/netipx"
 	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/api/v1/models"
@@ -30,11 +31,11 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/link"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	"github.com/cilium/cilium/pkg/defaults"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
-	iputil "github.com/cilium/cilium/pkg/ip"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/hooks"
@@ -79,8 +80,7 @@ func WithEPConfigurator(cfg EndpointConfigurator) Option {
 	}
 }
 
-// NewCmd creates a new Cmd instance, whose Add, Del and Check methods can be
-// passed to skel.PluginMain
+// NewCmd creates a new Cmd instance with Add, Del and Check methods
 func NewCmd(opts ...Option) *Cmd {
 	cmd := &Cmd{
 		cfg: &DefaultConfigurator{},
@@ -89,6 +89,15 @@ func NewCmd(opts ...Option) *Cmd {
 		opt(cmd)
 	}
 	return cmd
+}
+
+// CNIFuncs returns the CNI functions supported by Cilium that can be passed to skel.PluginMainFuncs
+func (cmd *Cmd) CNIFuncs() skel.CNIFuncs {
+	return skel.CNIFuncs{
+		Add:   cmd.Add,
+		Del:   cmd.Del,
+		Check: cmd.Check,
+	}
 }
 
 type CmdState struct {
@@ -202,15 +211,41 @@ func allocateIPsWithDelegatedPlugin(
 	// Safe to assume at most one IP per family. The K8s API docs say:
 	// "Pods may be allocated at most 1 value for each of IPv4 and IPv6"
 	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/
+	// Interface returned by IPAM should be treated as the uplink for the Pod as CNI spec introduced by:
+	// https://github.com/containernetworking/cni/pull/1137
+	masterMac := ""
+	for _, iface := range ipamResult.Interfaces {
+		if iface.Sandbox == "" && iface.Name != "" {
+			if uplink, err := safenetlink.LinkByName(iface.Name); err != nil {
+				return nil, releaseFunc, fmt.Errorf("failed to get uplink %q: %w", iface.Name, err)
+			} else {
+				masterMac = uplink.Attrs().HardwareAddr.String()
+			}
+			break
+		}
+	}
+	// Interface number could not be determined from IPAM result for now.
+	// Set a static value zero before we have a proper solution.
+	// option.Config.EgressMultiHomeIPRuleCompat also needs to be set to true.
 	for _, ipConfig := range ipamResult.IPs {
 		ipNet := ipConfig.Address
 		if ipv4 := ipNet.IP.To4(); ipv4 != nil {
 			ipam.Address.IPV4 = ipNet.String()
-			ipam.IPV4 = &models.IPAMAddressResponse{IP: ipv4.String()}
+			ipam.IPV4 = &models.IPAMAddressResponse{
+				IP:              ipv4.String(),
+				Gateway:         ipConfig.Gateway.String(),
+				MasterMac:       masterMac,
+				InterfaceNumber: "0",
+			}
 		} else if conf.Addressing.IPV6 != nil {
 			// assign ipam ipv6 address only if agent ipv6 config is enabled
 			ipam.Address.IPV6 = ipNet.String()
-			ipam.IPV6 = &models.IPAMAddressResponse{IP: ipNet.IP.String()}
+			ipam.IPV6 = &models.IPAMAddressResponse{
+				IP:              ipNet.IP.String(),
+				Gateway:         ipConfig.Gateway.String(),
+				MasterMac:       masterMac,
+				InterfaceNumber: "0",
+			}
 		}
 	}
 
@@ -224,7 +259,7 @@ func addIPConfigToLink(ip netip.Addr, routes []route.Route, rules []route.Rule, 
 		logfields.Interface: ifName,
 	}).Debug("Configuring link")
 
-	addr := &netlink.Addr{IPNet: iputil.AddrToIPNet(ip)}
+	addr := &netlink.Addr{IPNet: netipx.AddrIPNet(ip)}
 	if ip.Is6() {
 		addr.Flags = unix.IFA_F_NODAD
 	}
@@ -277,7 +312,7 @@ func addIPConfigToLink(ip netip.Addr, routes []route.Route, rules []route.Rule, 
 }
 
 func configureIface(ipam *models.IPAMResponse, ifName string, state *CmdState) (string, error) {
-	l, err := netlink.LinkByName(ifName)
+	l, err := safenetlink.LinkByName(ifName)
 	if err != nil {
 		return "", fmt.Errorf("failed to lookup %q: %w", ifName, err)
 	}
@@ -370,7 +405,7 @@ func prepareIP(ipAddr string, state *CmdState, mtu int) (*cniTypesV1.IPConfig, [
 	}
 
 	return &cniTypesV1.IPConfig{
-		Address: *iputil.AddrToIPNet(ip),
+		Address: *netipx.AddrIPNet(ip),
 		Gateway: gwIP,
 	}, rt, nil
 }
@@ -404,8 +439,10 @@ func reserveLocalIPPorts(conf *models.DaemonConfigurationStatus, sysctl sysctl.S
 	}
 
 	// Note: This setting applies to IPv4 and IPv6
-	const param = "net.ipv4.ip_local_reserved_ports"
-	var reserved = conf.IPLocalReservedPorts
+	var (
+		param    = []string{"net", "ipv4", "ip_local_reserved_ports"}
+		reserved = conf.IPLocalReservedPorts
+	)
 
 	// Append our reserved ports to the ones which might already be reserved.
 	existing, err := sysctl.Read(param)
@@ -649,8 +686,7 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 			res.Routes = append(res.Routes, routes...)
 		}
 
-		switch conf.IpamMode {
-		case ipamOption.IPAMENI, ipamOption.IPAMAzure, ipamOption.IPAMAlibabaCloud:
+		if needsEndpointRoutingOnHost(conf) {
 			err = interfaceAdd(ipConfig, ipam.IPV4, conf)
 			if err != nil {
 				return fmt.Errorf("unable to setup interface datapath: %w", err)
@@ -665,7 +701,7 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 			}
 
 			if ipv6IsEnabled(ipam) {
-				if err := sysctl.Disable("net.ipv6.conf.all.disable_ipv6"); err != nil {
+				if err := sysctl.Disable([]string{"net", "ipv6", "conf", "all", "disable_ipv6"}); err != nil {
 					logger.WithError(err).Warn("unable to enable ipv6 on all interfaces")
 				}
 			}
@@ -948,12 +984,12 @@ func verifyInterface(netnsPinPath, ifName string, expected *cniTypesV1.Result) e
 	}
 	defer ns.Close()
 	return ns.Do(func() error {
-		link, err := netlink.LinkByName(ifName)
+		link, err := safenetlink.LinkByName(ifName)
 		if err != nil {
 			return fmt.Errorf("cannot find container link %v", ifName)
 		}
 
-		addrList, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		addrList, err := safenetlink.AddrList(link, netlink.FAMILY_ALL)
 		if err != nil {
 			return fmt.Errorf("failed to list link addresses: %w", err)
 		}
@@ -1026,4 +1062,18 @@ func loggerWithCNIArgs(logger *logrus.Entry, cniArgs *types.ArgsSpec) *logrus.En
 		logfields.K8sNamespace: cniArgs.K8S_POD_NAMESPACE,
 		logfields.K8sPodName:   cniArgs.K8S_POD_NAME,
 	})
+}
+
+// needsEndpointRoutingOnHost returns true if extra routes/rules need to be installed
+// on host for the Pod. This is needed for following IPAM modes:
+// - Cloud ENI IPAM modes.
+// - DelegatedPlugin mode with InstallUplinkRoutesForDelegatedIPAM set to true.
+func needsEndpointRoutingOnHost(conf *models.DaemonConfigurationStatus) bool {
+	switch conf.IpamMode {
+	case ipamOption.IPAMENI, ipamOption.IPAMAzure, ipamOption.IPAMAlibabaCloud:
+		return true
+	case ipamOption.IPAMDelegatedPlugin:
+		return conf.InstallUplinkRoutesForDelegatedIPAM
+	}
+	return false
 }

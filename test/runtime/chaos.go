@@ -21,6 +21,8 @@ var _ = Describe("RuntimeAgentChaos", func() {
 
 	BeforeAll(func() {
 		vm = helpers.InitRuntimeHelper(helpers.Runtime, logger)
+		err := vm.SetUpCilium()
+		Expect(err).Should(BeNil(), "Cilium failed to start")
 		ExpectCiliumReady(vm)
 
 		res := vm.ContainerCreate(helpers.Client, constants.NetperfImage, helpers.CiliumDockerNetwork, "-l id.client")
@@ -58,6 +60,4 @@ var _ = Describe("RuntimeAgentChaos", func() {
 	})
 
 	Context("Cilium agent", agentChaosTests)
-
-	Context("KVStore", kvstoreChaosTests)
 })

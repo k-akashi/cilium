@@ -24,6 +24,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/cilium/cilium/pkg/bpf"
@@ -33,7 +34,6 @@ import (
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
-	"github.com/cilium/cilium/pkg/proxy"
 )
 
 const (
@@ -56,6 +56,8 @@ type cecResourceParser struct {
 
 	ingressIPv4 net.IP
 	ingressIPv6 net.IP
+
+	defaultMaxConcurrentRetries uint32
 }
 
 type parserParams struct {
@@ -64,14 +66,17 @@ type parserParams struct {
 	Logger    logrus.FieldLogger
 	Lifecycle cell.Lifecycle
 
-	Proxy          *proxy.Proxy
+	PortAllocator  PortAllocator
 	LocalNodeStore *node.LocalNodeStore
+
+	CecConfig cecConfig
 }
 
 func newCECResourceParser(params parserParams) *cecResourceParser {
 	parser := &cecResourceParser{
-		logger:        params.Logger,
-		portAllocator: params.Proxy,
+		logger:                      params.Logger,
+		portAllocator:               params.PortAllocator,
+		defaultMaxConcurrentRetries: params.CecConfig.ProxyMaxConcurrentRetries,
 	}
 
 	// Retrieve Ingress IPs from local Node.
@@ -313,6 +318,8 @@ func (r *cecResourceParser) parseResources(cecNamespace string, cecName string, 
 
 			fillInTransportSocketXDS(cecNamespace, cecName, cluster.TransportSocket)
 
+			fillInCircuitBreakers(cluster, r.defaultMaxConcurrentRetries)
+
 			// Fill in EDS config source if unset
 			if enum := cluster.GetType(); enum == envoy_config_cluster.Cluster_EDS {
 				if cluster.EdsClusterConfig == nil {
@@ -527,6 +534,7 @@ func (r *cecResourceParser) getBPFMetadataListenerFilter(useOriginalSourceAddr b
 		BpfRoot:                  bpf.BPFFSRoot(),
 		IsL7Lb:                   l7lb,
 		ProxyId:                  uint32(proxyPort),
+		PolicyUpdateWarningLimit: durationpb.New(option.Config.FQDNProxyResponseMaxDelay),
 	}
 
 	// Set Ingress source addresses if configuring for L7 LB.  One of these will be used when
@@ -835,32 +843,39 @@ func injectCiliumUpstreamL7Filter(opts *envoy_config_upstream.HttpProtocolOption
 	return changed, nil
 }
 
-func fillInTlsContextXDS(cecNamespace string, cecName string, tls *envoy_config_tls.CommonTlsContext) (updated bool) {
-	qualify := func(sc *envoy_config_tls.SdsSecretConfig) {
-		if sc.SdsConfig == nil {
-			sc.SdsConfig = envoy.CiliumXDSConfigSource
-			updated = true
-		}
-		var nameUpdated bool
-		sc.Name, nameUpdated = api.ResourceQualifiedName(cecNamespace, cecName, sc.Name)
-		if nameUpdated {
-			updated = true
-		}
+func qualifySdsSecretConfig(sc *envoy_config_tls.SdsSecretConfig, cecNamespace string, cecName string) bool {
+	updated := false
+
+	if sc.SdsConfig == nil {
+		sc.SdsConfig = envoy.CiliumXDSConfigSource
+		updated = true
 	}
+	var nameUpdated bool
+	sc.Name, nameUpdated = api.ResourceQualifiedName(cecNamespace, cecName, sc.Name)
+	if nameUpdated {
+		updated = true
+	}
+
+	return updated
+}
+
+func fillInTlsContextXDS(cecNamespace string, cecName string, tls *envoy_config_tls.CommonTlsContext) bool {
+	updated := false
 
 	if tls != nil {
 		for _, sc := range tls.TlsCertificateSdsSecretConfigs {
-			qualify(sc)
+			updated = qualifySdsSecretConfig(sc, cecNamespace, cecName) || updated
 		}
 		if sc := tls.GetValidationContextSdsSecretConfig(); sc != nil {
-			qualify(sc)
+			updated = qualifySdsSecretConfig(sc, cecNamespace, cecName) || updated
 		}
 		if cvc := tls.GetCombinedValidationContext(); cvc != nil {
 			if sc := cvc.GetValidationContextSdsSecretConfig(); sc != nil {
-				qualify(sc)
+				updated = qualifySdsSecretConfig(sc, cecNamespace, cecName) || updated
 			}
 		}
 	}
+
 	return updated
 }
 
@@ -874,7 +889,14 @@ func fillInTransportSocketXDS(cecNamespace string, cecName string, ts *envoy_con
 			var updated *anypb.Any
 			switch tls := any.(type) {
 			case *envoy_config_tls.DownstreamTlsContext:
-				if fillInTlsContextXDS(cecNamespace, cecName, tls.CommonTlsContext) {
+
+				wasUpdated := fillInTlsContextXDS(cecNamespace, cecName, tls.CommonTlsContext)
+
+				if tls.GetSessionTicketKeysSdsSecretConfig() != nil {
+					wasUpdated = qualifySdsSecretConfig(tls.GetSessionTicketKeysSdsSecretConfig(), cecNamespace, cecName) || wasUpdated
+				}
+
+				if wasUpdated {
 					updated = toAny(tls)
 				}
 			case *envoy_config_tls.UpstreamTlsContext:
@@ -887,6 +909,16 @@ func fillInTransportSocketXDS(cecNamespace string, cecName string, ts *envoy_con
 					TypedConfig: updated,
 				}
 			}
+		}
+	}
+}
+
+func fillInCircuitBreakers(cluster *envoy_config_cluster.Cluster, defaultConcurrentRetries uint32) {
+	if cluster.CircuitBreakers == nil {
+		cluster.CircuitBreakers = &envoy_config_cluster.CircuitBreakers{
+			Thresholds: []*envoy_config_cluster.CircuitBreakers_Thresholds{{
+				MaxRetries: &wrapperspb.UInt32Value{Value: defaultConcurrentRetries},
+			}},
 		}
 	}
 }

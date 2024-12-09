@@ -28,32 +28,32 @@ func TestValidateIPv6ClusterAllocCIDR(t *testing.T) {
 		IPv6ClusterAllocCIDR: "fdfd::/64",
 	}
 
-	require.Nil(t, valid1.validateIPv6ClusterAllocCIDR())
+	require.NoError(t, valid1.validateIPv6ClusterAllocCIDR())
 	require.Equal(t, "fdfd::", valid1.IPv6ClusterAllocCIDRBase)
 
 	valid2 := &DaemonConfig{
 		IPv6ClusterAllocCIDR: "fdfd:fdfd:fdfd:fdfd:aaaa::/64",
 	}
-	require.Nil(t, valid2.validateIPv6ClusterAllocCIDR())
+	require.NoError(t, valid2.validateIPv6ClusterAllocCIDR())
 	require.Equal(t, "fdfd:fdfd:fdfd:fdfd::", valid2.IPv6ClusterAllocCIDRBase)
 
 	invalid1 := &DaemonConfig{
 		IPv6ClusterAllocCIDR: "foo",
 	}
-	require.NotNil(t, invalid1.validateIPv6ClusterAllocCIDR())
+	require.Error(t, invalid1.validateIPv6ClusterAllocCIDR())
 
 	invalid2 := &DaemonConfig{
 		IPv6ClusterAllocCIDR: "fdfd",
 	}
-	require.NotNil(t, invalid2.validateIPv6ClusterAllocCIDR())
+	require.Error(t, invalid2.validateIPv6ClusterAllocCIDR())
 
 	invalid3 := &DaemonConfig{
 		IPv6ClusterAllocCIDR: "fdfd::/32",
 	}
-	require.NotNil(t, invalid3.validateIPv6ClusterAllocCIDR())
+	require.Error(t, invalid3.validateIPv6ClusterAllocCIDR())
 
 	invalid4 := &DaemonConfig{}
-	require.NotNil(t, invalid4.validateIPv6ClusterAllocCIDR())
+	require.Error(t, invalid4.validateIPv6ClusterAllocCIDR())
 }
 
 func TestGetEnvName(t *testing.T) {
@@ -194,10 +194,10 @@ func TestReadDirConfig(t *testing.T) {
 		args := tt.setupArgs()
 		want := tt.setupWant()
 		m, err := ReadDirConfig(args.dirName)
-		require.Equal(t, want.err, err, fmt.Sprintf("Test Name: %s", tt.name))
+		require.Equal(t, want.err, err, "Test Name: %s", tt.name)
 		err = MergeConfig(vp, m)
 		require.NoError(t, err)
-		assert.Equal(t, vp.AllSettings(), want.allSettings, fmt.Sprintf("Test Name: %s", tt.name))
+		assert.Equal(t, want.allSettings, vp.AllSettings(), "Test Name: %s", tt.name)
 		tt.postTestRun()
 	}
 }
@@ -912,11 +912,6 @@ func Test_populateNodePortRange(t *testing.T) {
 	}
 }
 
-func TestGetDefaultMonitorQueueSize(t *testing.T) {
-	require.Equal(t, 4*defaults.MonitorQueueSizePerCPU, getDefaultMonitorQueueSize(4))
-	require.Equal(t, defaults.MonitorQueueSizePerCPUMaximum, getDefaultMonitorQueueSize(1000))
-}
-
 const (
 	_   = iota
 	KiB = 1 << (10 * iota)
@@ -1169,7 +1164,7 @@ func Test_backupFiles(t *testing.T) {
 	files, err := os.ReadDir(tempDir)
 	require.NoError(t, err)
 	// No files should have been created
-	require.Len(t, files, 0)
+	require.Empty(t, files)
 
 	_, err = os.Create(filepath.Join(tempDir, "test.json"))
 	require.NoError(t, err)
@@ -1334,4 +1329,31 @@ func TestDaemonConfig_StoreInFile(t *testing.T) {
 	err = Config.ValidateUnchanged()
 	assert.NoError(t, err)
 	Config.Opts.Delete("unit-test-key-only")
+}
+
+func stringToStringFlag(t *testing.T, name string) *flag.Flag {
+	var value map[string]string
+	fs := flag.NewFlagSet("cilium-agent", flag.PanicOnError)
+	fs.StringToString(name, value, "")
+	flag := fs.Lookup(name)
+	assert.NotNil(t, flag)
+	assert.Equal(t, "stringToString", flag.Value.Type())
+	return flag
+}
+
+func TestApiRateLimitValidation(t *testing.T) {
+	const name = "api-rate-limit"
+	apiRateLimit := stringToStringFlag(t, name)
+	// This negative test checks that validateConfigMapFlag effectively works and rejects invalid values.
+	assert.Error(t, validateConfigMapFlag(apiRateLimit, name, 99), "must reject invalid values")
+	// These positive tests are regression tests, making sure validateConfigMapFlag accepts valid input.
+	assert.NoError(t, validateConfigMapFlag(apiRateLimit, name, "endpoint-create=rate-limit:100/s,rate-burst:300,max-wait-duration:60s,parallel-requests:300,log:true"), "must accept comma separated key value pairs")
+	assert.NoError(t, validateConfigMapFlag(apiRateLimit, name, "{}"), "must accept empty JSON object")
+	assert.NoError(t, validateConfigMapFlag(apiRateLimit, name, `{                                 
+		"endpoint-create": "auto-adjust:true,estimated-processing-duration:200ms,rate-limit:16/s,rate-burst:32,min-parallel-requests:16,max-parallel-requests:128,log:false", 
+		"endpoint-delete": "auto-adjust:true,estimated-processing-duration:200ms,rate-limit:16/s,rate-burst:32,min-parallel-requests:16,max-parallel-requests:128,log:false", 
+		"endpoint-get": "auto-adjust:true,estimated-processing-duration:100ms,rate-limit:16/s,rate-burst:32,min-parallel-requests:8,max-parallel-requests:16,log:false", 
+		"endpoint-list": "auto-adjust:true,estimated-processing-duration:300ms,rate-limit:16/s,rate-burst:32,min-parallel-requests:8,max-parallel-requests:16,log:false", 
+		"endpoint-patch": "auto-adjust:true,estimated-processing-duration:200ms,rate-limit:16/s,rate-burst:32,min-parallel-requests:16,max-parallel-requests:128,log:false"
+		}`), "must accept JSON object")
 }

@@ -157,7 +157,7 @@ func (k *K8sCiliumEndpointsWatcher) endpointUpdated(oldEndpoint, endpoint *types
 	var namedPortsChanged bool
 	defer func() {
 		if namedPortsChanged {
-			k.policyManager.TriggerPolicyUpdates(true, "Named ports added or updated")
+			k.policyManager.TriggerPolicyUpdates("Named ports added or updated")
 		}
 	}()
 	var ipsAdded []string
@@ -238,7 +238,7 @@ func (k *K8sCiliumEndpointsWatcher) endpointUpdated(oldEndpoint, endpoint *types
 		}
 		k8sMeta.NamedPorts[port.Name] = ciliumTypes.PortProto{
 			Port:  port.Port,
-			Proto: uint8(p),
+			Proto: p,
 		}
 	}
 
@@ -282,7 +282,7 @@ func (k *K8sCiliumEndpointsWatcher) endpointDeleted(endpoint *types.CiliumEndpoi
 			}
 		}
 		if namedPortsChanged {
-			k.policyManager.TriggerPolicyUpdates(true, "Named ports deleted")
+			k.policyManager.TriggerPolicyUpdates("Named ports deleted")
 		}
 	}
 	hubblemetrics.ProcessCiliumEndpointDeletion(endpoint)

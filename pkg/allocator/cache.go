@@ -32,7 +32,8 @@ type cache struct {
 
 	allocator *Allocator
 
-	stopChan chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// mutex protects all cache data structures
 	mutex lock.RWMutex
@@ -69,11 +70,13 @@ type cache struct {
 }
 
 func newCache(a *Allocator) (c cache) {
+	ctx, cancel := context.WithCancel(context.Background())
 	c = cache{
 		allocator:   a,
 		cache:       idMap{},
 		keyCache:    keyMap{},
-		stopChan:    make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
 		controllers: controller.NewManager(),
 	}
 	c.changeSrc, c.emitChange, c.completeChangeSrc = stream.Multicast[AllocatorChange]()
@@ -136,12 +139,12 @@ func (c *cache) OnUpsert(id idpool.ID, key AllocatorKey) {
 	defer c.mutex.Unlock()
 
 	if k, ok := c.nextCache[id]; ok {
-		delete(c.nextKeyCache, c.allocator.encodeKey(k))
+		delete(c.nextKeyCache, k.GetKey())
 	}
 
 	c.nextCache[id] = key
 	if key != nil {
-		c.nextKeyCache[c.allocator.encodeKey(key)] = id
+		c.nextKeyCache[key.GetKey()] = id
 	}
 
 	c.allocator.idPool.Remove(id)
@@ -219,7 +222,7 @@ func (c *cache) onDeleteLocked(id idpool.ID, key AllocatorKey, recreateMissingLo
 	}
 
 	if k, ok := c.nextCache[id]; ok && k != nil {
-		delete(c.nextKeyCache, c.allocator.encodeKey(k))
+		delete(c.nextKeyCache, k.GetKey())
 	}
 
 	delete(c.nextCache, id)
@@ -245,7 +248,7 @@ func (c *cache) start() waitChan {
 	c.stopWatchWg.Add(1)
 
 	go func() {
-		c.allocator.backend.ListAndWatch(context.TODO(), c, c.stopChan)
+		c.allocator.backend.ListAndWatch(c.ctx, c)
 		c.stopWatchWg.Done()
 	}()
 
@@ -253,7 +256,7 @@ func (c *cache) start() waitChan {
 }
 
 func (c *cache) stop() {
-	close(c.stopChan)
+	c.cancel()
 	c.stopWatchWg.Wait()
 	// Drain/stop any remaining sync identity controllers.
 	// Backend watch is now stopped, any running controllers attempting to
@@ -327,7 +330,7 @@ func (c *cache) foreach(cb RangeFunc) {
 func (c *cache) insert(key AllocatorKey, val idpool.ID) {
 	c.mutex.Lock()
 	c.nextCache[val] = key
-	c.nextKeyCache[c.allocator.encodeKey(key)] = val
+	c.nextKeyCache[key.GetKey()] = val
 	c.mutex.Unlock()
 }
 

@@ -301,15 +301,59 @@ communicating via the proxy must reconnect to re-establish connections.
   100 QPS/200 Burst. To configure the rate limit for Cilium Operator, use the
   ``--operator-k8s-client-qps`` and ``--operator-k8s-client-burst`` flags or the corresponding
   Helm values.
+* Support for Consul, deprecated since v1.12, has been removed.
+* Cilium now supports services protocol differentiation, which allows the agent to distinguish two
+  services on the same port with different protocols (e.g. TCP and UDP).
+  This feature, enabled by default, can be controlled with the ``--bpf-lb-proto-diff`` flag.
+  After the upgrade, existing services without a protocol set will be preserved as such, to avoid any
+  connection disruptions, and will need to be deleted and recreated in order for their protocol to
+  be taken into account by the agent.
+  In case of downgrades to a version that doesn't support services protocol differentiation,
+  existing services with the protocol set will be deleted and recreated, without the protocol, by
+  the agent, causing connection disruptions for such services.
+* MTU auto-detection is now continuous during agent lifetime, changing device MTU no longer requires
+  restarting the agent to pick up the new MTU.
+* MTU auto-detection will now use the lowest MTU of all external interfaces. Before, only the primary
+  interface was considered. One exception to this is in ENI mode where the secondary interfaces are not
+  considered for MTU auto-detection. MTU can still be configured manually via the ``MTU`` helm option,
+  ``--mtu`` agent flag or ``mtu`` option in CNI configuration.
+* Support for L7 protocol visibility using Pod annotations (``policy.cilium.io/proxy-visibility``),
+  deprecated since v1.15, has been removed.
+* The Cilium cluster name validation cannot be bypassed anymore, both for the local and
+  remote clusters. The cluster name is strictly enforced to consist of at most 32 lower
+  case alphanumeric characters and '-', start and end with an alphanumeric character.
+* Cilium could previously be run in a configuration where the Etcd instances
+  that distribute Cilium state between nodes would be managed in pod network by
+  Cilium itself. This support, which had been previously deprecated as complicated
+  and error prone, has now been removed. Refer to :ref:`k8s_install_etcd` for
+  alternatives for running Cilium with Etcd.
+* For IPsec, support for a single key has been removed. Per-tunnel keys will
+  now be used regardless of the presence of the ``+`` sign in the secret.
+* The option to run a synchronous probe using ``cilium-health status --probe`` is no longer supported,
+  and is now a hidden option that returns the results of the most recent cached probe. It will be 
+  removed in a future release.
+* The Cilium status API now reports the KVStore subsystem with ``Disabled`` state when disabled,
+  instead of ``OK`` state and ``Disabled`` message.
+* Support for ``metallb-bgp``, deprecated since 1.14, has been removed.
 
 Removed Options
 ~~~~~~~~~~~~~~~
 
 * The previously deprecated ``clustermesh-ip-identities-sync-timeout`` flag has
   been removed in favor of ``clustermesh-sync-timeout``.
+* The previously deprecated built-in WireGuard userspace-mode fallback (Helm ``wireguard.userspaceFallback``)
+  has been removed. Users of WireGuard transparent encryption are required to use a Linux kernel with
+  WireGuard support.
+* The previously deprecated ``metallb-bgp`` flags ``bgp-config-path``, ``bgp-announce-lb-ip``
+  and ``bgp-announce-pod-cidr`` have been removed. Users are now required to use Cilium BGP
+  control plane for BGP advertisements.
 
 Deprecated Options
 ~~~~~~~~~~~~~~~~~~
+
+* The high-scale mode for ipcache has been deprecated and will be removed in v1.18.
+* The hubble-relay flag ``--dial-timeout`` has been deprecated (now a no-op)
+  and will be removed in Cilium 1.18.
 
 Helm Options
 ~~~~~~~~~~~~
@@ -320,6 +364,18 @@ Helm Options
   ``hubble.ui.tls.client.cert``, and ``hubble.ui.tls.client.key`` have been
   deprecated in favor of the associated ``existingSecret`` options and will be
   removed in a future release.
+* The default value of ``hubble.tls.auto.certValidityDuration`` has been
+  lowered from 1095 days to 365 days because recent versions of MacOS will fail
+  to validate certificates with expirations longer than 825 days.
+* The Helm option ``hubble.relay.dialTimeout`` has been deprecated (now a no-op)
+  and will be removed in Cilium 1.18.
+* The ``metallb-bgp`` integration Helm options ``bgp.enabled``, ``bgp.announce.podCIDR``, and
+  ``bgp.announce.loadbalancerIP`` have been removed. Users are now required to use Cilium BGP
+  control plane options available under ``bgpControlPlane`` for BGP announcements.
+* The default value of ``dnsProxy.endpointMaxIpPerHostname`` and its
+  corresponding agent option has been increased from 50 to 1000 to reflect
+  improved scaling of toFQDNs policies and to better handle domains which return
+  a large number of IPs with short TTLs.
 
 Agent Options
 ~~~~~~~~~~~~~
@@ -327,15 +383,47 @@ Agent Options
 * The ``CONNTRACK_LOCAL`` option has been deprecated and will be removed in a
   future release.
 
+Bugtool Options
+~~~~~~~~~~~~~~~
+
+* The flag ``k8s-mode`` (and related flags ``cilium-agent-container-name``, ``k8s-namespace`` & ``k8s-label``)
+  have been deprecated and will be removed in a Cilium 1.18. Cilium CLI should be used to gather a sysdump from a K8s cluster.
+
 Added Metrics
 ~~~~~~~~~~~~~
+* ``cilium_node_health_connectivity_status``
+* ``cilium_node_health_connectivity_latency_seconds``
+* ``cilium_operator_unmanaged_pods``
+* ``cilium_policy_selector_match_count_max``
+* ``cilium_identity_cache_timer_duration``
+* ``cilium_identity_cache_timer_trigger_latency``
+* ``cilium_identity_cache_timer_trigger_folds``
 
 Removed Metrics
 ~~~~~~~~~~~~~~~
+* ``cilium_cidrgroup_translation_time_stats_seconds`` has been removed, as the measured code path no longer exists.
+* ``cilium_triggers_policy_update_total`` has been removed.
+* ``cilium_triggers_policy_update_folds`` has been removed.
+* ``cilium_triggers_policy_update_call_duration`` has been removed.
 
 Changed Metrics
 ~~~~~~~~~~~~~~~
 
+Deprecated Metrics
+~~~~~~~~~~~~~~~~~~
+* ``cilium_node_connectivity_status`` is now deprecated. Please use ``cilium_node_health_connectivity_status`` instead.
+* ``cilium_node_connectivity_latency_seconds`` is now deprecated. Please use ``cilium_node_health_connectivity_latency_seconds`` instead.
+
+Hubble CLI
+~~~~~~~~~~
+
+* the ``--cluster`` behavior changed to show flows emitted from nodes outside of
+  the provided cluster name (either coming from or going to the target cluster).
+  This change brings consistency between the ``--cluster`` and ``--namespace``
+  flags and removed the incompatibility between the ``--cluster`` and
+  ``--node-name`` flags. The previous behavior of ``--cluster foo`` can be
+  reproduced with ``--node-name foo/`` (shows all flows emitted from a node in
+  cluster ``foo``).
 
 Advanced
 ========
@@ -414,7 +502,7 @@ Generate the latest ConfigMap
 
     helm template cilium \
       --namespace=kube-system \
-      --set agent.enabled=false \
+      --set agent=false \
       --set config.enabled=true \
       --set operator.enabled=false \
       > cilium-configmap.yaml
@@ -532,7 +620,7 @@ The cilium preflight manifest requires etcd support and can be built with:
     helm template cilium \
       --namespace=kube-system \
       --set preflight.enabled=true \
-      --set agent.enabled=false \
+      --set agent=false \
       --set config.enabled=false \
       --set operator.enabled=false \
       --set etcd.enabled=true \

@@ -17,16 +17,18 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
+	"github.com/cilium/cilium/pkg/datapath/xdp"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/option"
 )
 
-func xdpConfigModeToFlag(xdpMode string) link.XDPAttachFlags {
+func xdpConfigModeToFlag(xdpMode xdp.Mode) link.XDPAttachFlags {
 	switch xdpMode {
-	case option.XDPModeNative, option.XDPModeLinkDriver, option.XDPModeBestEffort:
+	case xdp.ModeLinkDriver:
 		return link.XDPDriverMode
-	case option.XDPModeGeneric, option.XDPModeLinkGeneric:
+	case xdp.ModeLinkGeneric:
 		return link.XDPGenericMode
 	}
 	return 0
@@ -58,8 +60,8 @@ func xdpAttachedModeToFlag(mode uint32) link.XDPAttachFlags {
 //
 // bpffsBase is typically set to /sys/fs/bpf/cilium, but can be a temp directory
 // during tests.
-func (l *loader) maybeUnloadObsoleteXDPPrograms(xdpDevs []string, xdpMode, bpffsBase string) {
-	links, err := netlink.LinkList()
+func maybeUnloadObsoleteXDPPrograms(xdpDevs []string, xdpMode xdp.Mode, bpffsBase string) {
+	links, err := safenetlink.LinkList()
 	if err != nil {
 		log.WithError(err).Warn("Failed to list links for XDP unload")
 	}
@@ -86,7 +88,7 @@ func (l *loader) maybeUnloadObsoleteXDPPrograms(xdpDevs []string, xdpMode, bpffs
 			}
 		}
 		if !used {
-			if err := l.DetachXDP(link.Attrs().Name, bpffsBase, symbolFromHostNetdevXDP); err != nil {
+			if err := DetachXDP(link.Attrs().Name, bpffsBase, symbolFromHostNetdevXDP); err != nil {
 				log.WithError(err).Warn("Failed to detach obsolete XDP program")
 			}
 		}
@@ -95,7 +97,7 @@ func (l *loader) maybeUnloadObsoleteXDPPrograms(xdpDevs []string, xdpMode, bpffs
 
 // xdpCompileArgs derives compile arguments for bpf_xdp.c.
 func xdpCompileArgs(xdpDev string, extraCArgs []string) ([]string, error) {
-	link, err := netlink.LinkByName(xdpDev)
+	link, err := safenetlink.LinkByName(xdpDev)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +111,6 @@ func xdpCompileArgs(xdpDev string, extraCArgs []string) ([]string, error) {
 	if option.Config.EnableNodePort {
 		args = append(args, []string{
 			fmt.Sprintf("-DTHIS_MTU=%d", link.Attrs().MTU),
-			fmt.Sprintf("-DNATIVE_DEV_IFINDEX=%d", link.Attrs().Index),
 			"-DDISABLE_LOOPBACK_LB",
 		}...)
 	}
@@ -125,7 +126,7 @@ func xdpCompileArgs(xdpDev string, extraCArgs []string) ([]string, error) {
 }
 
 // compileAndLoadXDPProg compiles bpf_xdp.c for the given XDP device and loads it.
-func compileAndLoadXDPProg(ctx context.Context, xdpDev, xdpMode string, extraCArgs []string) error {
+func compileAndLoadXDPProg(ctx context.Context, xdpDev string, xdpMode xdp.Mode, extraCArgs []string) error {
 	args, err := xdpCompileArgs(xdpDev, extraCArgs)
 	if err != nil {
 		return fmt.Errorf("failed to derive XDP compile extra args: %w", err)
@@ -152,7 +153,7 @@ func compileAndLoadXDPProg(ctx context.Context, xdpDev, xdpMode string, extraCAr
 		return err
 	}
 
-	iface, err := netlink.LinkByName(xdpDev)
+	iface, err := safenetlink.LinkByName(xdpDev)
 	if err != nil {
 		return fmt.Errorf("retrieving device %s: %w", xdpDev, err)
 	}
@@ -164,6 +165,9 @@ func compileAndLoadXDPProg(ctx context.Context, xdpDev, xdpMode string, extraCAr
 
 	var obj xdpObjects
 	commit, err := bpf.LoadAndAssign(&obj, spec, &bpf.CollectionOptions{
+		Constants: map[string]uint64{
+			"interface_ifindex": uint64(iface.Attrs().Index),
+		},
 		CollectionOptions: ebpf.CollectionOptions{
 			Maps: ebpf.MapOptions{PinPath: bpf.TCGlobalsPath()},
 		},
@@ -283,8 +287,8 @@ func attachXDPProgram(iface netlink.Link, prog *ebpf.Program, progName, bpffsDir
 //
 // bpffsBase is typically /sys/fs/bpf/cilium, but can be overridden to a tempdir
 // during tests.
-func (l *loader) DetachXDP(ifaceName string, bpffsBase, progName string) error {
-	iface, err := netlink.LinkByName(ifaceName)
+func DetachXDP(ifaceName string, bpffsBase, progName string) error {
+	iface, err := safenetlink.LinkByName(ifaceName)
 	if err != nil {
 		return fmt.Errorf("getting link '%s' by name: %w", ifaceName, err)
 	}

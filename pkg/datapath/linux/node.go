@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	dpTunnel "github.com/cilium/cilium/pkg/datapath/tunnel"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
@@ -42,6 +44,7 @@ import (
 	"github.com/cilium/cilium/pkg/node/manager"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
+	ciliumslices "github.com/cilium/cilium/pkg/slices"
 	"github.com/cilium/cilium/pkg/source"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -149,7 +152,7 @@ func newNodeHandler(
 		nodeIDs:                idpool.NewIDPool(minNodeID, maxNodeID),
 		nodeIDsByIPs:           map[string]uint16{},
 		nodeIPsByIDs:           map[uint16]sets.Set[string]{},
-		ipsecMetricCollector:   ipsec.NewXFRMCollector(),
+		ipsecMetricCollector:   ipsec.NewXFRMCollector(log),
 		prefixClusterMutatorFn: func(node *nodeTypes.Node) []cmtypes.PrefixClusterOpts { return nil },
 		nodeNeighborQueue:      nbq,
 		ipsecUpdateNeeded:      map[nodeTypes.Identity]bool{},
@@ -295,7 +298,7 @@ func createDirectRouteSpec(log *slog.Logger, CIDR *cidr.CIDR, nodeIP net.IP, ski
 				"gateway", routes[0].Gw.String())
 			addRoute = false
 		} else {
-			err = fmt.Errorf("route to destination %s contains gateway %s, must be directly reachable. Add `direct-node-routes-skip-unreachable` to skip unreachable routes",
+			err = fmt.Errorf("route to destination %s contains gateway %s, must be directly reachable. Add `direct-routing-skip-unreachable` to skip unreachable routes",
 				nodeIP, routes[0].Gw.String())
 		}
 		return
@@ -318,7 +321,7 @@ func createDirectRouteSpec(log *slog.Logger, CIDR *cidr.CIDR, nodeIP net.IP, ski
 			Dst:   dst,
 		}
 
-		routes, err = netlink.RouteListFiltered(family, filter, netlink.RT_FILTER_DST|netlink.RT_FILTER_TABLE)
+		routes, err = safenetlink.RouteListFiltered(family, filter, netlink.RT_FILTER_DST|netlink.RT_FILTER_TABLE)
 		if err != nil {
 			err = fmt.Errorf("unable to find local route for destination %s: %w", nodeIP, err)
 			return
@@ -427,7 +430,7 @@ func (n *linuxNodeHandler) deleteDirectRoute(CIDR *cidr.CIDR, nodeIP net.IP) err
 		Protocol: linux_defaults.RTProto,
 	}
 
-	routes, err := netlink.RouteListFiltered(family, filter, netlink.RT_FILTER_DST|netlink.RT_FILTER_GW)
+	routes, err := safenetlink.RouteListFiltered(family, filter, netlink.RT_FILTER_DST|netlink.RT_FILTER_GW)
 	if err != nil {
 		n.log.Error("Unable to list direct routes", logfields.Error, err)
 		return fmt.Errorf("failed to list direct routes %s: %w", familyStr, err)
@@ -594,6 +597,8 @@ func (n *linuxNodeHandler) NodeUpdate(oldNode, newNode nodeTypes.Node) error {
 	return nil
 }
 
+var errNodeIPNotRoutable = errors.New("remote node IP is non-routable")
+
 func getNextHopIP(nodeIP net.IP, link netlink.Link) (nextHopIP net.IP, err error) {
 	// Figure out whether nodeIP is directly reachable (i.e. in the same L2)
 	routes, err := netlink.RouteGetWithOptions(nodeIP, &netlink.RouteGetOptions{Oif: link.Attrs().Name, FIBMatch: true})
@@ -601,7 +606,7 @@ func getNextHopIP(nodeIP net.IP, link netlink.Link) (nextHopIP net.IP, err error
 		return nil, fmt.Errorf("failed to retrieve route for remote node IP: %w", err)
 	}
 	if len(routes) == 0 {
-		return nil, fmt.Errorf("remote node IP is non-routable")
+		return nil, errNodeIPNotRoutable
 	}
 
 	nextHopIP = nodeIP
@@ -643,17 +648,7 @@ type NextHop struct {
 	IsNew bool
 }
 
-func (n *linuxNodeHandler) insertNeighborCommon(ctx context.Context, nextHop NextHop, link netlink.Link, refresh bool) error {
-	if refresh {
-		if lastPing, found := n.neighLastPingByNextHop[nextHop.Name]; found &&
-			time.Since(lastPing) < option.Config.ARPPingRefreshPeriod {
-			// Last ping was issued less than option.Config.ARPPingRefreshPeriod
-			// ago, so skip it (e.g. to avoid ddos'ing the same GW if nodes are
-			// L3 connected)
-			return nil
-		}
-	}
-
+func (n *linuxNodeHandler) insertNeighborCommon(ctx context.Context, nextHop NextHop, link netlink.Link) error {
 	// Don't proceed if the refresh controller cancelled the context
 	select {
 	case <-ctx.Done():
@@ -720,7 +715,7 @@ func (n *linuxNodeHandler) insertNeighborCommon(ctx context.Context, nextHop Nex
 	return errs
 }
 
-func (n *linuxNodeHandler) insertNeighbor4(ctx context.Context, newNode *nodeTypes.Node, link netlink.Link, refresh bool) error {
+func (n *linuxNodeHandler) insertNeighbor4(ctx context.Context, newNode *nodeTypes.Node, link netlink.Link) error {
 	newNodeIP := newNode.GetNodeIP(false)
 	nextHopIPv4 := make(net.IP, len(newNodeIP))
 	copy(nextHopIPv4, newNodeIP)
@@ -788,14 +783,14 @@ func (n *linuxNodeHandler) insertNeighbor4(ctx context.Context, newNode *nodeTyp
 		IsNew: nextHopIsNew,
 	}
 
-	if err := errors.Join(errs, n.insertNeighborCommon(ctx, nh, link, refresh)); err != nil {
+	if err := errors.Join(errs, n.insertNeighborCommon(ctx, nh, link)); err != nil {
 		return fmt.Errorf("insert node neighbor IPv4 for %s(%s) failed : %w", link.Attrs().Name, newNodeIP, err)
 	}
 
 	return errs
 }
 
-func (n *linuxNodeHandler) insertNeighbor6(ctx context.Context, newNode *nodeTypes.Node, link netlink.Link, refresh bool) error {
+func (n *linuxNodeHandler) insertNeighbor6(ctx context.Context, newNode *nodeTypes.Node, link netlink.Link) error {
 	newNodeIP := newNode.GetNodeIP(true)
 	nextHopIPv6 := make(net.IP, len(newNodeIP))
 	copy(nextHopIPv6, newNodeIP)
@@ -864,7 +859,7 @@ func (n *linuxNodeHandler) insertNeighbor6(ctx context.Context, newNode *nodeTyp
 		IsNew: nextHopIsNew,
 	}
 
-	if err := errors.Join(errs, n.insertNeighborCommon(ctx, nh, link, refresh)); err != nil {
+	if err := errors.Join(errs, n.insertNeighborCommon(ctx, nh, link)); err != nil {
 		scopedLog.Debug("insert node neighbor IPv6 failed", logfields.Error, err)
 		return err
 	}
@@ -876,15 +871,11 @@ func (n *linuxNodeHandler) insertNeighbor6(ctx context.Context, newNode *nodeTyp
 // "newNode" (ip route get newNodeIP.GetNodeIP()). The L2 addr of the nexthop is
 // determined by the Linux kernel's neighboring subsystem. The related iface for
 // the neighbor is specified by n.neighDiscoveryLink.
-//
-// The given "refresh" param denotes whether the method is called by a controller
-// which tries to update neighbor entries previously inserted by insertNeighbor().
-// In this case the kernel refreshes the entry via NTF_USE.
-func (n *linuxNodeHandler) insertNeighbor(ctx context.Context, newNode *nodeTypes.Node, refresh bool) error {
+func (n *linuxNodeHandler) insertNeighbor(ctx context.Context, newNode *nodeTypes.Node) error {
 	var links []netlink.Link
 
 	n.neighLock.Lock()
-	if n.neighDiscoveryLinks == nil || len(n.neighDiscoveryLinks) == 0 {
+	if len(n.neighDiscoveryLinks) == 0 {
 		n.neighLock.Unlock()
 		// Nothing to do - the discovery link was not set yet
 		return nil
@@ -892,23 +883,46 @@ func (n *linuxNodeHandler) insertNeighbor(ctx context.Context, newNode *nodeType
 	links = n.neighDiscoveryLinks
 	n.neighLock.Unlock()
 
-	var errs error
+	var (
+		errV4, errV6 error
+		errs         []error
+	)
+
+	// "node IP not routable" on a subset of the discovery links should not be considered a failure.
+	// Propagate an error only if no next hop can be inserted for any links, otherwise filter away
+	// those intermediate errors.
+
+	isNotRoutableErr := func(err error) bool {
+		return errors.Is(err, errNodeIPNotRoutable)
+	}
+
 	if newNode.GetNodeIP(false).To4() != nil {
 		for _, l := range links {
-			errs = errors.Join(errs, n.insertNeighbor4(ctx, newNode, l, refresh))
+			errs = append(errs, n.insertNeighbor4(ctx, newNode, l))
 		}
-	}
-	if newNode.GetNodeIP(true).To16() != nil {
-		for _, l := range links {
-			errs = errors.Join(errs, n.insertNeighbor6(ctx, newNode, l, refresh))
+		if ciliumslices.AllMatch(errs, isNotRoutableErr) {
+			errV4 = fmt.Errorf("unable to determine next hop address for any neighbor discovery link: %w", errors.Join(errs...))
+		} else {
+			errV4 = errors.Join(slices.DeleteFunc(errs, isNotRoutableErr)...)
 		}
 	}
 
-	return errs
+	if newNode.GetNodeIP(true).To16() != nil {
+		for _, l := range links {
+			errs = append(errs, n.insertNeighbor6(ctx, newNode, l))
+		}
+		if ciliumslices.AllMatch(errs, isNotRoutableErr) {
+			errV6 = fmt.Errorf("unable to determine next hop address for any neighbor discovery link: %w", errors.Join(errs...))
+		} else {
+			errV6 = errors.Join(slices.DeleteFunc(errs, isNotRoutableErr)...)
+		}
+	}
+
+	return errors.Join(errV4, errV6)
 }
 
 func (n *linuxNodeHandler) InsertMiscNeighbor(newNode *nodeTypes.Node) {
-	n.nodeNeighborQueue.Enqueue(newNode, false)
+	n.nodeNeighborQueue.Enqueue(newNode)
 }
 
 func (n *linuxNodeHandler) deleteNeighborCommon(nextHopStr string) {
@@ -1004,7 +1018,7 @@ func (n *linuxNodeHandler) nodeUpdate(oldNode, newNode *nodeTypes.Node, firstAdd
 
 	if n.enableNeighDiscovery && !newNode.IsLocal() {
 		// If neighbor discovery is enabled, enqueue the request so we can monitor/report call health.
-		n.nodeNeighborQueue.Enqueue(newNode, false)
+		n.nodeNeighborQueue.Enqueue(newNode)
 	}
 
 	// Local node update
@@ -1248,7 +1262,7 @@ func (n *linuxNodeHandler) NodeConfigurationChanged(newConfig datapath.LocalNode
 		if n.enableNeighDiscovery {
 			neighDiscoveryLinks := make([]netlink.Link, 0, len(ifaceNames))
 			for _, ifaceName := range ifaceNames {
-				l, err := netlink.LinkByName(ifaceName)
+				l, err := safenetlink.LinkByName(ifaceName)
 				if err != nil {
 					return fmt.Errorf("cannot find link by name %s for neighbor discovery: %w",
 						ifaceName, err)
@@ -1305,12 +1319,6 @@ func (n *linuxNodeHandler) NodeConfigurationChanged(newConfig datapath.LocalNode
 		}
 		if err := ipsec.DeleteXFRM(n.log, ipsec.AllReqID); err != nil {
 			return fmt.Errorf("failed to delete xfrm policies on node configuration changed: %w", err)
-		}
-	}
-
-	if !newConfig.EnableIPSecEncryptedOverlay {
-		if err := ipsec.DeleteXFRM(n.log, ipsec.EncryptedOverlayReqID); err != nil {
-			return fmt.Errorf("failed to delete encrypt overlay xfrm policies on node configuration change: %w", err)
 		}
 	}
 
@@ -1389,9 +1397,7 @@ func (n *linuxNodeHandler) NodeNeighDiscoveryEnabled() bool {
 
 // NodeNeighborRefresh is called to refresh node neighbor table.
 // This is currently triggered by controller neighbor-table-refresh
-// When refresh is set, insertNeighbor will perform a timestamp check on
-// the last ping and potentially skip the refresh to prevent ddos on the gateway.
-func (n *linuxNodeHandler) NodeNeighborRefresh(ctx context.Context, nodeToRefresh nodeTypes.Node, refresh bool) error {
+func (n *linuxNodeHandler) NodeNeighborRefresh(ctx context.Context, nodeToRefresh nodeTypes.Node) error {
 	n.mutex.Lock()
 	if !n.isInitialized {
 		n.mutex.Unlock()
@@ -1400,13 +1406,13 @@ func (n *linuxNodeHandler) NodeNeighborRefresh(ctx context.Context, nodeToRefres
 		return nil
 	}
 	n.mutex.Unlock()
-	return n.insertNeighbor(ctx, &nodeToRefresh, refresh)
+	return n.insertNeighbor(ctx, &nodeToRefresh)
 }
 
 func (n *linuxNodeHandler) NodeCleanNeighborsLink(l netlink.Link, migrateOnly bool) bool {
 	successClean := true
 
-	neighList, err := netlink.NeighListExecute(netlink.Ndmsg{
+	neighList, err := safenetlink.NeighListExecute(netlink.Ndmsg{
 		Index: uint32(l.Attrs().Index),
 	})
 	if err != nil {
@@ -1548,7 +1554,7 @@ func (n *linuxNodeHandler) NodeCleanNeighbors(migrateOnly bool) {
 	}()
 
 	for _, linkName := range linkNames {
-		l, err := netlink.LinkByName(linkName)
+		l, err := safenetlink.LinkByName(linkName)
 		if err != nil {
 			// If the link is not found we don't need to keep retrying cleaning
 			// up the neihbor entries so we can keep successClean=true
@@ -1641,8 +1647,6 @@ func NodeEnsureLocalRoutingRule() error {
 		Table:    unix.RT_TABLE_LOCAL,
 		Priority: linux_defaults.RulePriorityLocalLookup,
 		Protocol: linux_defaults.RTProto,
-		Mark:     -1,
-		Mask:     -1,
 	}
 
 	if option.Config.EnableIPv4 {

@@ -6,6 +6,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/go-openapi/runtime/middleware"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	. "github.com/cilium/cilium/api/v1/server/restapi/daemon"
+	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
@@ -31,7 +33,7 @@ import (
 	"github.com/cilium/cilium/pkg/maps/lbmap"
 	"github.com/cilium/cilium/pkg/maps/lxcmap"
 	"github.com/cilium/cilium/pkg/maps/metricsmap"
-	"github.com/cilium/cilium/pkg/maps/ratelimitmetricsmap"
+	"github.com/cilium/cilium/pkg/maps/ratelimitmap"
 	"github.com/cilium/cilium/pkg/maps/timestamp"
 	tunnelmap "github.com/cilium/cilium/pkg/maps/tunnel"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
@@ -121,15 +123,20 @@ func (d *Daemon) getMasqueradingStatus() *models.Masquerading {
 		return s
 	}
 
+	localNode, err := d.nodeLocalStore.Get(context.TODO())
+	if err != nil {
+		return s
+	}
+
 	if option.Config.EnableIPv4 {
 		// SnatExclusionCidr is the legacy field, continue to provide
 		// it for the time being
-		s.SnatExclusionCidr = datapath.RemoteSNATDstAddrExclusionCIDRv4().String()
-		s.SnatExclusionCidrV4 = datapath.RemoteSNATDstAddrExclusionCIDRv4().String()
+		s.SnatExclusionCidr = datapath.RemoteSNATDstAddrExclusionCIDRv4(localNode).String()
+		s.SnatExclusionCidrV4 = datapath.RemoteSNATDstAddrExclusionCIDRv4(localNode).String()
 	}
 
 	if option.Config.EnableIPv6 {
-		s.SnatExclusionCidrV6 = datapath.RemoteSNATDstAddrExclusionCIDRv6().String()
+		s.SnatExclusionCidrV6 = datapath.RemoteSNATDstAddrExclusionCIDRv6(localNode).String()
 	}
 
 	if option.Config.EnableBPFMasquerade {
@@ -299,7 +306,10 @@ func (d *Daemon) getKubeProxyReplacementStatus() *models.KubeProxyReplacement {
 		features.NodePort.Algorithm = models.KubeProxyReplacementFeaturesNodePortAlgorithmRandom
 		if option.Config.NodePortAlg == option.NodePortAlgMaglev {
 			features.NodePort.Algorithm = models.KubeProxyReplacementFeaturesNodePortAlgorithmMaglev
-			features.NodePort.LutSize = int64(option.Config.MaglevTableSize)
+			features.NodePort.LutSize = int64(d.maglevConfig.MaglevTableSize)
+		}
+		if option.Config.LoadBalancerAlgorithmAnnotation {
+			features.NodePort.LutSize = int64(d.maglevConfig.MaglevTableSize)
 		}
 		if option.Config.NodePortAcceleration == option.NodePortAccelerationGeneric {
 			features.NodePort.Acceleration = models.KubeProxyReplacementFeaturesNodePortAccelerationGeneric
@@ -341,6 +351,18 @@ func (d *Daemon) getKubeProxyReplacementStatus() *models.KubeProxyReplacement {
 		}
 		features.Nat46X64.Service = svc
 	}
+	if option.Config.LoadBalancerAlgorithmAnnotation {
+		features.Annotations = append(features.Annotations, annotation.ServiceLoadBalancingAlgorithm)
+	}
+	if option.Config.LoadBalancerModeAnnotation {
+		features.Annotations = append(features.Annotations, annotation.ServiceForwardingMode)
+	}
+	features.Annotations = append(features.Annotations, annotation.ServiceNodeExposure)
+	features.Annotations = append(features.Annotations, annotation.ServiceTypeExposure)
+	if option.Config.EnableSVCSourceRangeCheck {
+		features.Annotations = append(features.Annotations, annotation.ServiceSourceRangesPolicy)
+	}
+	sort.Strings(features.Annotations)
 
 	var directRoutingDevice string
 	drd, _ := d.directRoutingDev.Get(context.TODO(), d.db.ReadTxn())
@@ -423,7 +445,7 @@ func (d *Daemon) getBPFMapStatus() *models.BPFMapStatus {
 			},
 			{
 				Name: "Ratelimit metrics",
-				Size: int64(ratelimitmetricsmap.MaxEntries),
+				Size: int64(ratelimitmap.MaxMetricsEntries),
 			},
 			{
 				Name: "NAT",
@@ -455,13 +477,14 @@ func (d *Daemon) getBPFMapStatus() *models.BPFMapStatus {
 
 func getHealthzHandler(d *Daemon, params GetHealthzParams) middleware.Responder {
 	brief := params.Brief != nil && *params.Brief
-	sr := d.getStatus(brief)
+	requireK8sConnectivity := params.RequireK8sConnectivity != nil && *params.RequireK8sConnectivity
+	sr := d.getStatus(brief, requireK8sConnectivity)
 	return NewGetHealthzOK().WithPayload(&sr)
 }
 
 // getStatus returns the daemon status. If brief is provided a minimal version
 // of the StatusResponse is provided.
-func (d *Daemon) getStatus(brief bool) models.StatusResponse {
+func (d *Daemon) getStatus(brief bool, requireK8sConnectivity bool) models.StatusResponse {
 	staleProbes := d.statusCollector.GetStaleProbes()
 	stale := make(map[string]strfmt.DateTime, len(staleProbes))
 	for probe, startTime := range staleProbes {
@@ -517,7 +540,9 @@ func (d *Daemon) getStatus(brief bool) models.StatusResponse {
 			State: models.StatusStateWarning,
 			Msg:   fmt.Sprintf("%s    %s", ciliumVer, msg),
 		}
-	case d.statusResponse.Kvstore != nil && d.statusResponse.Kvstore.State != models.StatusStateOk:
+	case d.statusResponse.Kvstore != nil &&
+		d.statusResponse.Kvstore.State != models.StatusStateOk &&
+		d.statusResponse.Kvstore.State != models.StatusStateDisabled:
 		msg := "Kvstore service is not ready: " + d.statusResponse.Kvstore.Msg
 		sr.Cilium = &models.Status{
 			State: d.statusResponse.Kvstore.State,
@@ -532,7 +557,7 @@ func (d *Daemon) getStatus(brief bool) models.StatusResponse {
 			State: d.statusResponse.ContainerRuntime.State,
 			Msg:   fmt.Sprintf("%s    %s", ciliumVer, msg),
 		}
-	case d.clientset.IsEnabled() && d.statusResponse.Kubernetes != nil && d.statusResponse.Kubernetes.State != models.StatusStateOk:
+	case d.clientset.IsEnabled() && d.statusResponse.Kubernetes != nil && d.statusResponse.Kubernetes.State != models.StatusStateOk && requireK8sConnectivity:
 		msg := "Kubernetes service is not ready: " + d.statusResponse.Kubernetes.Msg
 		sr.Cilium = &models.Status{
 			State: d.statusResponse.Kubernetes.State,
@@ -563,51 +588,39 @@ func (d *Daemon) getIdentityRange() *models.IdentityRange {
 	return s
 }
 
-func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
+func (d *Daemon) startStatusCollector(ctx context.Context, cleaner *daemonCleanup) error {
 	probes := []status.Probe{
-		{
-			Name: "check-locks",
-			Probe: func(ctx context.Context) (interface{}, error) {
-				// nothing to do any more.
-				return nil, nil
-			},
-			OnStatusUpdate: func(status status.Status) {
-				d.statusCollectMutex.Lock()
-				defer d.statusCollectMutex.Unlock()
-				// FIXME we have no field for the lock status
-			},
-		},
 		{
 			Name: "kvstore",
 			Probe: func(ctx context.Context) (interface{}, error) {
 				if option.Config.KVStore == "" {
-					return models.StatusStateDisabled, nil
+					return &models.Status{State: models.StatusStateDisabled}, nil
 				} else {
-					return kvstore.Client().Status()
+					return kvstore.Client().Status(), nil
 				}
 			},
 			OnStatusUpdate: func(status status.Status) {
-				var msg string
-				state := models.StatusStateOk
-				info, ok := status.Data.(string)
-
-				switch {
-				case ok && status.Err != nil:
-					state = models.StatusStateFailure
-					msg = fmt.Sprintf("Err: %s - %s", status.Err, info)
-				case status.Err != nil:
-					state = models.StatusStateFailure
-					msg = fmt.Sprintf("Err: %s", status.Err)
-				case ok:
-					msg = info
-				}
-
 				d.statusCollectMutex.Lock()
 				defer d.statusCollectMutex.Unlock()
 
-				d.statusResponse.Kvstore = &models.Status{
-					State: state,
-					Msg:   msg,
+				if status.Err != nil {
+					d.statusResponse.Kvstore = &models.Status{
+						State: models.StatusStateFailure,
+						Msg:   status.Err.Error(),
+					}
+					return
+				}
+
+				if kvstore, ok := status.Data.(*models.Status); ok {
+					if kvstore.State == models.StatusStateWarning && option.Config.KVstorePodNetworkSupport {
+						// Don't treat warnings as errors when the support for running
+						// etcd in pod network is enabled. This is necessary to allow
+						// Cilium turning ready even before connecting to the kvstore,
+						// and break the chicken-and-egg dependency during startup.
+						kvstore.State = models.StatusStateOk
+					}
+
+					d.statusResponse.Kvstore = kvstore
 				}
 			},
 		},
@@ -808,7 +821,7 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 		{
 			Name: "hubble",
 			Probe: func(ctx context.Context) (interface{}, error) {
-				return d.getHubbleStatus(ctx), nil
+				return d.hubble.Status(ctx), nil
 			},
 			OnStatusUpdate: func(status status.Status) {
 				d.statusCollectMutex.Lock()
@@ -934,11 +947,18 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 
 	d.statusCollector = status.NewCollector(probes, status.DefaultConfig)
 
+	// Block until all probes have been executed at least once, to make sure that
+	// the status has been fully initialized once we exit from this function.
+	if err := d.statusCollector.WaitForFirstRun(ctx); err != nil {
+		return fmt.Errorf("waiting for first run: %w", err)
+	}
+
 	// Set up a signal handler function which prints out logs related to daemon status.
 	cleaner.cleanupFuncs.Add(func() {
 		// If the KVstore state is not OK, print help for user.
 		if d.statusResponse.Kvstore != nil &&
-			d.statusResponse.Kvstore.State != models.StatusStateOk {
+			d.statusResponse.Kvstore.State != models.StatusStateOk &&
+			d.statusResponse.Kvstore.State != models.StatusStateDisabled {
 			helpMsg := "cilium-agent depends on the availability of cilium-operator/etcd-cluster. " +
 				"Check if the cilium-operator pod and etcd-cluster are running and do not have any " +
 				"warnings or error messages."
@@ -951,4 +971,6 @@ func (d *Daemon) startStatusCollector(cleaner *daemonCleanup) {
 
 		d.statusCollector.Close()
 	})
+
+	return nil
 }

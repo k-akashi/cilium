@@ -18,7 +18,7 @@ import (
 	"github.com/cilium/cilium/pkg/maps/metricsmap"
 	"github.com/cilium/cilium/pkg/maps/neighborsmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
-	"github.com/cilium/cilium/pkg/maps/ratelimitmetricsmap"
+	"github.com/cilium/cilium/pkg/maps/ratelimitmap"
 	"github.com/cilium/cilium/pkg/maps/recorder"
 	"github.com/cilium/cilium/pkg/maps/signalmap"
 	"github.com/cilium/cilium/pkg/maps/srv6map"
@@ -60,6 +60,13 @@ func CheckStructAlignments(path string) error {
 	return check.CheckStructAlignments(path, toCheckSizes, false)
 }
 
+func RegisterLbStructsToCheck(isPerSvcLb bool) {
+	registerToCheck(map[string][]any{
+		"lb4_service": {lbmap.Service4Value{}},
+		"lb6_service": {lbmap.Service6Value{}},
+	})
+}
+
 func init() {
 	registerToCheck(map[string][]any{
 		"ipv4_ct_tuple":        {ctmap.CtKey4{}, ctmap.CtKey4Global{}},
@@ -68,10 +75,8 @@ func init() {
 		"ipcache_key":          {ipcachemap.Key{}},
 		"remote_endpoint_info": {ipcachemap.RemoteEndpointInfo{}},
 		"lb4_key":              {lbmap.Service4Key{}},
-		"lb4_service":          {lbmap.Service4Value{}},
 		"lb4_backend":          {lbmap.Backend4ValueV3{}},
 		"lb6_key":              {lbmap.Service6Key{}},
-		"lb6_service":          {lbmap.Service6Value{}},
 		"lb6_backend":          {lbmap.Backend6ValueV3{}},
 		"endpoint_info":        {lxcmap.EndpointInfo{}},
 		"metrics_key":          {metricsmap.Key{}},
@@ -120,8 +125,10 @@ func init() {
 		"auth_info":               {authmap.AuthInfo{}},
 		"skip_lb4_key":            {lbmap.SkipLB4Key{}},
 		"skip_lb6_key":            {lbmap.SkipLB6Key{}},
-		"ratelimit_metrics_key":   {ratelimitmetricsmap.Key{}},
-		"ratelimit_metrics_value": {ratelimitmetricsmap.Value{}},
+		"ratelimit_key":           {ratelimitmap.Key{}},
+		"ratelimit_value":         {ratelimitmap.Value{}},
+		"ratelimit_metrics_key":   {ratelimitmap.MetricsKey{}},
+		"ratelimit_metrics_value": {ratelimitmap.MetricsValue{}},
 	})
 
 	registerToCheckSizes(map[string][]any{

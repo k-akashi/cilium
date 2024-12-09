@@ -7,39 +7,23 @@ GO_TAGS ?=
 TARGET=cilium
 INSTALL = $(QUIET)install
 BINDIR ?= /usr/local/bin
-VERSION=$(shell git describe --tags --always)
+CLI_VERSION=$(shell git describe --tags --always)
+THIS_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+CLI_MAIN_DIR?=./cmd/cilium
 STRIP_DEBUG=-w -s
 ifdef DEBUG
 	STRIP_DEBUG=
 endif
-GO_BUILD_LDFLAGS ?= $(STRIP_DEBUG) -X 'github.com/cilium/cilium/cilium-cli/defaults.CLIVersion=$(VERSION)'
+GO_BUILD_LDFLAGS ?= $(STRIP_DEBUG) \
+	-X 'github.com/cilium/cilium/cilium-cli/defaults.CLIVersion=$(CLI_VERSION)'
 
 TEST_TIMEOUT ?= 5s
-RELEASE_UID ?= $(shell id -u)
-RELEASE_GID ?= $(shell id -g)
-
-# renovate: datasource=docker depName=golang
-GO_IMAGE_VERSION = 1.22.5-alpine3.19
-GO_IMAGE_SHA = sha256:48aac60d4f50477055967586f60391fb1f3cbdc2e176e36f1f7f3fd0f5380ef7
-
-# renovate: datasource=docker depName=golangci/golangci-lint
-GOLANGCILINT_WANT_VERSION = v1.59.1
-GOLANGCILINT_IMAGE_SHA = sha256:b5f8712114561f1e2fbe74d04ed07ddfd992768705033a6251f3c7b848eac38e
-GOLANGCILINT_VERSION = $(shell golangci-lint version --format short 2>/dev/null)
 
 $(TARGET):
 	$(GO_BUILD) $(if $(GO_TAGS),-tags $(GO_TAGS)) \
 		-ldflags "$(GO_BUILD_LDFLAGS)" \
 		-o $(TARGET) \
-		./cmd/cilium
-
-release:
-	docker run \
-		--rm \
-		--workdir /cilium \
-		--volume `pwd`:/cilium docker.io/library/golang:$(GO_IMAGE_VERSION)@$(GO_IMAGE_SHA) \
-		sh -c "apk add --no-cache setpriv make git zip && \
-			/usr/bin/setpriv --reuid=$(RELEASE_UID) --regid=$(RELEASE_GID) --clear-groups make GOCACHE=/tmp/gocache local-release"
+		$(CLI_MAIN_DIR)
 
 local-release: clean
 	set -o errexit; \
@@ -63,7 +47,7 @@ local-release: clean
 			test -d release/$$OS/$$ARCH|| mkdir -p release/$$OS/$$ARCH; \
 			env GOOS=$$OS GOARCH=$$ARCH $(GO_BUILD) $(if $(GO_TAGS),-tags $(GO_TAGS)) \
 				-ldflags "$(GO_BUILD_LDFLAGS)" \
-				-o release/$$OS/$$ARCH/$(TARGET)$$EXT ./cmd/cilium; \
+				-o release/$$OS/$$ARCH/$(TARGET)$$EXT $(CLI_MAIN_DIR); \
 			if [ $$OS = "windows" ]; \
 			then \
 				zip -j release/$(TARGET)-$$OS-$$ARCH.zip release/$$OS/$$ARCH/$(TARGET)$$EXT; \
@@ -97,14 +81,6 @@ tags: $$($(GO) list ./...)
 	@ctags $<
 	cscope -R -b -q
 
-ifneq (,$(findstring $(GOLANGCILINT_WANT_VERSION:v%=%),$(GOLANGCILINT_VERSION)))
-check:
-	golangci-lint run
-else
-check:
-	docker run --rm -v `pwd`:/app -w /app docker.io/golangci/golangci-lint:$(GOLANGCILINT_WANT_VERSION) golangci-lint run
-endif
-
-.PHONY: $(TARGET) release local-release install clean test bench check clean-tags tags
+.PHONY: $(TARGET) local-release install clean test bench check clean-tags tags
 
 -include Makefile.override

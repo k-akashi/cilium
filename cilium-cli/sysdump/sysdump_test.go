@@ -16,10 +16,12 @@ import (
 	"time"
 
 	"github.com/blang/semver/v4"
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,6 +35,11 @@ import (
 	ciliumv2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/safeio"
 )
+
+type nopHooks struct{}
+
+func (h *nopHooks) AddSysdumpFlags(*pflag.FlagSet)   {}
+func (h *nopHooks) AddSysdumpTasks(*Collector) error { return nil }
 
 func TestSysdumpCollector(t *testing.T) {
 	client := fakeClient{
@@ -48,7 +55,7 @@ func TestSysdumpCollector(t *testing.T) {
 	}
 	startTime := time.Unix(946713600, 0)
 	timestamp := startTime.Format(timeFormat)
-	collector, err := NewCollector(&client, options, startTime, "cilium-cli-version")
+	collector, err := NewCollector(&client, options, &nopHooks{}, startTime)
 	assert.NoError(t, err)
 	assert.Equal(t, "my-sysdump-"+timestamp, path.Base(collector.sysdumpDir))
 	tempFile := collector.AbsoluteTempPath("my-file-<ts>")
@@ -70,7 +77,7 @@ func TestNodeList(t *testing.T) {
 			},
 		},
 	}
-	collector, err := NewCollector(&client, options, time.Now(), "cilium-cli-version")
+	collector, err := NewCollector(&client, options, &nopHooks{}, time.Now())
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"node-a", "node-b", "node-c"}, collector.NodeList)
 
@@ -78,9 +85,21 @@ func TestNodeList(t *testing.T) {
 		Writer:   io.Discard,
 		NodeList: "node-a,node-c",
 	}
-	collector, err = NewCollector(&client, options, time.Now(), "cilium-cli-version")
+	collector, err = NewCollector(&client, options, &nopHooks{}, time.Now())
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"node-a", "node-c"}, collector.NodeList)
+}
+
+type extendingHooks struct{}
+
+func (h *extendingHooks) AddSysdumpFlags(*pflag.FlagSet) {}
+func (h *extendingHooks) AddSysdumpTasks(c *Collector) error {
+	c.AddTasks([]Task{
+		{
+			Description: "extended",
+		},
+	})
+	return nil
 }
 
 func TestAddTasks(t *testing.T) {
@@ -94,12 +113,25 @@ func TestAddTasks(t *testing.T) {
 			},
 		},
 	}
-	collector, err := NewCollector(&client, options, time.Now(), "cilium-cli-version")
+	collector, err := NewCollector(&client, options, &nopHooks{}, time.Now())
 	assert.NoError(t, err)
+	assert.Empty(t, collector.additionalTasks)
 	collector.AddTasks([]Task{{}, {}, {}})
 	assert.Len(t, collector.additionalTasks, 3)
 	collector.AddTasks([]Task{{}, {}, {}})
 	assert.Len(t, collector.additionalTasks, 6)
+
+	collector, err = NewCollector(&client, options, &extendingHooks{}, time.Now())
+	assert.NoError(t, err)
+	assert.Len(t, collector.additionalTasks, 1)
+	assert.Equal(t, "extended", collector.additionalTasks[0].Description)
+	collector.AddTasks([]Task{{}, {}})
+	assert.Len(t, collector.additionalTasks, 3)
+	assert.Equal(t, "extended", collector.additionalTasks[0].Description)
+	collector.AddTasks([]Task{{}, {}, {}})
+	assert.Len(t, collector.additionalTasks, 6)
+	assert.Equal(t, "extended", collector.additionalTasks[0].Description)
+
 }
 
 func TestExtractGopsPID(t *testing.T) {
@@ -175,7 +207,7 @@ func TestKVStoreTask(t *testing.T) {
 		OutputFileName: "my-sysdump-<ts>",
 		Writer:         io.Discard,
 	}
-	collector, err := NewCollector(client, options, time.Now(), "cilium-cli-version")
+	collector, err := NewCollector(client, options, &nopHooks{}, time.Now())
 	assert.NoError(err)
 	collector.submitKVStoreTasks(context.Background(), &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -227,6 +259,26 @@ type fakeClient struct {
 }
 
 func (c *fakeClient) ListCiliumBGPPeeringPolicies(_ context.Context, _ metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPPeeringPolicyList, error) {
+	panic("implement me")
+}
+
+func (c *fakeClient) ListCiliumBGPClusterConfigs(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPClusterConfigList, error) {
+	panic("implement me")
+}
+
+func (c *fakeClient) ListCiliumBGPPeerConfigs(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPPeerConfigList, error) {
+	panic("implement me")
+}
+
+func (c *fakeClient) ListCiliumBGPAdvertisements(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPAdvertisementList, error) {
+	panic("implement me")
+}
+
+func (c *fakeClient) ListCiliumBGPNodeConfigs(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPNodeConfigList, error) {
+	panic("implement me")
+}
+
+func (c *fakeClient) ListCiliumBGPNodeConfigOverrides(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumBGPNodeConfigOverrideList, error) {
 	panic("implement me")
 }
 
@@ -464,6 +516,10 @@ func (c *fakeClient) ListNamespaces(_ context.Context, _ metav1.ListOptions) (*c
 }
 
 func (c *fakeClient) ListEndpoints(_ context.Context, _ metav1.ListOptions) (*corev1.EndpointsList, error) {
+	panic("implement me")
+}
+
+func (c *fakeClient) ListEndpointSlices(_ context.Context, _ metav1.ListOptions) (*discoveryv1.EndpointSliceList, error) {
 	panic("implement me")
 }
 

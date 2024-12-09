@@ -9,11 +9,11 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/cilium/cilium/pkg/container/cache"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
@@ -105,6 +105,11 @@ var (
 	// on IDNameKubeAPIServer.
 	LabelKubeAPIServer = Labels{IDNameKubeAPIServer: NewLabel(IDNameKubeAPIServer, "", LabelSourceReserved)}
 
+	LabelKubeAPIServerExt = Labels{
+		IDNameKubeAPIServer: NewLabel(IDNameKubeAPIServer, "", LabelSourceReserved),
+		IDNameWorld:         NewLabel(IDNameWorld, "", LabelSourceReserved),
+	}
+
 	// LabelIngress is the label used for Ingress proxies. See comment
 	// on IDNameIngress.
 	LabelIngress = Labels{IDNameIngress: NewLabel(IDNameIngress, "", LabelSourceReserved)}
@@ -141,6 +146,12 @@ const (
 
 	// LabelSourceCIDR is the label source for generated CIDRs.
 	LabelSourceCIDR = "cidr"
+
+	// LabelSourceCIDRGroup is the label source used for labels from CIDRGroups
+	LabelSourceCIDRGroup = "cidrgroup"
+
+	// LabelSourceCIDRGroupKeyPrefix is the source as a k8s selector key prefix
+	LabelSourceCIDRGroupKeyPrefix = LabelSourceCIDRGroup + "."
 
 	// LabelSourceNode is the label source for remote-nodes.
 	LabelSourceNode = "node"
@@ -244,7 +255,7 @@ func (l Labels) GetPrintableModel() (res []string) {
 		}
 	}
 
-	sort.Strings(res)
+	slices.Sort(res)
 	return res
 }
 
@@ -281,6 +292,17 @@ func (l Labels) GetFromSource(source string) Labels {
 	return lbls
 }
 
+// RemoveFromSource removes all labels that are from the given source
+func (l Labels) RemoveFromSource(source string) Labels {
+	lbls := Labels{}
+	for k, v := range l {
+		if v.Source != source {
+			lbls[k] = v
+		}
+	}
+	return lbls
+}
+
 // NewLabel returns a new label from the given key, value and source. If source is empty,
 // the default value will be LabelSourceUnspec. If key starts with '$', the source
 // will be overwritten with LabelSourceReserved. If key contains ':', the value
@@ -302,9 +324,9 @@ func NewLabel(key string, value string, source string) Label {
 	}
 
 	l := Label{
-		Key:    key,
-		Value:  value,
-		Source: source,
+		Key:    cache.Strings.Get(key),
+		Value:  cache.Strings.Get(value),
+		Source: cache.Strings.Get(source),
 	}
 	if l.Source == LabelSourceCIDR {
 		c, err := LabelToPrefix(l.Key)

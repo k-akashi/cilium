@@ -20,6 +20,7 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/statedb"
 	"github.com/sirupsen/logrus"
+	"go4.org/netipx"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -40,7 +41,6 @@ import (
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -252,11 +252,13 @@ func (k *K8sPodWatcher) podsInit(asyncControllers *sync.WaitGroup) {
 		return cancel
 	}
 
-	// We will watch for pods on th entire cluster to keep existing
+	// We will watch for pods on the entire cluster to keep existing
 	// functionality untouched. If we are running with CiliumEndpoint CRD
 	// enabled then it means that we can simply watch for pods that are created
-	// for this node.
-	if !option.Config.DisableCiliumEndpointCRD {
+	// for this node. Similarly, we don't need to watch for all pods when the
+	// support for running the Cilium KVstore in pod network is disabled, as in
+	// that case we just rely on the KVStore data from the beginning.
+	if !option.Config.DisableCiliumEndpointCRD || option.Config.KVstoreEnabledWithoutPodNetworkSupport() {
 		watchNodePods()
 		return
 	}
@@ -418,10 +420,10 @@ func (k *K8sPodWatcher) updateK8sPodV1(oldK8sPod, newK8sPod *slim_corev1.Pod) er
 	// Check annotation updates.
 	oldAnno := oldK8sPod.ObjectMeta.Annotations
 	newAnno := newK8sPod.ObjectMeta.Annotations
-	annoChangedProxy := !k8s.AnnotationsEqual([]string{annotation.ProxyVisibility, annotation.ProxyVisibilityAlias}, oldAnno, newAnno)
 	annoChangedBandwidth := !k8s.AnnotationsEqual([]string{bandwidth.EgressBandwidth}, oldAnno, newAnno)
+	annoChangedPriority := !k8s.AnnotationsEqual([]string{bandwidth.Priority}, oldAnno, newAnno)
 	annoChangedNoTrack := !k8s.AnnotationsEqual([]string{annotation.NoTrack, annotation.NoTrackAlias}, oldAnno, newAnno)
-	annotationsChanged := annoChangedProxy || annoChangedBandwidth || annoChangedNoTrack
+	annotationsChanged := annoChangedBandwidth || annoChangedPriority || annoChangedNoTrack
 
 	// Check label updates too.
 	oldK8sPodLabels, _ := labelsfilter.Filter(labels.Map2Labels(oldK8sPod.ObjectMeta.Labels, labels.LabelSourceK8s))
@@ -491,34 +493,16 @@ func (k *K8sPodWatcher) updateK8sPodV1(oldK8sPod, newK8sPod *slim_corev1.Pod) er
 		}
 
 		if annotationsChanged {
-			if annoChangedProxy {
-				podEP.UpdateVisibilityPolicy(func(ns, podName string) (proxyVisibility string, err error) {
-					p, err := k.GetCachedPod(ns, podName)
-					if err != nil {
-						return "", nil
-					}
-					value, _ := annotation.Get(p, annotation.ProxyVisibility, annotation.ProxyVisibilityAlias)
-					return value, nil
-				})
-			}
 			if annoChangedBandwidth {
-				podEP.UpdateBandwidthPolicy(k.bandwidthManager, func(ns, podName string) (bandwidthEgress string, err error) {
-					p, err := k.GetCachedPod(ns, podName)
-					if err != nil {
-						return "", nil
-					}
-					return p.ObjectMeta.Annotations[bandwidth.EgressBandwidth], nil
-				})
+				podEP.UpdateBandwidthPolicy(k.bandwidthManager,
+					newK8sPod.Annotations[bandwidth.EgressBandwidth],
+					newK8sPod.Annotations[bandwidth.Priority])
 			}
 			if annoChangedNoTrack {
-				podEP.UpdateNoTrackRules(func(ns, podName string) (noTrackPort string, err error) {
-					p, err := k.GetCachedPod(ns, podName)
-					if err != nil {
-						return "", nil
-					}
-					value, _ := annotation.Get(p, annotation.NoTrack, annotation.NoTrackAlias)
-					return value, nil
-				})
+				podEP.UpdateNoTrackRules(func() string {
+					value, _ := annotation.Get(newK8sPod, annotation.NoTrack, annotation.NoTrackAlias)
+					return value
+				}())
 			}
 			realizePodAnnotationUpdate(podEP)
 		}
@@ -712,10 +696,10 @@ func (k *K8sPodWatcher) genServiceMappings(pod *slim_corev1.Pod, podIPs []string
 					}
 					loopbackHostport = true
 				}
-				nodeAddrAll = []netip.Addr{ip.MustAddrFromIP(feIP)}
+				nodeAddrAll = []netip.Addr{netipx.MustFromStdIP(feIP)}
 			} else {
 				iter := k.nodeAddrs.List(k.db.ReadTxn(), datapathTables.NodeAddressNodePortIndex.Query(true))
-				for addr, _, ok := iter.Next(); ok; addr, _, ok = iter.Next() {
+				for addr := range iter {
 					nodeAddrAll = append(nodeAddrAll, addr.Addr)
 				}
 				nodeAddrAll = append(nodeAddrAll, netip.IPv4Unspecified())
@@ -923,20 +907,12 @@ func (k *K8sPodWatcher) updatePodHostData(oldPod, newPod *slim_corev1.Pod, oldPo
 
 		// This happens at most once due to k8sMeta being the same for all podIPs in this loop
 		if namedPortsChanged {
-			k.policyManager.TriggerPolicyUpdates(true, "Named ports added or updated")
+			k.policyManager.TriggerPolicyUpdates("Named ports added or updated")
 		}
 	}()
 
 	specEqual := oldPod != nil && newPod.Spec.DeepEqual(&oldPod.Spec)
 	hostIPEqual := oldPod != nil && newPod.Status.HostIP != oldPod.Status.HostIP
-
-	// only upsert HostPort Mapping if spec or ip slice is different
-	if !specEqual || !ipSliceEqual {
-		err := k.upsertHostPortMapping(oldPod, newPod, oldPodIPs, newPodIPs)
-		if err != nil {
-			return fmt.Errorf("cannot upsert hostPort for PodIPs: %s", newPodIPs)
-		}
-	}
 
 	// is spec and hostIPs are the same there no need to perform the remaining
 	// operations
@@ -971,7 +947,7 @@ func (k *K8sPodWatcher) updatePodHostData(oldPod, newPod *slim_corev1.Pod, oldPo
 			}
 			k8sMeta.NamedPorts[port.Name] = ciliumTypes.PortProto{
 				Port:  uint16(port.ContainerPort),
-				Proto: uint8(p),
+				Proto: p,
 			}
 		}
 	}
@@ -1012,6 +988,17 @@ func (k *K8sPodWatcher) updatePodHostData(oldPod, newPod *slim_corev1.Pod, oldPo
 	}
 	if len(errs) != 0 {
 		return errors.New(strings.Join(errs, ", "))
+	}
+
+	nodeNameEqual := newPod.Spec.NodeName == nodeTypes.GetName()
+
+	// only upsert HostPort Mapping if the pod is on the local node
+	// and spec or ip slice is different
+	if nodeNameEqual && (!specEqual || !ipSliceEqual) {
+		err := k.upsertHostPortMapping(oldPod, newPod, oldPodIPs, newPodIPs)
+		if err != nil {
+			return fmt.Errorf("cannot upsert hostPort for PodIPs: %s", newPodIPs)
+		}
 	}
 
 	return nil

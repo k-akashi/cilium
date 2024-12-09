@@ -4,6 +4,7 @@
 package defaults
 
 import (
+	"crypto/sha256"
 	"time"
 )
 
@@ -36,23 +37,26 @@ const (
 
 	HubbleGenerateCertsCronJobName = "hubble-generate-certs"
 
-	ClusterMeshDeploymentName             = "clustermesh-apiserver"
-	ClusterMeshBinaryName                 = "/usr/bin/clustermesh-apiserver"
-	ClusterMeshContainerName              = "apiserver"
-	ClusterMeshPodSelector                = "k8s-app=clustermesh-apiserver"
-	ClusterMeshMetricsPortName            = "apiserv-metrics"
-	ClusterMeshKVStoreMeshContainerName   = "kvstoremesh"
-	ClusterMeshKVStoreMeshMetricsPortName = "kvmesh-metrics"
-	ClusterMeshEtcdContainerName          = "etcd"
-	ClusterMeshEtcdMetricsPortName        = "etcd-metrics"
-	ClusterMeshServiceName                = "clustermesh-apiserver"
-	ClusterMeshSecretName                 = "cilium-clustermesh" // Secret which contains the clustermesh configuration
-	ClusterMeshKVStoreMeshSecretName      = "cilium-kvstoremesh" // Secret which contains the kvstoremesh configuration
-	ClusterMeshServerSecretName           = "clustermesh-apiserver-server-cert"
-	ClusterMeshAdminSecretName            = "clustermesh-apiserver-admin-cert"
-	ClusterMeshClientSecretName           = "clustermesh-apiserver-client-cert"
-	ClusterMeshRemoteSecretName           = "clustermesh-apiserver-remote-cert"
-	ClusterMeshExternalWorkloadSecretName = "clustermesh-apiserver-external-workload-cert"
+	ClusterMeshDeploymentName              = "clustermesh-apiserver"
+	ClusterMeshBinaryName                  = "/usr/bin/clustermesh-apiserver"
+	ClusterMeshContainerName               = "apiserver"
+	ClusterMeshPodSelector                 = "k8s-app=clustermesh-apiserver"
+	ClusterMeshMetricsPortName             = "apiserv-metrics"
+	ClusterMeshKVStoreMeshContainerName    = "kvstoremesh"
+	ClusterMeshKVStoreMeshMetricsPortName  = "kvmesh-metrics"
+	ClusterMeshEtcdContainerName           = "etcd"
+	ClusterMeshEtcdMetricsPortName         = "etcd-metrics"
+	ClusterMeshServiceName                 = "clustermesh-apiserver"
+	ClusterMeshSecretName                  = "cilium-clustermesh" // Secret which contains the clustermesh configuration
+	ClusterMeshKVStoreMeshSecretName       = "cilium-kvstoremesh" // Secret which contains the kvstoremesh configuration
+	ClusterMeshServerSecretName            = "clustermesh-apiserver-server-cert"
+	ClusterMeshAdminSecretName             = "clustermesh-apiserver-admin-cert"
+	ClusterMeshClientSecretName            = "clustermesh-apiserver-client-cert"
+	ClusterMeshRemoteSecretName            = "clustermesh-apiserver-remote-cert"
+	ClusterMeshExternalWorkloadSecretName  = "clustermesh-apiserver-external-workload-cert"
+	ClusterMeshConnectionModeBidirectional = "bidirectional"
+	ClusterMeshConnectionModeMesh          = "mesh"
+	ClusterMeshConnectionModeUnicast       = "unicast"
 
 	SPIREServerStatefulSetName = "spire-server"
 	SPIREServerConfigMapName   = "spire-server"
@@ -68,11 +72,13 @@ const (
 	// renovate: datasource=docker
 	ConnectivityCheckJSONMockImage = "quay.io/cilium/json-mock:v1.3.8@sha256:5aad04835eda9025fe4561ad31be77fd55309af8158ca8663a72f6abb78c2603"
 	// renovate: datasource=docker
-	ConnectivityDNSTestServerImage = "docker.io/coredns/coredns:1.11.3@sha256:9caabbf6238b189a65d0d6e6ac138de60d6a1c419e5a341fbbb7c78382559c6e"
+	ConnectivityDNSTestServerImage = "docker.io/coredns/coredns:1.12.0@sha256:40384aa1f5ea6bfdc77997d243aec73da05f27aed0c5e9d65bfa98933c519d97"
 	// renovate: datasource=docker
 	ConnectivityTestConnDisruptImage = "quay.io/cilium/test-connection-disruption:v0.0.14@sha256:c3fd56e326ae16f6cb63dbb2e26b4e47ec07a123040623e11399a7fe1196baa0"
 	// renovate: datasource=docker
-	ConnectivityTestFRRImage = "quay.io/frrouting/frr:10.0.1@sha256:83e2ff39e9c033c086e02e1cfd32ff188837a666876212f2a875bd85a79afb7c"
+	ConnectivityTestFRRImage = "quay.io/frrouting/frr:10.2.0@sha256:68733b8504b30d2a8565e43038f1313a500f2d9d58251882915eff0fbbd85e59"
+	// renovate: datasource=docker
+	ConnectivityTestSocatImage = "docker.io/alpine/socat:1.8.0.0@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8"
 
 	ConfigMapName = "cilium-config"
 
@@ -84,10 +90,12 @@ const (
 	FlowWaitTimeout   = 10 * time.Second
 	FlowRetryInterval = 500 * time.Millisecond
 
-	PolicyWaitTimeout = 15 * time.Second
+	PolicyWaitTimeout = 30 * time.Second
 
 	ConnectRetry      = 3
 	ConnectRetryDelay = 3 * time.Second
+
+	CurlParallel = 0
 
 	ConnectTimeout = 2 * time.Second
 	RequestTimeout = 10 * time.Second
@@ -106,14 +114,16 @@ const (
 
 	// Default timeout for Connectivity Test Suite (disabled by default)
 	ConnectivityTestSuiteTimeout = 0 * time.Minute
+
+	LogLevelError   = "error"
+	LogLevelWarning = "warning"
 )
 
 var (
-	// renovate: datasource=github-releases depName=cilium/cilium
-	Version = "v1.16.0"
-
 	// HelmRepository specifies Helm repository to download Cilium charts from.
-	HelmRepository = "https://helm.cilium.io"
+	HelmRepoIDLen    = 4
+	HelmRepository   = "https://helm.cilium.io"
+	HelmRepositoryID = sha256.Sum256([]byte(HelmRepository))
 
 	// CiliumScheduleAffinity is the node affinity to prevent Cilium from being schedule on
 	// nodes labeled with CiliumNoScheduleLabel.
@@ -150,16 +160,21 @@ var (
 		"Unsupported protocol for NAT masquerade",
 		"Invalid source ip",
 		"Unknown L3 target address",
-		"No tunnel/encapsulation endpoint (datapath BUG!)",
 		"Host datapath not ready",
 		"Unknown ICMPv4 code",
 		"Forbidden ICMPv6 message",
+		"No egress gateway found",
 	}
 
 	ExpectedXFRMErrors = []string{
 		"inbound_forward_header", // XfrmFwdHdrError
 		"inbound_other",          // XfrmInError
 		"inbound_state_invalid",  // XfrmInStateInvalid
+	}
+
+	LogCheckLevels = []string{
+		LogLevelError,
+		LogLevelWarning,
 	}
 
 	// The following variables are set at compile time via LDFLAGS.

@@ -150,9 +150,9 @@ func NewService6Key(ip net.IP, port uint16, proto u8proto.U8proto, scope uint8, 
 func (k *Service6Key) String() string {
 	kHost := k.ToHost().(*Service6Key)
 	if kHost.Scope == loadbalancer.ScopeInternal {
-		return fmt.Sprintf("[%s]:%d/i (%d)", kHost.Address, kHost.Port, kHost.BackendSlot)
+		return fmt.Sprintf("[%s]:%d/%s/i (%d)", kHost.Address, kHost.Port, u8proto.U8proto(kHost.Proto).String(), kHost.BackendSlot)
 	} else {
-		return fmt.Sprintf("[%s]:%d (%d)", kHost.Address, kHost.Port, kHost.BackendSlot)
+		return fmt.Sprintf("[%s]:%d/%s (%d)", kHost.Address, kHost.Port, u8proto.U8proto(kHost.Proto).String(), kHost.BackendSlot)
 	}
 }
 
@@ -167,6 +167,7 @@ func (k *Service6Key) SetScope(scope uint8)    { k.Scope = scope }
 func (k *Service6Key) GetScope() uint8         { return k.Scope }
 func (k *Service6Key) GetAddress() net.IP      { return k.Address.IP() }
 func (k *Service6Key) GetPort() uint16         { return k.Port }
+func (k *Service6Key) GetProtocol() uint8      { return k.Proto }
 func (k *Service6Key) MapDelete() error        { return k.Map().Delete(k.ToNetwork()) }
 
 func (k *Service6Key) RevNatValue() RevNatValue {
@@ -218,13 +219,21 @@ func (s *Service6Value) SetFlags(flags uint16) {
 	s.Flags2 = uint8(flags >> 8)
 }
 
+func (s *Service6Value) GetLbAlg() uint8 {
+	return uint8(uint32(s.BackendID) >> 24)
+}
+
+func (s *Service6Value) SetLbAlg(lb uint8) {
+	s.BackendID = uint32(lb) << 24
+}
+
 func (s *Service6Value) GetFlags() uint16 {
 	return (uint16(s.Flags2) << 8) | uint16(s.Flags)
 }
 
 func (s *Service6Value) SetSessionAffinityTimeoutSec(t uint32) {
 	// See (* Service4Value).SetSessionAffinityTimeoutSec() for comment
-	s.BackendID = t
+	s.BackendID |= t
 }
 
 func (s *Service6Value) SetL7LBProxyPort(port uint16) {
@@ -236,6 +245,7 @@ func (s *Service6Value) SetL7LBProxyPort(port uint16) {
 func (s *Service6Value) SetBackendID(id loadbalancer.BackendID) {
 	s.BackendID = uint32(id)
 }
+
 func (s *Service6Value) GetBackendID() loadbalancer.BackendID {
 	return loadbalancer.BackendID(s.BackendID)
 }
@@ -312,9 +322,10 @@ func (b *Backend6Value) GetAddress() net.IP { return b.Address.IP() }
 func (b *Backend6Value) GetIPCluster() cmtypes.AddrCluster {
 	return cmtypes.AddrClusterFrom(b.Address.Addr(), 0)
 }
-func (b *Backend6Value) GetPort() uint16 { return b.Port }
-func (b *Backend6Value) GetFlags() uint8 { return b.Flags }
-func (b *Backend6Value) GetZone() uint8  { return 0 }
+func (b *Backend6Value) GetPort() uint16    { return b.Port }
+func (b *Backend6Value) GetProtocol() uint8 { return uint8(b.Proto) }
+func (b *Backend6Value) GetFlags() uint8    { return b.Flags }
+func (b *Backend6Value) GetZone() uint8     { return 0 }
 
 func (v *Backend6Value) ToNetwork() BackendValue {
 	n := *v
@@ -380,9 +391,10 @@ func (b *Backend6ValueV3) GetAddress() net.IP { return b.Address.IP() }
 func (b *Backend6ValueV3) GetIPCluster() cmtypes.AddrCluster {
 	return cmtypes.AddrClusterFrom(b.Address.Addr(), uint32(b.ClusterID))
 }
-func (b *Backend6ValueV3) GetPort() uint16 { return b.Port }
-func (b *Backend6ValueV3) GetFlags() uint8 { return b.Flags }
-func (b *Backend6ValueV3) GetZone() uint8  { return b.Zone }
+func (b *Backend6ValueV3) GetPort() uint16    { return b.Port }
+func (b *Backend6ValueV3) GetProtocol() uint8 { return uint8(b.Proto) }
+func (b *Backend6ValueV3) GetFlags() uint8    { return b.Flags }
+func (b *Backend6ValueV3) GetZone() uint8     { return b.Zone }
 
 func (v *Backend6ValueV3) ToNetwork() BackendValue {
 	n := *v
@@ -464,9 +476,9 @@ const SizeofSockRevNat6Key = int(unsafe.Sizeof(SockRevNat6Key{}))
 
 // SockRevNat6Value is an entry in the reverse NAT sock map.
 type SockRevNat6Value struct {
-	address     types.IPv6 `align:"address"`
-	port        int16      `align:"port"`
-	revNatIndex uint16     `align:"rev_nat_index"`
+	Address     types.IPv6 `align:"address"`
+	Port        int16      `align:"port"`
+	RevNatIndex uint16     `align:"rev_nat_index"`
 }
 
 // SizeofSockRevNat6Value is the size of type SockRevNat6Value.
@@ -494,7 +506,7 @@ func (k *SockRevNat6Key) New() bpf.MapKey { return &SockRevNat6Key{} }
 
 // String converts the value into a human readable string format.
 func (v *SockRevNat6Value) String() string {
-	return fmt.Sprintf("[%s]:%d, %d", v.address, v.port, v.revNatIndex)
+	return fmt.Sprintf("[%s]:%d, %d", v.Address, v.Port, v.RevNatIndex)
 }
 
 func (v *SockRevNat6Value) New() bpf.MapValue { return &SockRevNat6Value{} }

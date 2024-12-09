@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 
 	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
 
 	"github.com/cilium/cilium/pkg/act"
 	"github.com/cilium/cilium/pkg/datapath/agentliveness"
@@ -33,7 +35,9 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/datapath/xdp"
 	"github.com/cilium/cilium/pkg/loadbalancer/experimental"
+	"github.com/cilium/cilium/pkg/maglev"
 	"github.com/cilium/cilium/pkg/maps"
 	"github.com/cilium/cilium/pkg/maps/eventsmap"
 	"github.com/cilium/cilium/pkg/maps/lbmap"
@@ -79,14 +83,14 @@ var Cell = cell.Module(
 
 	cell.Provide(newWireguardAgent),
 
-	cell.Provide(func(expConfig experimental.Config) types.LBMap {
+	cell.Provide(func(expConfig experimental.Config, maglev *maglev.Maglev) types.LBMap {
 		if expConfig.EnableExperimentalLB {
 			// The experimental control-plane is enabled. Use a fake LBMap
 			// to effectively disable the other code paths writing to LBMaps.
 			return mockmaps.NewLBMockMap()
 		}
 
-		return lbmap.New()
+		return lbmap.New(maglev)
 	}),
 
 	// Provides the Table[NodeAddress] and the controller that populates it from Table[*Device]
@@ -141,6 +145,9 @@ var Cell = cell.Module(
 	// Provides prefilter, a means of configuring XDP pre-filters for DDoS-mitigation.
 	prefilter.Cell,
 
+	// XDP cell provides modularized XDP enablement.
+	xdp.Cell,
+
 	// Provides node handler, which handles node events.
 	cell.Provide(linuxdatapath.NewNodeHandler),
 	cell.Provide(node.NewNodeIDApiHandler),
@@ -151,7 +158,7 @@ var Cell = cell.Module(
 	act.Cell,
 )
 
-func newWireguardAgent(lc cell.Lifecycle, sysctl sysctl.Sysctl) *wg.Agent {
+func newWireguardAgent(lc cell.Lifecycle, sysctl sysctl.Sysctl, health cell.Health, registry job.Registry, db *statedb.DB, mtuTable statedb.Table[mtu.RouteMTU]) *wg.Agent {
 	var wgAgent *wg.Agent
 	if option.Config.EnableWireguard {
 		if option.Config.EnableIPSec {
@@ -159,19 +166,17 @@ func newWireguardAgent(lc cell.Lifecycle, sysctl sysctl.Sysctl) *wg.Agent {
 				option.EnableWireguard, option.EnableIPSecName)
 		}
 
+		jobGroup := registry.NewGroup(health)
+		lc.Append(jobGroup)
+
 		var err error
 		privateKeyPath := filepath.Join(option.Config.StateDir, wgTypes.PrivKeyFilename)
-		wgAgent, err = wg.NewAgent(privateKeyPath, sysctl)
+		wgAgent, err = wg.NewAgent(privateKeyPath, sysctl, jobGroup, db, mtuTable)
 		if err != nil {
 			log.Fatalf("failed to initialize WireGuard: %s", err)
 		}
 
-		lc.Append(cell.Hook{
-			OnStop: func(cell.HookContext) error {
-				wgAgent.Close()
-				return nil
-			},
-		})
+		lc.Append(wgAgent)
 	} else {
 		// Delete WireGuard device from previous run (if such exists)
 		link.DeleteByName(wgTypes.IfaceName)

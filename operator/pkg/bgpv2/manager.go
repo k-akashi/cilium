@@ -6,10 +6,12 @@ package bgpv2
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/job"
-	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -17,21 +19,12 @@ import (
 	k8s_client "github.com/cilium/cilium/pkg/k8s/client"
 	cilium_client_v2alpha1 "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/typed/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/k8s/resource"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 )
 
 var (
-	// retry options used in reconcileWithRetry method.
-	// steps will repeat for ~8.5 minutes.
-	bo = wait.Backoff{
-		Duration: 1 * time.Second,
-		Factor:   2,
-		Jitter:   0,
-		Steps:    10,
-		Cap:      0,
-	}
-
 	// maxErrorLen is the maximum length of error message to be logged.
 	maxErrorLen = 140
 )
@@ -39,7 +32,7 @@ var (
 type BGPParams struct {
 	cell.In
 
-	Logger       logrus.FieldLogger
+	Logger       *slog.Logger
 	LC           cell.Lifecycle
 	Clientset    k8s_client.Clientset
 	DaemonConfig *option.DaemonConfig
@@ -50,11 +43,12 @@ type BGPParams struct {
 	ClusterConfigResource      resource.Resource[*cilium_api_v2alpha1.CiliumBGPClusterConfig]
 	NodeConfigOverrideResource resource.Resource[*cilium_api_v2alpha1.CiliumBGPNodeConfigOverride]
 	NodeConfigResource         resource.Resource[*cilium_api_v2alpha1.CiliumBGPNodeConfig]
+	PeerConfigResource         resource.Resource[*cilium_api_v2alpha1.CiliumBGPPeerConfig]
 	NodeResource               resource.Resource[*cilium_api_v2.CiliumNode]
 }
 
 type BGPResourceManager struct {
-	logger    logrus.FieldLogger
+	logger    *slog.Logger
 	clientset k8s_client.Clientset
 	lc        cell.Lifecycle
 	jobs      job.Group
@@ -65,15 +59,20 @@ type BGPResourceManager struct {
 	nodeConfigOverride      resource.Resource[*cilium_api_v2alpha1.CiliumBGPNodeConfigOverride]
 	nodeConfig              resource.Resource[*cilium_api_v2alpha1.CiliumBGPNodeConfig]
 	ciliumNode              resource.Resource[*cilium_api_v2.CiliumNode]
+	peerConfig              resource.Resource[*cilium_api_v2alpha1.CiliumBGPPeerConfig]
 	clusterConfigStore      resource.Store[*cilium_api_v2alpha1.CiliumBGPClusterConfig]
 	nodeConfigOverrideStore resource.Store[*cilium_api_v2alpha1.CiliumBGPNodeConfigOverride]
 	nodeConfigStore         resource.Store[*cilium_api_v2alpha1.CiliumBGPNodeConfig]
+	peerConfigStore         resource.Store[*cilium_api_v2alpha1.CiliumBGPPeerConfig]
 	ciliumNodeStore         resource.Store[*cilium_api_v2.CiliumNode]
 	nodeConfigClient        cilium_client_v2alpha1.CiliumBGPNodeConfigInterface
 
 	// internal state
 	reconcileCh      chan struct{}
 	bgpClusterSyncCh chan struct{}
+
+	// enable/disable status reporting
+	enableStatusReporting bool
 }
 
 // registerBGPResourceManager creates a new BGPResourceManager operator instance.
@@ -95,7 +94,10 @@ func registerBGPResourceManager(p BGPParams) *BGPResourceManager {
 		clusterConfig:      p.ClusterConfigResource,
 		nodeConfigOverride: p.NodeConfigOverrideResource,
 		nodeConfig:         p.NodeConfigResource,
+		peerConfig:         p.PeerConfigResource,
 		ciliumNode:         p.NodeResource,
+
+		enableStatusReporting: p.DaemonConfig.EnableBGPControlPlaneStatusReport,
 	}
 
 	b.nodeConfigClient = b.clientset.CiliumV2alpha1().CiliumBGPNodeConfigs()
@@ -135,8 +137,24 @@ func (b *BGPResourceManager) initializeJobs() {
 			return nil
 		}),
 
+		job.OneShot("bgpv2-operator-node-config-tracker", func(ctx context.Context, health cell.Health) error {
+			for e := range b.nodeConfig.Events(ctx) {
+				b.triggerReconcile()
+				e.Done(nil)
+			}
+			return nil
+		}),
+
 		job.OneShot("bgpv2-operator-node-config-override-tracker", func(ctx context.Context, health cell.Health) error {
 			for e := range b.nodeConfigOverride.Events(ctx) {
+				b.triggerReconcile()
+				e.Done(nil)
+			}
+			return nil
+		}),
+
+		job.OneShot("bgpv2-operator-peer-config-tracker", func(ctx context.Context, health cell.Health) error {
+			for e := range b.peerConfig.Events(ctx) {
 				b.triggerReconcile()
 				e.Done(nil)
 			}
@@ -165,6 +183,11 @@ func (b *BGPResourceManager) initializeStores(ctx context.Context) (err error) {
 	}
 
 	b.nodeConfigStore, err = b.nodeConfig.Store(ctx)
+	if err != nil {
+		return
+	}
+
+	b.peerConfigStore, err = b.peerConfig.Store(ctx)
 	if err != nil {
 		return
 	}
@@ -206,7 +229,7 @@ func (b *BGPResourceManager) Run(ctx context.Context) (err error) {
 
 			err := b.reconcileWithRetry(ctx)
 			if err != nil {
-				b.logger.WithError(err).Error("BGP reconciliation failed")
+				b.logger.Error("BGP reconciliation failed", logfields.Error, err)
 			} else {
 				b.logger.Debug("BGP reconciliation successful")
 			}
@@ -216,13 +239,30 @@ func (b *BGPResourceManager) Run(ctx context.Context) (err error) {
 
 // reconcileWithRetry retries reconcile with exponential backoff.
 func (b *BGPResourceManager) reconcileWithRetry(ctx context.Context) error {
+	// steps will repeat for ~8.5 minutes.
+	bo := wait.Backoff{
+		Duration: 1 * time.Second,
+		Factor:   2,
+		Jitter:   0,
+		Steps:    10,
+		Cap:      0,
+	}
+	attempt := 0
+
 	retryFn := func(ctx context.Context) (bool, error) {
+		attempt++
+
 		err := b.reconcile(ctx)
 
 		switch {
 		case err != nil:
 			// log error, continue retry
-			b.logger.WithError(TrimError(err, maxErrorLen)).Warn("BGP reconciliation error")
+			if isRetryableError(err) && attempt%5 != 0 {
+				// for retryable error print warning only every 5th attempt
+				b.logger.Debug("Transient BGP reconciliation error", logfields.Error, TrimError(err, maxErrorLen))
+			} else {
+				b.logger.Warn("BGP reconciliation error", logfields.Error, TrimError(err, maxErrorLen))
+			}
 			return false, nil
 		default:
 			// no error, stop retry
@@ -248,4 +288,13 @@ func TrimError(err error, maxLen int) error {
 		return fmt.Errorf("%s... ", err.Error()[:maxLen])
 	}
 	return err
+}
+
+// isRetryableError returns true if the error returned by reconcile
+// is likely transient, and will be addressed by a subsequent iteration.
+func isRetryableError(err error) bool {
+	return k8serrors.IsAlreadyExists(err) ||
+		k8serrors.IsConflict(err) ||
+		k8serrors.IsNotFound(err) ||
+		(k8serrors.IsForbidden(err) && k8serrors.HasStatusCause(err, corev1.NamespaceTerminatingCause))
 }

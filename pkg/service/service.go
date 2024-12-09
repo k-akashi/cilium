@@ -35,6 +35,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/service/healthserver"
 	"github.com/cilium/cilium/pkg/time"
+	"github.com/cilium/cilium/pkg/u8proto"
 )
 
 // ErrLocalRedirectServiceExists represents an error when a Local redirect
@@ -79,6 +80,7 @@ type svcInfo struct {
 	backendByHash map[string]*lb.Backend
 
 	svcType                   lb.SVCType
+	svcForwardingMode         lb.SVCForwardingMode
 	svcExtTrafficPolicy       lb.SVCTrafficPolicy
 	svcIntTrafficPolicy       lb.SVCTrafficPolicy
 	svcNatPolicy              lb.SVCNatPolicy
@@ -87,6 +89,8 @@ type svcInfo struct {
 	svcHealthCheckNodePort    uint16
 	healthcheckFrontendHash   string
 	svcName                   lb.ServiceName
+	loadBalancerAlgorithm     lb.SVCLoadBalancingAlgorithm
+	svcSourceRangesPolicy     lb.SVCSourceRangesPolicy
 	loadBalancerSourceRanges  []*cidr.CIDR
 	l7LBProxyPort             uint16 // Non-zero for egress L7 LB services
 	LoopbackHostport          bool
@@ -109,17 +113,20 @@ func (svc *svcInfo) deepCopyToLBSVC() *lb.SVC {
 		backends[i] = backend.DeepCopy()
 	}
 	return &lb.SVC{
-		Frontend:            *svc.frontend.DeepCopy(),
-		Backends:            backends,
-		Type:                svc.svcType,
-		ExtTrafficPolicy:    svc.svcExtTrafficPolicy,
-		IntTrafficPolicy:    svc.svcIntTrafficPolicy,
-		NatPolicy:           svc.svcNatPolicy,
-		HealthCheckNodePort: svc.svcHealthCheckNodePort,
-		Annotations:         svc.annotations,
-		Name:                svc.svcName,
-		L7LBProxyPort:       svc.l7LBProxyPort,
-		LoopbackHostport:    svc.LoopbackHostport,
+		Frontend:              *svc.frontend.DeepCopy(),
+		Backends:              backends,
+		Type:                  svc.svcType,
+		ForwardingMode:        svc.svcForwardingMode,
+		ExtTrafficPolicy:      svc.svcExtTrafficPolicy,
+		IntTrafficPolicy:      svc.svcIntTrafficPolicy,
+		NatPolicy:             svc.svcNatPolicy,
+		SourceRangesPolicy:    svc.svcSourceRangesPolicy,
+		HealthCheckNodePort:   svc.svcHealthCheckNodePort,
+		Annotations:           svc.annotations,
+		Name:                  svc.svcName,
+		L7LBProxyPort:         svc.l7LBProxyPort,
+		LoopbackHostport:      svc.LoopbackHostport,
+		LoadBalancerAlgorithm: svc.loadBalancerAlgorithm,
 	}
 }
 
@@ -137,6 +144,9 @@ func (svc *svcInfo) isExtLocal() bool {
 }
 
 func (svc *svcInfo) isIntLocal() bool {
+	if !option.Config.EnableInternalTrafficPolicy {
+		return false
+	}
 	switch svc.svcType {
 	case lb.SVCTypeClusterIP, lb.SVCTypeNodePort, lb.SVCTypeLoadBalancer, lb.SVCTypeExternalIPs:
 		return svc.svcIntTrafficPolicy == lb.SVCTrafficPolicyLocal
@@ -170,7 +180,14 @@ func (svc *svcInfo) filterBackends(frontend lb.L3n4AddrID) bool {
 }
 
 func (svc *svcInfo) useMaglev() bool {
-	if option.Config.NodePortAlg != option.NodePortAlgMaglev {
+	// we need to check if LoadBalancerAlgorithmAnnotation is enabled otherwise load
+	// balancer algorithm will not be populated in lb maps and this information
+	// will be lost when services are restored from maps.
+	if option.Config.LoadBalancerAlgorithmAnnotation {
+		if svc.loadBalancerAlgorithm != lb.SVCLoadBalancingAlgorithmMaglev {
+			return false
+		}
+	} else if option.Config.NodePortAlg != option.NodePortAlgMaglev {
 		return false
 	}
 	// Provision the Maglev LUT for ClusterIP only if ExternalClusterIP is
@@ -273,6 +290,7 @@ type Service struct {
 
 	healthCheckers         []HealthChecker
 	healthCheckSubscribers []HealthSubscriber
+	healthCheckChan        chan any
 
 	lbmap         datapathTypes.LBMap
 	lastUpdatedTs atomic.Value
@@ -299,6 +317,7 @@ func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, back
 		backendByHash:            map[string]*lb.Backend{},
 		monitorAgent:             monitorAgent,
 		healthServer:             localHealthServer,
+		healthCheckChan:          make(chan any),
 		lbmap:                    lbmap,
 		l7lbSvcs:                 map[lb.ServiceName]*L7LBInfo{},
 		backendConnectionHandler: backendConnectionHandler{},
@@ -309,7 +328,7 @@ func newService(monitorAgent monitorAgent.Agent, lbmap datapathTypes.LBMap, back
 	svc.lastUpdatedTs.Store(time.Now())
 
 	for _, hc := range healthCheckers {
-		hc.SetCallback(svc.HealthCheckCallback)
+		hc.SetCallback(svc.healthCheckCallback)
 	}
 
 	return svc
@@ -725,6 +744,7 @@ func (s *Service) upsertService(params *lb.SVC) (bool, lb.ID, error) {
 				logfields.Backends:  params.Backends,
 
 				logfields.ServiceType:                params.Type,
+				logfields.ServiceForwardingMode:      params.ForwardingMode,
 				logfields.ServiceExtTrafficPolicy:    params.ExtTrafficPolicy,
 				logfields.ServiceIntTrafficPolicy:    params.IntTrafficPolicy,
 				logfields.ServiceHealthCheckNodePort: params.HealthCheckNodePort,
@@ -734,7 +754,9 @@ func (s *Service) upsertService(params *lb.SVC) (bool, lb.ID, error) {
 				logfields.SessionAffinity:        params.SessionAffinity,
 				logfields.SessionAffinityTimeout: params.SessionAffinityTimeoutSec,
 
-				logfields.LoadBalancerSourceRanges: params.LoadBalancerSourceRanges,
+				logfields.LoadBalancerSourceRanges:       params.LoadBalancerSourceRanges,
+				logfields.LoadBalancerSourceRangesPolicy: params.SourceRangesPolicy,
+				logfields.LoadBalancerAlgorithm:          params.LoadBalancerAlgorithm,
 
 				logfields.L7LBProxyPort: params.L7LBProxyPort,
 			})
@@ -982,13 +1004,15 @@ func (s *Service) upsertNodePortHealthService(svc *svcInfo, nodeMeta NodeMetaCol
 	}
 	// Create a new service with the healthcheck frontend and healthcheck backend
 	healthCheckSvc := &lb.SVC{
-		Name:             healthCheckSvcName,
-		Type:             svc.svcType,
-		Frontend:         healthCheckFrontend,
-		ExtTrafficPolicy: lb.SVCTrafficPolicyLocal,
-		IntTrafficPolicy: lb.SVCTrafficPolicyLocal,
-		Backends:         healthCheckBackends,
-		LoopbackHostport: true,
+		Name:                  healthCheckSvcName,
+		Type:                  svc.svcType,
+		ForwardingMode:        svc.svcForwardingMode,
+		Frontend:              healthCheckFrontend,
+		ExtTrafficPolicy:      lb.SVCTrafficPolicyLocal,
+		IntTrafficPolicy:      lb.SVCTrafficPolicyLocal,
+		Backends:              healthCheckBackends,
+		LoopbackHostport:      true,
+		LoadBalancerAlgorithm: svc.loadBalancerAlgorithm,
 	}
 
 	_, _, err := s.upsertService(healthCheckSvc)
@@ -1055,6 +1079,7 @@ func (s *Service) UpdateBackendsStateMultiple(svcMapping map[lb.ID]*svcInfo, bac
 		be.State = updatedB.State
 		be.Preferred = updatedB.Preferred
 
+	nextService:
 		for id, info := range svcMapping {
 			var p *datapathTypes.UpsertServiceParams
 			for i, b := range info.backends {
@@ -1069,22 +1094,32 @@ func (s *Service) UpdateBackendsStateMultiple(svcMapping map[lb.ID]*svcInfo, bac
 				found := false
 
 				if p, found = updateSvcs[id]; !found {
+					proto, err := u8proto.ParseProtocol(info.frontend.L4Addr.Protocol)
+					if err != nil {
+						errs = errors.Join(errs, fmt.Errorf("failed to parse service protocol for frontend %+v: %w", info.frontend, err))
+						continue nextService
+					}
+
 					p = &datapathTypes.UpsertServiceParams{
 						ID:                        uint16(id),
 						IP:                        info.frontend.L3n4Addr.AddrCluster.AsNetIP(),
 						Port:                      info.frontend.L3n4Addr.L4Addr.Port,
+						Protocol:                  byte(proto),
 						PrevBackendsCount:         len(info.backends),
 						IPv6:                      info.frontend.IsIPv6(),
 						Type:                      info.svcType,
+						ForwardingMode:            info.svcForwardingMode,
 						ExtLocal:                  info.isExtLocal(),
 						IntLocal:                  info.isIntLocal(),
 						Scope:                     info.frontend.L3n4Addr.Scope,
 						SessionAffinity:           info.sessionAffinity,
 						SessionAffinityTimeoutSec: info.sessionAffinityTimeoutSec,
+						SourceRangesPolicy:        info.svcSourceRangesPolicy,
 						CheckSourceRange:          info.checkLBSourceRange(),
 						UseMaglev:                 info.useMaglev(),
 						Name:                      info.svcName,
 						LoopbackHostport:          info.LoopbackHostport,
+						LoadBalancingAlgorithm:    info.loadBalancerAlgorithm,
 					}
 				}
 				p.PreferredBackends, p.ActiveBackends, p.NonActiveBackends = segregateBackends(info.backends)
@@ -1402,8 +1437,36 @@ func (s *Service) createSVCInfoIfNotExist(p *lb.SVC) (*svcInfo, bool, bool,
 	prevSessionAffinity := false
 	prevLoadBalancerSourceRanges := []*cidr.CIDR{}
 
+	// when Cilium is upgraded to a version that supports service protocol differentiation, and such feature is
+	// enabled, we may end up in a situation where some existing services do not have the protocol set.
+	//
+	// As in such cases we want to preserve the existing services (in order to not break existing connections to
+	// those services), when trying to create a new one check first if an "old" service without the protocol
+	// already exists, by overwriting its protocol to NONE.
+	// If it doesn't then do a second lookup in the svcByHash map with the protocol set.
+	//
+	// Note that this logic can be removed once we stop supporting services without protocol.
+	proto := p.Frontend.L3n4Addr.L4Addr.Protocol
+	p.Frontend.L3n4Addr.L4Addr.Protocol = "ANY"
+
+	backendProtos := []lb.L4Type{}
+	for _, backend := range p.Backends {
+		backendProtos = append(backendProtos, backend.L3n4Addr.L4Addr.Protocol)
+		backend.L3n4Addr.L4Addr.Protocol = "ANY"
+	}
+
 	hash := p.Frontend.Hash()
 	svc, found := s.svcByHash[hash]
+	if !found {
+		p.Frontend.L3n4Addr.L4Addr.Protocol = proto
+		for i, backend := range p.Backends {
+			backend.L3n4Addr.L4Addr.Protocol = backendProtos[i]
+		}
+
+		hash = p.Frontend.Hash()
+		svc, found = s.svcByHash[hash]
+	}
+
 	if !found {
 		// Allocate service ID for the new service
 		addrID, err := AcquireID(p.Frontend.L3n4Addr, uint32(p.Frontend.ID))
@@ -1419,8 +1482,9 @@ func (s *Service) createSVCInfoIfNotExist(p *lb.SVC) (*svcInfo, bool, bool,
 			frontend:      p.Frontend,
 			backendByHash: map[string]*lb.Backend{},
 
-			svcType: p.Type,
-			svcName: p.Name,
+			svcType:           p.Type,
+			svcForwardingMode: p.ForwardingMode,
+			svcName:           p.Name,
 
 			sessionAffinity:           p.SessionAffinity,
 			sessionAffinityTimeoutSec: p.SessionAffinityTimeoutSec,
@@ -1429,7 +1493,9 @@ func (s *Service) createSVCInfoIfNotExist(p *lb.SVC) (*svcInfo, bool, bool,
 			svcIntTrafficPolicy:      p.IntTrafficPolicy,
 			svcNatPolicy:             p.NatPolicy,
 			svcHealthCheckNodePort:   p.HealthCheckNodePort,
+			svcSourceRangesPolicy:    p.SourceRangesPolicy,
 			loadBalancerSourceRanges: p.LoadBalancerSourceRanges,
+			loadBalancerAlgorithm:    p.LoadBalancerAlgorithm,
 			l7LBProxyPort:            p.L7LBProxyPort,
 			LoopbackHostport:         p.LoopbackHostport,
 
@@ -1456,14 +1522,17 @@ func (s *Service) createSVCInfoIfNotExist(p *lb.SVC) (*svcInfo, bool, bool,
 		prevSessionAffinity = svc.sessionAffinity
 		prevLoadBalancerSourceRanges = svc.loadBalancerSourceRanges
 		svc.svcType = p.Type
+		svc.svcForwardingMode = p.ForwardingMode
 		svc.svcExtTrafficPolicy = p.ExtTrafficPolicy
 		svc.svcIntTrafficPolicy = p.IntTrafficPolicy
 		svc.svcNatPolicy = p.NatPolicy
 		svc.svcHealthCheckNodePort = p.HealthCheckNodePort
 		svc.sessionAffinity = p.SessionAffinity
 		svc.sessionAffinityTimeoutSec = p.SessionAffinityTimeoutSec
+		svc.svcSourceRangesPolicy = p.SourceRangesPolicy
 		svc.loadBalancerSourceRanges = p.LoadBalancerSourceRanges
 		svc.annotations = p.Annotations
+		svc.loadBalancerAlgorithm = p.LoadBalancerAlgorithm
 
 		// Name, namespace and cluster are optional and intended for exposure via
 		// API. They they are not part of any BPF maps and cannot be restored
@@ -1531,7 +1600,6 @@ func (s *Service) upsertServiceIntoLBMaps(svc *svcInfo, isExtLocal, isIntLocal b
 
 	var (
 		toDeleteAffinity, toAddAffinity []lb.BackendID
-		checkLBSrcRange                 bool
 	)
 
 	// Update sessionAffinity
@@ -1565,7 +1633,8 @@ func (s *Service) upsertServiceIntoLBMaps(svc *svcInfo, isExtLocal, isIntLocal b
 	}
 
 	// Update LB source range check cidrs
-	if checkLBSrcRange = svc.checkLBSourceRange() || len(prevLoadBalancerSourceRanges) != 0; checkLBSrcRange {
+	checkLBSrcRange := svc.checkLBSourceRange()
+	if checkLBSrcRange || len(prevLoadBalancerSourceRanges) != 0 {
 		if err := s.lbmap.UpdateSourceRanges(uint16(svc.frontend.ID),
 			prevLoadBalancerSourceRanges, svc.loadBalancerSourceRanges,
 			v6FE); err != nil {
@@ -1619,11 +1688,16 @@ func (s *Service) upsertServiceIntoLBMaps(svc *svcInfo, isExtLocal, isIntLocal b
 		}
 	}
 	svc.svcNatPolicy = natPolicy
+	protocol, err := u8proto.ParseProtocol(svc.frontend.L3n4Addr.L4Addr.Protocol)
+	if err != nil {
+		return err
+	}
 
 	p := &datapathTypes.UpsertServiceParams{
 		ID:                        uint16(svc.frontend.ID),
 		IP:                        svc.frontend.L3n4Addr.AddrCluster.AsNetIP(),
 		Port:                      svc.frontend.L3n4Addr.L4Addr.Port,
+		Protocol:                  uint8(protocol),
 		PreferredBackends:         preferredBackends,
 		ActiveBackends:            activeBackends,
 		NonActiveBackends:         nonActiveBackends,
@@ -1631,16 +1705,19 @@ func (s *Service) upsertServiceIntoLBMaps(svc *svcInfo, isExtLocal, isIntLocal b
 		IPv6:                      v6FE,
 		NatPolicy:                 natPolicy,
 		Type:                      svc.svcType,
+		ForwardingMode:            svc.svcForwardingMode,
 		ExtLocal:                  isExtLocal,
 		IntLocal:                  isIntLocal,
 		Scope:                     svc.frontend.L3n4Addr.Scope,
 		SessionAffinity:           svc.sessionAffinity,
 		SessionAffinityTimeoutSec: svc.sessionAffinityTimeoutSec,
+		SourceRangesPolicy:        svc.svcSourceRangesPolicy,
 		CheckSourceRange:          checkLBSrcRange,
 		UseMaglev:                 svc.useMaglev(),
 		L7LBProxyPort:             svc.l7LBProxyPort,
 		Name:                      svc.svcName,
 		LoopbackHostport:          svc.LoopbackHostport,
+		LoadBalancingAlgorithm:    svc.loadBalancerAlgorithm,
 	}
 	if err := s.lbmap.UpsertService(p); err != nil {
 		return err
@@ -1810,6 +1887,7 @@ func (s *Service) restoreServicesLocked(svcBackendsById map[lb.BackendID]struct{
 			backends:            svc.Backends,
 			backendByHash:       map[string]*lb.Backend{},
 			svcType:             svc.Type,
+			svcForwardingMode:   svc.ForwardingMode,
 			svcExtTrafficPolicy: svc.ExtTrafficPolicy,
 			svcIntTrafficPolicy: svc.IntTrafficPolicy,
 			svcNatPolicy:        svc.NatPolicy,
@@ -1822,7 +1900,8 @@ func (s *Service) restoreServicesLocked(svcBackendsById map[lb.BackendID]struct{
 			// SyncWithK8sFinished() could remove services which were restored
 			// from the maps but not present in the k8sServiceCache (e.g. a svc
 			// was deleted while cilium-agent was down).
-			restoredFromDatapath: true,
+			restoredFromDatapath:  true,
+			loadBalancerAlgorithm: svc.LoadBalancerAlgorithm,
 		}
 
 		for j, backend := range svc.Backends {
@@ -1906,8 +1985,7 @@ func (s *Service) deleteServiceLocked(svc *svcInfo) error {
 		s.deleteBackendsFromAffinityMatchMap(svc.frontend.ID, backendIDs)
 	}
 
-	if option.Config.EnableSVCSourceRangeCheck &&
-		svc.svcType == lb.SVCTypeLoadBalancer {
+	if svc.checkLBSourceRange() {
 		if err := s.lbmap.UpdateSourceRanges(uint16(svc.frontend.ID),
 			svc.loadBalancerSourceRanges, nil, ipv6); err != nil {
 			return err
@@ -2072,6 +2150,9 @@ func (s *Service) notifyMonitorServiceUpsert(frontend lb.L3n4AddrID, backends []
 		be = append(be, b)
 	}
 
+	if !option.Config.EnableInternalTrafficPolicy {
+		svcIntTrafficPolicy = lb.SVCTrafficPolicyCluster
+	}
 	msg := monitorAPI.ServiceUpsertMessage(id, fe, be, string(svcType), string(svcExtTrafficPolicy), string(svcIntTrafficPolicy), svcName, svcNamespace)
 	s.monitorAgent.SendEvent(monitorAPI.MessageTypeAgent, msg)
 }

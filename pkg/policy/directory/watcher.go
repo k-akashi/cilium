@@ -6,8 +6,10 @@ package directory
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/sirupsen/logrus"
@@ -21,25 +23,22 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
-	"github.com/cilium/cilium/pkg/policy"
+	policycell "github.com/cilium/cilium/pkg/policy/cell"
+	policytypes "github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/source"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 type policyWatcher struct {
-	log           logrus.FieldLogger
-	config        Config
-	policyManager PolicyManager
-	readStatus    DirectoryWatcherReadStatus
+	log            logrus.FieldLogger
+	config         Config
+	policyImporter policycell.PolicyImporter
+	synced         sync.WaitGroup
 	// maps cnp file name to cnp object. this is required to retrieve data during delete.
 	fileNameToCnpCache map[string]*cilium_v2.CiliumNetworkPolicy
 }
 
-func (p *policyWatcher) translateToCNPObject(file string) (*cilium_v2.CiliumNetworkPolicy, error) {
-	data, err := os.ReadFile(file)
-	if err != nil {
-		return nil, err
-	}
-
+func (p *policyWatcher) translateToCNPObject(data []byte) (*cilium_v2.CiliumNetworkPolicy, error) {
 	// yaml to json conversion
 	jsonData, err := yaml.YAMLToJSON([]byte(data))
 	if err != nil {
@@ -52,8 +51,16 @@ func (p *policyWatcher) translateToCNPObject(file string) (*cilium_v2.CiliumNetw
 	if err != nil {
 		return nil, err
 	}
+	return cnp, err
+}
 
-	return cnp, nil
+func (p *policyWatcher) readAndTranslateToCNPObject(file string) (*cilium_v2.CiliumNetworkPolicy, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	cnp, err := p.translateToCNPObject(data)
+	return cnp, err
 }
 
 func getLabels(fileName string, cnp *cilium_v2.CiliumNetworkPolicy) labels.LabelArray {
@@ -78,13 +85,7 @@ func getLabels(fileName string, cnp *cilium_v2.CiliumNetworkPolicy) labels.Label
 
 // read cilium network policy yaml file and convert to policy object and
 // add rules to policy engine.
-func (p *policyWatcher) addToPolicyEngine(cnpFilePath string) error {
-	// read from file and convert to cnp object
-	cnp, err := p.translateToCNPObject(cnpFilePath)
-	if err != nil {
-		return err
-	}
-
+func (p *policyWatcher) addToPolicyEngine(cnp *cilium_v2.CiliumNetworkPolicy, cnpFilePath string) error {
 	fileName := filepath.Base(cnpFilePath)
 
 	resourceID := ipcacheTypes.NewResourceID(
@@ -105,16 +106,18 @@ func (p *policyWatcher) addToPolicyEngine(cnpFilePath string) error {
 		r.Labels = lbls
 	}
 
+	dc := make(chan uint64, 1)
 	// add to policy engine
-	_, err = p.policyManager.PolicyAdd(rules, &policy.AddOptions{
-		ReplaceByResource: true,
-		Source:            source.Directory,
-		Resource:          resourceID,
+	p.policyImporter.UpdatePolicy(&policytypes.PolicyUpdate{
+		Rules:               rules,
+		Source:              source.Directory,
+		Resource:            resourceID,
+		ProcessingStartTime: time.Now(),
+		DoneChan:            dc,
 	})
+	<-dc // wait for policy to be applied
 
-	if err == nil {
-		p.fileNameToCnpCache[fileName] = cnp
-	}
+	p.fileNameToCnpCache[fileName] = cnp
 
 	return err
 }
@@ -123,8 +126,7 @@ func (p *policyWatcher) deleteFromPolicyEngine(cnpFilePath string) error {
 	fileName := filepath.Base(cnpFilePath)
 	cnp := p.fileNameToCnpCache[fileName]
 	if cnp == nil {
-		p.log.WithField("file", fileName).Error("BUG: Policy deletion request for file which was never added")
-		return nil
+		return fmt.Errorf("fileNameToCnp map entry doesn't exist for file:%s", fileName)
 	}
 
 	resourceID := ipcacheTypes.NewResourceID(
@@ -132,13 +134,14 @@ func (p *policyWatcher) deleteFromPolicyEngine(cnpFilePath string) error {
 		p.config.StaticCNPPath,
 		fileName,
 	)
-	_, err := p.policyManager.PolicyDelete(getLabels(fileName, cnp), &policy.DeleteOptions{
-		Source:           source.Directory,
-		DeleteByResource: true,
-		Resource:         resourceID})
+	p.policyImporter.UpdatePolicy(&policytypes.PolicyUpdate{
+		Rules:    nil, // delete policy
+		Source:   source.Directory,
+		Resource: resourceID,
+	})
 
 	delete(p.fileNameToCnpCache, fileName)
-	return err
+	return nil
 }
 
 func (p *policyWatcher) isValidCNPFileName(filePath string) bool {
@@ -153,6 +156,10 @@ func (p *policyWatcher) isValidCNPFileName(filePath string) bool {
 		return false
 	}
 	return true
+}
+
+func (p *policyWatcher) Wait() {
+	p.synced.Wait()
 }
 
 func (p *policyWatcher) watchDirectory(ctx context.Context) {
@@ -184,25 +191,39 @@ func (p *policyWatcher) watchDirectory(ctx context.Context) {
 			if !p.isValidCNPFileName(absPath) {
 				continue
 			}
-			err := p.addToPolicyEngine(absPath)
+			// read from file and convert to cnp object
+			cnp, err := p.readAndTranslateToCNPObject(absPath)
 			if err != nil {
-				p.log.WithError(err).WithField(logfields.Path, absPath).Fatal("Failed to add network policy to policy engine")
+				p.log.WithError(err).WithField(logfields.Path, absPath).Fatal("Failed to translate policy yaml file to cnp object")
+			} else {
+
+				err = p.addToPolicyEngine(cnp, absPath)
+				if err != nil {
+					p.log.WithError(err).WithField(logfields.Path, absPath).Fatal("Failed to add network policy to policy engine")
+				}
 			}
 			reportCNPChangeMetrics(err)
 		}
-		close(p.readStatus)
+		p.synced.Done()
 		// Listen for file add, update, rename and delete
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case event := <-watcher.Events:
 				if !p.isValidCNPFileName(event.Name) {
 					continue
 				}
 				if event.Op.Has(fsnotify.Create) || event.Op.Has(fsnotify.Write) {
 					p.log.WithField(logfields.Path, event.Name).Debug("CNP file added/updated in directory..")
-					err := p.addToPolicyEngine(event.Name)
+					cnp, err := p.readAndTranslateToCNPObject(event.Name)
 					if err != nil {
-						p.log.WithError(err).WithField(logfields.Path, event.Name).Error("Failed to add network policy to policy engine")
+						p.log.WithError(err).WithField(logfields.Path, event.Name).Fatal("Failed to translate policy yaml file to cnp object")
+					} else {
+						err = p.addToPolicyEngine(cnp, event.Name)
+						if err != nil {
+							p.log.WithError(err).WithField(logfields.Path, event.Name).Error("Failed to add network policy to policy engine")
+						}
 					}
 				}
 				if event.Op.Has(fsnotify.Remove) || event.Op.Has(fsnotify.Rename) {

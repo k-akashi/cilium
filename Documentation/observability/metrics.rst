@@ -312,12 +312,14 @@ Name                                       Labels                               
 Node Connectivity
 ~~~~~~~~~~~~~~~~~
 
-========================================== ====================================================================================================================================================================== ========== ===================================================================================================================
-Name                                       Labels                                                                                                                                                                 Default    Description
-========================================== ====================================================================================================================================================================== ========== ===================================================================================================================
-``node_connectivity_status``               ``source_cluster``, ``source_node_name``, ``target_cluster``, ``target_node_name``, ``target_node_type``, ``type``                                                     Enabled    The last observed status of both ICMP and HTTP connectivity between the current Cilium agent and other Cilium nodes
-``node_connectivity_latency_seconds``      ``address_type``, ``protocol``, ``source_cluster``, ``source_node_name``, ``target_cluster``, ``target_node_ip``, ``target_node_name``, ``target_node_type``, ``type`` Enabled    The last observed latency between the current Cilium agent and other Cilium nodes in seconds
-========================================== ====================================================================================================================================================================== ========== ===================================================================================================================
+============================================= ====================================================================================================================================================================== ========== ==================================================================================================================================================================================================================
+Name                                          Labels                                                                                                                                                                 Default    Description
+============================================= ====================================================================================================================================================================== ========== ==================================================================================================================================================================================================================
+``node_connectivity_status``                  ``source_cluster``, ``source_node_name``, ``target_cluster``, ``target_node_name``, ``target_node_type``, ``type``                                                     Enabled    Deprecated, will be removed in Cilium 1.18 - use ``node_health_connectivity_status`` instead. The last observed status of both ICMP and HTTP connectivity between the current Cilium agent and other Cilium nodes
+``node_connectivity_latency_seconds``         ``address_type``, ``protocol``, ``source_cluster``, ``source_node_name``, ``target_cluster``, ``target_node_ip``, ``target_node_name``, ``target_node_type``, ``type`` Enabled    Deprecated, will be removed in Cilium 1.18 - use ``node_health_connectivity_latency_seconds`` instead. The last observed latency between the current Cilium agent and other Cilium nodes in seconds
+``node_health_connectivity_status``           ``source_cluster``, ``source_node_name``, ``type``, ``status``                                                                                                         Enabled    Number of endpoints with last observed status of both ICMP and HTTP connectivity between the current Cilium agent and other Cilium nodes
+``node_health_connectivity_latency_seconds``  ``source_cluster``, ``source_node_name``, ``type``, ``address_type``, ``protocol``                                                                                     Enabled    Histogram of the last observed latency between the current Cilium agent and other Cilium nodes in seconds
+============================================= ====================================================================================================================================================================== ========== ==================================================================================================================================================================================================================
 
 Clustermesh
 ~~~~~~~~~~~
@@ -403,6 +405,7 @@ Name                                       Labels                               
 ``policy_change_total``                                                                       Enabled    Number of policy changes by outcome
 ``policy_endpoint_enforcement_status``                                                        Enabled    Number of endpoints labeled by policy enforcement status
 ``policy_implementation_delay``            ``source``                                         Enabled    Time in seconds between a policy change and it being fully deployed into the datapath, labeled by the policy's source
+``policy_selector_match_count_max``        ``class``                                          Enabled    The maximum number of identities selected by a network policy selector
 ========================================== ================================================== ========== ========================================================
 
 Policy L7 (HTTP/Kafka/FQDN)
@@ -430,6 +433,9 @@ Name                                     Labels                                 
 ``identity_gc_latency``                  ``outcome``, ``identity_type``                     Enabled    Duration of the last successful identity GC run
 ``ipcache_errors_total``                 ``type``, ``error``                                Enabled    Number of errors interacting with the ipcache
 ``ipcache_events_total``                 ``type``                                           Enabled    Number of events interacting with the ipcache
+``identity_cache_timer_duration``        ``name``                                           Enabled    Seconds required to execute periodic policy processes. ``name="id-alloc-update-policy-maps"`` is the time taken to apply incremental updates to the BPF policy maps.
+``identity_cache_timer_trigger_latency`` ``name``                                           Enabled    Seconds spent waiting for a previous process to finish before starting the next round. ``name="id-alloc-update-policy-maps"`` is the time waiting before applying incremental updates to the BPF policy maps.
+``identity_cache_timer_trigger_folds``   ``name``                                           Enabled    Number of timer triggers that were coalesced in to one execution. ``name="id-alloc-update-policy-maps"`` applies the incremental updates to the BPF policy maps.
 ======================================== ================================================== ========== ========================================================
 
 Events external to Cilium
@@ -602,13 +608,13 @@ Name                                           Labels                           
 BGP Control Plane
 ~~~~~~~~~~~~~~~~~
 
-====================== ============================================= ======== ===================================================================
-Name                   Labels                                        Default  Description
-====================== ============================================= ======== ===================================================================
-``session_state``      ``vrouter``, ``neighbor``                     Enabled  Current state of the BGP session with the peer, Up = 1 or Down = 0
-``advertised_routes``  ``vrouter``, ``neighbor``, ``afi``, ``safi``  Enabled  Number of routes advertised to the peer
-``received_routes``    ``vrouter``, ``neighbor``, ``afi``, ``safi``  Enabled  Number of routes received from the peer
-====================== ============================================= ======== ===================================================================
+====================== =============================================================== ======== ===================================================================
+Name                   Labels                                                          Default  Description
+====================== =============================================================== ======== ===================================================================
+``session_state``      ``vrouter``, ``neighbor``, ``neighbor_asn``                     Enabled  Current state of the BGP session with the peer, Up = 1 or Down = 0
+``advertised_routes``  ``vrouter``, ``neighbor``, ``neighbor_asn``, ``afi``, ``safi``  Enabled  Number of routes advertised to the peer
+``received_routes``    ``vrouter``, ``neighbor``, ``neighbor_asn``, ``afi``, ``safi``  Enabled  Number of routes received from the peer
+====================== =============================================================== ======== ===================================================================
 
 All metrics are enabled only when the BGP Control Plane is enabled.
 
@@ -700,6 +706,15 @@ Name                                           Labels                           
 ``ces_sync_total``                             ``outcome``                      The number of completed CES syncs by outcome
 ``ces_queueing_delay_seconds``                                                  CiliumEndpointSlice queueing delay in seconds
 ============================================== ================================ ========================================================
+
+Unmanaged Pods
+~~~~~~~~~~~~~~
+
+============================================ ======= ========== ====================================================================
+Name                                         Labels  Default    Description
+============================================ ======= ========== ====================================================================
+``unmanaged_pods``                                   Enabled    The total number of pods observed to be unmanaged by Cilium operator
+============================================ ======= ========== ====================================================================
 
 "Double Write" Identity Allocation Mode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

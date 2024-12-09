@@ -7,7 +7,7 @@ DOCKER=${DOCKER:-docker}
 ORG=${ORG:-cilium}
 
 cosign() {
-  "${DOCKER}" run --rm gcr.io/projectsigstore/cosign:v2.2.4 "$@"
+  "${DOCKER}" run --rm ghcr.io/sigstore/cosign/cosign:v2.2.4 "$@"
 }
 
 helm() {
@@ -51,7 +51,7 @@ main() {
         git stash
         remote=$(git remote -v | grep "${ORG}/${PROJECT}" | awk '{print $1;exit}')
         git fetch "${remote}"
-        git checkout "$version"
+        git checkout -b "$version"
         cd -
     else
         git clone --depth 1 --branch "$version" "https://github.com/cilium/${PROJECT}.git"

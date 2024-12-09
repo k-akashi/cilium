@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding"
 	"errors"
+	"iter"
 	"reflect"
 	"unsafe"
 
@@ -114,18 +115,30 @@ func (ops *mapOps[KV]) toStringKey(kv KV) string {
 }
 
 // Prune BPF map values that do not exist in the table.
-func (ops *mapOps[KV]) Prune(ctx context.Context, txn statedb.ReadTxn, iter statedb.Iterator[KV]) error {
+func (ops *mapOps[KV]) Prune(ctx context.Context, txn statedb.ReadTxn, objs iter.Seq2[KV, statedb.Revision]) error {
 	return ops.withMap(func(m *ebpf.Map) error {
-		desiredKeys := sets.New(statedb.Collect(statedb.Map(iter, func(kv KV) string { return ops.toStringKey(kv) }))...)
-		var errs []error
+		desiredKeys := sets.New[string]()
+		for obj := range objs {
+			desiredKeys.Insert(ops.toStringKey(obj))
+		}
+
+		// We need to collect the keys to prune first, as it is not safe to
+		// delete entries while iterating
+		keysToPrune := [][]byte{}
 		mapIter := &keyIterator{m, nil, nil, m.MaxEntries()}
 		for key := mapIter.Next(); key != nil; key = mapIter.Next() {
 			if !desiredKeys.Has(string(key)) {
-				if err := m.Delete(key); err != nil {
-					errs = append(errs, err)
-				}
+				keysToPrune = append(keysToPrune, key)
 			}
 		}
+
+		var errs []error
+		for _, key := range keysToPrune {
+			if err := m.Delete(key); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
 		errs = append(errs, mapIter.Err())
 		return errors.Join(errs...)
 	})

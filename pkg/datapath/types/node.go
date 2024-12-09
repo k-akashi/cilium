@@ -10,6 +10,7 @@ import (
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/datapath/tables"
+	"github.com/cilium/cilium/pkg/datapath/xdp"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 )
 
@@ -55,6 +56,12 @@ type LocalNodeConfiguration struct {
 	// Immutable at runtime.
 	AllocCIDRIPv6 *cidr.CIDR
 
+	// NativeRoutingCIDRIPv4 is the v4 CIDR in which pod IPs are routable.
+	NativeRoutingCIDRIPv4 *cidr.CIDR
+
+	// NativeRoutingCIDRIPv6 is the v4 CIDR in which pod IPs are routable.
+	NativeRoutingCIDRIPv6 *cidr.CIDR
+
 	// LoopbackIPv4 is the IPv4 loopback address.
 	// Immutable at runtime.
 	LoopbackIPv4 net.IP
@@ -72,6 +79,10 @@ type LocalNodeConfiguration struct {
 	// used as NodePort frontends and the addresses to use for BPF masquerading.
 	// Mutable at runtime.
 	NodeAddresses []tables.NodeAddress
+
+	// DeriveMasqIPAddrFromDevice overrides the interface name to use for deriving
+	// the masquerading IP address for the node.
+	DeriveMasqIPAddrFromDevice string
 
 	// HostEndpointID is the endpoint ID assigned to the host endpoint.
 	// Immutable at runtime.
@@ -153,7 +164,7 @@ type LocalNodeConfiguration struct {
 	// EnableIPSecEncryptedOverlay enables IPSec routes for overlay traffic
 	EnableIPSecEncryptedOverlay bool
 
-	// EncryptNode enables encrypting NodeIP traffic requires EnableIPSec
+	// EncryptNode enables encrypting NodeIP traffic
 	EncryptNode bool
 
 	// IPv4PodSubnets is a list of IPv4 subnets that pod IPs are assigned from
@@ -165,6 +176,14 @@ type LocalNodeConfiguration struct {
 	// these are then used when encryption is enabled to configure the node
 	// for encryption over these subnets at node initialization.
 	IPv6PodSubnets []*cidr.CIDR
+
+	// XDPConfig holds configuration options to determine how the node should
+	// handle XDP programs.
+	XDPConfig xdp.Config
+
+	// RoutingMode is the current routing mode of the local node.
+	// Can be 'native' or 'tunnel'.
+	RoutingMode string
 }
 
 func (cfg *LocalNodeConfiguration) DeviceNames() []string {
@@ -220,7 +239,7 @@ type NodeNeighbors interface {
 	NodeNeighDiscoveryEnabled() bool
 
 	// NodeNeighborRefresh is called to refresh node neighbor table
-	NodeNeighborRefresh(ctx context.Context, node nodeTypes.Node, refresh bool) error
+	NodeNeighborRefresh(ctx context.Context, node nodeTypes.Node) error
 
 	// NodeCleanNeighbors cleans all neighbor entries for the direct routing device
 	// and the encrypt interface.
@@ -231,7 +250,7 @@ type NodeNeighbors interface {
 	// be added, for example, for external service backends.
 	InsertMiscNeighbor(newNode *nodeTypes.Node)
 
-	// DeleteMiscNeighbor delets a eighbor entry for the address passed via oldNode.
+	// DeleteMiscNeighbor deletes a neighbor entry for the address passed via oldNode.
 	// This is needed to delete the entries which have been inserted at an earlier
 	// point in time through InsertMiscNeighbor.
 	DeleteMiscNeighbor(oldNode *nodeTypes.Node)

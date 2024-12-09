@@ -4,13 +4,16 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: cilium-config-agent
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "cilium.namespace" . }}
   {{- with .Values.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   labels:
     app.kubernetes.io/part-of: cilium
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -18,7 +21,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ .Values.serviceAccounts.cilium.name | quote }}
-    namespace: {{ .Release.Namespace }}
+    namespace: {{ include "cilium.namespace" . }}
 {{- end}}
 
 {{- if and .Values.agent (not .Values.preflight.enabled) .Values.serviceAccounts.cilium.create .Values.ingressController.enabled .Values.ingressController.secretsNamespace.name}}
@@ -41,7 +44,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ .Values.serviceAccounts.cilium.name | quote }}
-    namespace: {{ .Release.Namespace }}
+    namespace: {{ include "cilium.namespace" . }}
 {{- end }}
 
 {{- if and .Values.agent (not .Values.preflight.enabled) .Values.serviceAccounts.cilium.create .Values.gatewayAPI.enabled .Values.gatewayAPI.secretsNamespace.name}}
@@ -64,7 +67,7 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: {{ .Values.serviceAccounts.cilium.name | quote }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "cilium.namespace" . }}
 {{- end}}
 
 {{- if and .Values.agent (not .Values.preflight.enabled) .Values.serviceAccounts.cilium.create .Values.envoyConfig.enabled .Values.envoyConfig.secretsNamespace.name}}
@@ -87,7 +90,7 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: {{ .Values.serviceAccounts.cilium.name | quote }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "cilium.namespace" . }}
 {{- end}}
 
 {{- if and .Values.agent (not .Values.preflight.enabled) .Values.serviceAccounts.cilium.create .Values.bgpControlPlane.enabled .Values.bgpControlPlane.secretsNamespace.name}}
@@ -106,5 +109,24 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: {{ .Values.serviceAccounts.cilium.name | quote }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "cilium.namespace" . }}
 {{- end}}
+
+{{- if and .Values.operator.enabled .Values.serviceAccounts.operator.create .Values.tls.secretSync.enabled .Values.tls.secretSync.secretsNamespace.name ( eq "k8s" .Values.tls.secretsBackend )}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cilium-tlsinterception-secrets
+  namespace: {{ .Values.tls.secretSync.secretsNamespace.name | quote }}
+  labels:
+    app.kubernetes.io/part-of: cilium
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cilium-tlsinterception-secrets
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.serviceAccounts.cilium.name | quote }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}

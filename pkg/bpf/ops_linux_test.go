@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding"
 	"errors"
+	"iter"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -39,13 +40,7 @@ func (o *TestObject) BinaryValue() encoding.BinaryMarshaler {
 	return StructBinaryMarshaler{&o.Value}
 }
 
-type emptyIterator struct{}
-
-func (*emptyIterator) Next() (*TestObject, uint64, bool) {
-	return nil, 0, false
-}
-
-var _ statedb.Iterator[*TestObject] = &emptyIterator{}
+var emptySeq iter.Seq2[*TestObject, statedb.Revision] = func(yield func(*TestObject, uint64) bool) {}
 
 func Test_MapOps(t *testing.T) {
 	testutils.PrivilegedTest(t)
@@ -89,17 +84,57 @@ func Test_MapOps(t *testing.T) {
 
 	v, err = testMap.Lookup(&TestKey{2})
 	if assert.NoError(t, err, "Lookup") {
-		assert.Equal(t, v.(*TestValue).Value, uint32(3))
+		assert.Equal(t, uint32(3), v.(*TestValue).Value)
 	}
 
 	// Give Prune() an empty set of objects, which should cause it to
 	// remove everything.
-	err = ops.Prune(ctx, nil, &emptyIterator{})
+	err = ops.Prune(ctx, nil, emptySeq)
 	assert.NoError(t, err, "Prune")
 
 	data := map[string][]string{}
 	testMap.Dump(data)
-	assert.Len(t, data, 0)
+	assert.Empty(t, data)
+}
+
+func Test_MapOpsPrune(t *testing.T) {
+	testutils.PrivilegedTest(t)
+
+	// This tests pruning with an LPM trie. This ensures we do not regress, as
+	// previously we had issues with Prune concurrently iterating and deleting
+	// entries, which caused the iteration to skip entries
+	testMap := NewMap(
+		"cilium_ops_prune_test",
+		ebpf.LPMTrie,
+		&TestLPMKey{},
+		&TestValue{},
+		maxEntries,
+		BPF_F_NO_PREALLOC,
+	)
+	err := testMap.OpenOrCreate()
+	require.NoError(t, err, "OpenOrCreate")
+	defer testMap.Close()
+
+	ctx := context.TODO()
+	ops := NewMapOps[*TestObject](testMap)
+
+	// Fill map with similarly prefixed entries
+	err = testMap.Update(&TestLPMKey{32, 0xFF00_00FF}, &TestValue{0})
+	assert.NoError(t, err, "Update 0")
+	err = testMap.Update(&TestLPMKey{32, 0xFF01_01FF}, &TestValue{1})
+	assert.NoError(t, err, "Update 1")
+	err = testMap.Update(&TestLPMKey{32, 0xFF02_02FF}, &TestValue{2})
+	assert.NoError(t, err, "Update 2")
+	err = testMap.Update(&TestLPMKey{32, 0xFF03_03FF}, &TestValue{3})
+	assert.NoError(t, err, "Update 3")
+
+	// Prune should now remove everything
+	err = ops.Prune(ctx, nil, emptySeq)
+	assert.NoError(t, err, "Prune")
+
+	data := map[string][]string{}
+	testMap.Dump(data)
+	assert.Empty(t, data)
 }
 
 // Test_MapOps_ReconcilerExample serves as a testable example for the map ops.

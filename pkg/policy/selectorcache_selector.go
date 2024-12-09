@@ -4,97 +4,23 @@
 package policy
 
 import (
-	"bytes"
-	"encoding/json"
 	"sort"
-	"strings"
 	"sync"
-	"sync/atomic"
 
+	"github.com/hashicorp/go-hclog"
+	"github.com/sirupsen/logrus"
+
+	"github.com/cilium/cilium/pkg/container/versioned"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/types"
 )
 
-// CachedSelector represents an identity selector owned by the selector cache
-type CachedSelector interface {
-	// GetSelections returns the cached set of numeric identities
-	// selected by the CachedSelector.  The retuned slice must NOT
-	// be modified, as it is shared among multiple users.
-	GetSelections() identity.NumericIdentitySlice
-
-	// GetMetadataLabels returns metadata labels for additional context
-	// surrounding the selector. These are typically the labels associated with
-	// Cilium rules.
-	GetMetadataLabels() labels.LabelArray
-
-	// Selects return 'true' if the CachedSelector selects the given
-	// numeric identity.
-	Selects(nid identity.NumericIdentity) bool
-
-	// IsWildcard returns true if the endpoint selector selects
-	// all endpoints.
-	IsWildcard() bool
-
-	// IsNone returns true if the selector never selects anything
-	IsNone() bool
-
-	// String returns the string representation of this selector.
-	// Used as a map key.
-	String() string
-}
-
-// CachedSelectorSlice is a slice of CachedSelectors that can be sorted.
-type CachedSelectorSlice []CachedSelector
-
-// MarshalJSON returns the CachedSelectors as JSON formatted buffer
-func (s CachedSelectorSlice) MarshalJSON() ([]byte, error) {
-	buffer := bytes.NewBufferString("[")
-	for i, selector := range s {
-		buf, err := json.Marshal(selector.String())
-		if err != nil {
-			return nil, err
-		}
-
-		buffer.Write(buf)
-		if i < len(s)-1 {
-			buffer.WriteString(",")
-		}
-	}
-	buffer.WriteString("]")
-	return buffer.Bytes(), nil
-}
-
-func (s CachedSelectorSlice) Len() int      { return len(s) }
-func (s CachedSelectorSlice) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-
-func (s CachedSelectorSlice) Less(i, j int) bool {
-	return strings.Compare(s[i].String(), s[j].String()) < 0
-}
-
-// SelectsAllEndpoints returns whether the CachedSelectorSlice selects all
-// endpoints, which is true if the wildcard endpoint selector is present in the
-// slice.
-func (s CachedSelectorSlice) SelectsAllEndpoints() bool {
-	for _, selector := range s {
-		if selector.IsWildcard() {
-			return true
-		}
-	}
-	return false
-}
-
-// CachedSelectionUser inserts selectors into the cache and gets update
-// callbacks whenever the set of selected numeric identities change for
-// the CachedSelectors pushed by it.
-type CachedSelectionUser interface {
-	// IdentitySelectionUpdated implementations MUST NOT call back
-	// to the name manager or the selector cache while executing this function!
-	//
-	// The caller is responsible for making sure the same identity is not
-	// present in both 'added' and 'deleted'.
-	IdentitySelectionUpdated(selector CachedSelector, added, deleted []identity.NumericIdentity)
-}
+type CachedSelector types.CachedSelector
+type CachedSelectorSlice types.CachedSelectorSlice
+type CachedSelectionUser types.CachedSelectionUser
 
 // identitySelector is the internal type for all selectors in the
 // selector cache.
@@ -134,19 +60,31 @@ type CachedSelectionUser interface {
 type identitySelector struct {
 	source           selectorSource
 	key              string
-	selections       atomic.Pointer[identity.NumericIdentitySlice]
+	selections       versioned.Value[identity.NumericIdentitySlice]
 	users            map[CachedSelectionUser]struct{}
 	cachedSelections map[identity.NumericIdentity]struct{}
 	metadataLbls     labels.LabelArray
 }
 
+func (i *identitySelector) MaySelectPeers() bool {
+	for user := range i.users {
+		if user.IsPeerSelector() {
+			return true
+		}
+	}
+
+	return false
+}
+
 // identitySelector implements CachedSelector
-var _ CachedSelector = (*identitySelector)(nil)
+var _ types.CachedSelector = (*identitySelector)(nil)
 
 type selectorSource interface {
 	matches(scIdentity) bool
 
 	remove(identityNotifier)
+
+	metricsClass() string
 }
 
 // fqdnSelector implements the selectorSource for a FQDNSelector. A fqdnSelector
@@ -166,6 +104,10 @@ func (f *fqdnSelector) remove(dnsProxy identityNotifier) {
 // that matches the FQDNSelector's IdentityLabel string
 func (f *fqdnSelector) matches(identity scIdentity) bool {
 	return identity.lbls.Intersects(labels.LabelArray{f.selector.IdentityLabel()})
+}
+
+func (f *fqdnSelector) metricsClass() string {
+	return LabelValueSCFQDN
 }
 
 type labelIdentitySelector struct {
@@ -203,6 +145,19 @@ func (l *labelIdentitySelector) remove(_ identityNotifier) {
 	// only useful for fqdn selectors
 }
 
+func (l *labelIdentitySelector) metricsClass() string {
+	if l.selector.DeepEqual(&api.EntitySelectorMapping[api.EntityCluster][0]) {
+		return LabelValueSCCluster
+	}
+	for _, entity := range api.EntitySelectorMapping[api.EntityWorld] {
+		if l.selector.DeepEqual(&entity) {
+			return LabelValueSCWorld
+		}
+	}
+
+	return LabelValueSCOther
+}
+
 // lock must be held
 //
 // The caller is responsible for making sure the same identity is not
@@ -231,12 +186,15 @@ func (i *identitySelector) Equal(b *identitySelector) bool {
 // that case GetSelections() will return either the old or new version
 // of the selections. If the old version is returned, the user is
 // guaranteed to receive a notification including the update.
-func (i *identitySelector) GetSelections() identity.NumericIdentitySlice {
-	selections := i.selections.Load()
-	if selections == nil {
-		return emptySelection
+func (i *identitySelector) GetSelections(version *versioned.VersionHandle) identity.NumericIdentitySlice {
+	if !version.IsValid() {
+		log.WithFields(logrus.Fields{
+			logfields.Version:    version,
+			logfields.Stacktrace: hclog.Stacktrace(),
+		}).Error("GetSelections: Invalid VersionHandle finds nothing")
+		return identity.NumericIdentitySlice{}
 	}
-	return *selections
+	return i.selections.At(version)
 }
 
 func (i *identitySelector) GetMetadataLabels() labels.LabelArray {
@@ -245,11 +203,11 @@ func (i *identitySelector) GetMetadataLabels() labels.LabelArray {
 
 // Selects return 'true' if the CachedSelector selects the given
 // numeric identity.
-func (i *identitySelector) Selects(nid identity.NumericIdentity) bool {
+func (i *identitySelector) Selects(version *versioned.VersionHandle, nid identity.NumericIdentity) bool {
 	if i.IsWildcard() {
 		return true
 	}
-	nids := i.GetSelections()
+	nids := i.GetSelections(version)
 	idx := sort.Search(len(nids), func(i int) bool { return nids[i] >= nid })
 	return idx < len(nids) && nids[idx] == nid
 }
@@ -298,7 +256,7 @@ func (i *identitySelector) numUsers() int {
 // cached selections after the cached selections have been changed.
 //
 // lock must be held
-func (i *identitySelector) updateSelections() {
+func (i *identitySelector) updateSelections(nextVersion *versioned.Tx) {
 	selections := make(identity.NumericIdentitySlice, len(i.cachedSelections))
 	idx := 0
 	for nid := range i.cachedSelections {
@@ -311,13 +269,18 @@ func (i *identitySelector) updateSelections() {
 	sort.Slice(selections, func(i, j int) bool {
 		return selections[i] < selections[j]
 	})
-	i.setSelections(&selections)
+	i.setSelections(selections, nextVersion)
 }
 
-func (i *identitySelector) setSelections(selections *identity.NumericIdentitySlice) {
-	if len(*selections) > 0 {
-		i.selections.Store(selections)
+func (i *identitySelector) setSelections(selections identity.NumericIdentitySlice, nextVersion *versioned.Tx) {
+	var err error
+	if len(selections) > 0 {
+		err = i.selections.SetAt(selections, nextVersion)
 	} else {
-		i.selections.Store(&emptySelection)
+		err = i.selections.RemoveAt(nextVersion)
+	}
+	if err != nil {
+		stacktrace := hclog.Stacktrace()
+		log.WithError(err).WithField(logfields.Stacktrace, stacktrace).Error("setSelections failed")
 	}
 }

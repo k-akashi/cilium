@@ -860,6 +860,13 @@ func init() {
             "description": "Brief will return a brief representation of the Cilium status.\n",
             "name": "brief",
             "in": "header"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "If set to true, failure of the agent to connect to the Kubernetes control plane will cause the agent's health status to also fail.\n",
+            "name": "require-k8s-connectivity",
+            "in": "header"
           }
         ],
         "responses": {
@@ -987,6 +994,9 @@ func init() {
         "parameters": [
           {
             "$ref": "#/parameters/cidr"
+          },
+          {
+            "$ref": "#/parameters/labels"
           }
         ],
         "responses": {
@@ -1220,28 +1230,6 @@ func init() {
           },
           "404": {
             "description": "Map not found"
-          }
-        }
-      }
-    },
-    "/metrics/": {
-      "get": {
-        "tags": [
-          "metrics"
-        ],
-        "summary": "Retrieve cilium metrics",
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/Metric"
-              }
-            }
-          },
-          "500": {
-            "description": "Metrics cannot be retrieved"
           }
         }
       }
@@ -1909,6 +1897,10 @@ func init() {
           "description": "Indicator if this backend is preferred in the context of clustermesh service affinity. The value is set based\non related annotation of global service. Applicable for active state only.",
           "type": "boolean"
         },
+        "protocol": {
+          "description": "Layer 4 protocol (TCP, UDP, etc)",
+          "type": "string"
+        },
         "state": {
           "description": "State of the backend for load-balancing service traffic",
           "type": "string",
@@ -2209,6 +2201,13 @@ func init() {
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "match-families": {
+          "description": "Matches any of the provided address families. If empty matches all address families.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BgpFamily"
           }
         },
         "match-neighbors": {
@@ -2636,6 +2635,10 @@ func init() {
           "description": "Immutable configuration (read-only)",
           "$ref": "#/definitions/ConfigurationMap"
         },
+        "installUplinkRoutesForDelegatedIPAM": {
+          "description": "Install ingress/egress routes through uplink on host for Pods when working with\ndelegated IPAM plugin.\n",
+          "type": "boolean"
+        },
         "ipLocalReservedPorts": {
           "description": "Comma-separated list of IP ports should be reserved in the workload network namespace",
           "type": "string"
@@ -2883,6 +2886,10 @@ func init() {
         "netns-cookie": {
           "description": "Network namespace cookie",
           "type": "string"
+        },
+        "parent-interface-index": {
+          "description": "Index of network device from which an IP was used as endpoint IP. Only relevant for ENI environments.",
+          "type": "integer"
         },
         "pid": {
           "description": "Process ID of the workload belonging to this endpoint",
@@ -3716,6 +3723,12 @@ func init() {
           "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
+            "annotations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "bpfSocketLBHostnsOnly": {
               "description": "flag bpf-lb-sock-hostns-only",
               "type": "boolean"
@@ -6437,6 +6450,13 @@ func init() {
             "description": "Brief will return a brief representation of the Cilium status.\n",
             "name": "brief",
             "in": "header"
+          },
+          {
+            "type": "boolean",
+            "default": true,
+            "description": "If set to true, failure of the agent to connect to the Kubernetes control plane will cause the agent's health status to also fail.\n",
+            "name": "require-k8s-connectivity",
+            "in": "header"
           }
         ],
         "responses": {
@@ -6576,6 +6596,14 @@ func init() {
             "description": "A CIDR range of IPs",
             "name": "cidr",
             "in": "query"
+          },
+          {
+            "description": "List of labels\n",
+            "name": "labels",
+            "in": "body",
+            "schema": {
+              "$ref": "#/definitions/Labels"
+            }
           }
         ],
         "responses": {
@@ -6846,28 +6874,6 @@ func init() {
           },
           "404": {
             "description": "Map not found"
-          }
-        }
-      }
-    },
-    "/metrics/": {
-      "get": {
-        "tags": [
-          "metrics"
-        ],
-        "summary": "Retrieve cilium metrics",
-        "responses": {
-          "200": {
-            "description": "Success",
-            "schema": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/Metric"
-              }
-            }
-          },
-          "500": {
-            "description": "Metrics cannot be retrieved"
           }
         }
       }
@@ -7598,6 +7604,10 @@ func init() {
           "description": "Indicator if this backend is preferred in the context of clustermesh service affinity. The value is set based\non related annotation of global service. Applicable for active state only.",
           "type": "boolean"
         },
+        "protocol": {
+          "description": "Layer 4 protocol (TCP, UDP, etc)",
+          "type": "string"
+        },
         "state": {
           "description": "State of the backend for load-balancing service traffic",
           "type": "string",
@@ -7898,6 +7908,13 @@ func init() {
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "match-families": {
+          "description": "Matches any of the provided address families. If empty matches all address families.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BgpFamily"
           }
         },
         "match-neighbors": {
@@ -8377,6 +8394,10 @@ func init() {
           "description": "Immutable configuration (read-only)",
           "$ref": "#/definitions/ConfigurationMap"
         },
+        "installUplinkRoutesForDelegatedIPAM": {
+          "description": "Install ingress/egress routes through uplink on host for Pods when working with\ndelegated IPAM plugin.\n",
+          "type": "boolean"
+        },
         "ipLocalReservedPorts": {
           "description": "Comma-separated list of IP ports should be reserved in the workload network namespace",
           "type": "string"
@@ -8647,6 +8668,10 @@ func init() {
         "netns-cookie": {
           "description": "Network namespace cookie",
           "type": "string"
+        },
+        "parent-interface-index": {
+          "description": "Index of network device from which an IP was used as endpoint IP. Only relevant for ENI environments.",
+          "type": "integer"
         },
         "pid": {
           "description": "Process ID of the workload belonging to this endpoint",
@@ -9506,6 +9531,12 @@ func init() {
           "description": "\n\n+k8s:deepcopy-gen=true",
           "type": "object",
           "properties": {
+            "annotations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "bpfSocketLBHostnsOnly": {
               "description": "flag bpf-lb-sock-hostns-only",
               "type": "boolean"
@@ -9693,6 +9724,12 @@ func init() {
       "description": "\n\n+k8s:deepcopy-gen=true",
       "type": "object",
       "properties": {
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "bpfSocketLBHostnsOnly": {
           "description": "flag bpf-lb-sock-hostns-only",
           "type": "boolean"

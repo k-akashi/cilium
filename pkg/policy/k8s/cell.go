@@ -5,10 +5,13 @@ package k8s
 
 import (
 	"context"
+	"net/netip"
 
 	"github.com/cilium/hive/cell"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	cilium_v2_alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
@@ -21,7 +24,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
-	"github.com/cilium/cilium/pkg/promise"
+	policycell "github.com/cilium/cilium/pkg/policy/cell"
 )
 
 const (
@@ -50,7 +53,12 @@ type PolicyManager interface {
 }
 
 type serviceCache interface {
-	ForEachService(func(svcID k8s.ServiceID, svc *k8s.Service, eps *k8s.Endpoints) bool)
+	ForEachService(func(svcID k8s.ServiceID, svc *k8s.Service, eps *k8s.EndpointSlices) bool)
+}
+
+type ipc interface {
+	UpsertMetadataBatch(updates ...ipcache.MU) (revision uint64)
+	RemoveMetadataBatch(updates ...ipcache.MU) (revision uint64)
 }
 
 type PolicyWatcherParams struct {
@@ -65,13 +73,16 @@ type PolicyWatcherParams struct {
 	K8sResourceSynced *synced.Resources
 	K8sAPIGroups      *synced.APIGroups
 
-	PolicyManager promise.Promise[PolicyManager]
-	ServiceCache  *k8s.ServiceCache
+	ServiceCache   *k8s.ServiceCache
+	IPCache        *ipcache.IPCache
+	PolicyImporter policycell.PolicyImporter
 
 	CiliumNetworkPolicies            resource.Resource[*cilium_v2.CiliumNetworkPolicy]
 	CiliumClusterwideNetworkPolicies resource.Resource[*cilium_v2.CiliumClusterwideNetworkPolicy]
 	CiliumCIDRGroups                 resource.Resource[*cilium_v2_alpha1.CiliumCIDRGroup]
 	NetworkPolicies                  resource.Resource[*slim_networking_v1.NetworkPolicy]
+
+	MetricsManager CNPMetrics
 }
 
 func startK8sPolicyWatcher(params PolicyWatcherParams) {
@@ -87,30 +98,28 @@ func startK8sPolicyWatcher(params PolicyWatcherParams) {
 	p := &policyWatcher{
 		log:                              params.Logger,
 		config:                           params.Config,
+		policyImporter:                   params.PolicyImporter,
 		k8sResourceSynced:                params.K8sResourceSynced,
 		k8sAPIGroups:                     params.K8sAPIGroups,
 		svcCache:                         params.ServiceCache,
 		svcCacheNotifications:            svcCacheNotifications,
+		ipCache:                          params.IPCache,
 		ciliumNetworkPolicies:            params.CiliumNetworkPolicies,
 		ciliumClusterwideNetworkPolicies: params.CiliumClusterwideNetworkPolicies,
 		ciliumCIDRGroups:                 params.CiliumCIDRGroups,
 		networkPolicies:                  params.NetworkPolicies,
 
-		cnpCache:          make(map[resource.Key]*types.SlimCNP),
-		cidrGroupCache:    make(map[string]*cilium_v2_alpha1.CiliumCIDRGroup),
-		cidrGroupPolicies: make(map[resource.Key]struct{}),
+		cnpCache:       make(map[resource.Key]*types.SlimCNP),
+		cidrGroupCache: make(map[string]*cilium_v2_alpha1.CiliumCIDRGroup),
+		cidrGroupCIDRs: make(map[string]sets.Set[netip.Prefix]),
 
 		toServicesPolicies: make(map[resource.Key]struct{}),
 		cnpByServiceID:     make(map[k8s.ServiceID]map[resource.Key]struct{}),
+		metricsManager:     params.MetricsManager,
 	}
 
 	params.Lifecycle.Append(cell.Hook{
 		OnStart: func(startCtx cell.HookContext) error {
-			policyManager, err := params.PolicyManager.Await(startCtx)
-			if err != nil {
-				return err
-			}
-			p.policyManager = policyManager
 			p.watchResources(ctx)
 			return nil
 		},
@@ -123,17 +132,28 @@ func startK8sPolicyWatcher(params PolicyWatcherParams) {
 	})
 
 	if params.Config.EnableK8sNetworkPolicy {
+		p.knpSyncPending.Store(1)
 		p.registerResourceWithSyncFn(ctx, k8sAPIGroupNetworkingV1Core, func() bool {
-			return p.knpSynced.Load()
+			return p.knpSyncPending.Load() == 0
 		})
 	}
-	p.registerResourceWithSyncFn(ctx, k8sAPIGroupCiliumNetworkPolicyV2, func() bool {
-		return p.cnpSynced.Load() && p.cidrGroupSynced.Load()
-	})
-	p.registerResourceWithSyncFn(ctx, k8sAPIGroupCiliumClusterwideNetworkPolicyV2, func() bool {
-		return p.ccnpSynced.Load() && p.cidrGroupSynced.Load()
-	})
-	p.registerResourceWithSyncFn(ctx, k8sAPIGroupCiliumCIDRGroupV2Alpha1, func() bool {
-		return p.cidrGroupSynced.Load()
-	})
+	if params.Config.EnableCiliumNetworkPolicy {
+		p.cnpSyncPending.Store(1)
+		p.registerResourceWithSyncFn(ctx, k8sAPIGroupCiliumNetworkPolicyV2, func() bool {
+			return p.cnpSyncPending.Load() == 0 && p.cidrGroupSynced.Load()
+		})
+	}
+
+	if params.Config.EnableCiliumClusterwideNetworkPolicy {
+		p.ccnpSyncPending.Store(1)
+		p.registerResourceWithSyncFn(ctx, k8sAPIGroupCiliumClusterwideNetworkPolicyV2, func() bool {
+			return p.ccnpSyncPending.Load() == 0 && p.cidrGroupSynced.Load()
+		})
+	}
+
+	if params.Config.EnableCiliumNetworkPolicy || params.Config.EnableCiliumClusterwideNetworkPolicy {
+		p.registerResourceWithSyncFn(ctx, k8sAPIGroupCiliumCIDRGroupV2Alpha1, func() bool {
+			return p.cidrGroupSynced.Load()
+		})
+	}
 }

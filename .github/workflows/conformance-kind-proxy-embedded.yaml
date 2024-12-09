@@ -22,7 +22,6 @@ concurrency:
 
 env:
   kind_config: .github/kind-config.yaml
-  cilium_cli_ci_version:
 
 jobs:
   installation-and-connectivity:
@@ -37,10 +36,9 @@ jobs:
         with:
           comment_on_pr: false
 
-      - name: Checkout target branch to access local actions
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.base_ref || github.ref }}
           persist-credentials: false
 
       - name: Set Environment Variables
@@ -50,7 +48,7 @@ jobs:
         id: default_vars
         uses: ./.github/actions/helm-default
         with:
-          image-tag: ${{ github.event.pull_request.head.sha }}
+          image-tag: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up job variables
         id: vars
@@ -70,14 +68,8 @@ jobs:
           echo connectivity_test_defaults=${CONNECTIVITY_TEST_DEFAULTS} >> $GITHUB_OUTPUT
           echo sha=${{ steps.default_vars.outputs.sha }} >> $GITHUB_OUTPUT
 
-      - name: Checkout code
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
-        with:
-          ref: ${{ steps.vars.outputs.sha }}
-          persist-credentials: false
-
       - name: Create kind cluster
-        uses: helm/kind-action@0025e74a8c7512023d06dc019c617aa3cf561fde # v1.10.0
+        uses: helm/kind-action@9fdad0686e6f19fcd572f62516f5e0436f562ee7 # v1.10.0
         with:
           version: ${{ env.KIND_VERSION }}
           node_image: ${{ env.KIND_K8S_IMAGE }}
@@ -86,7 +78,7 @@ jobs:
           wait: 0 # The control-plane never becomes ready, since no CNI is present
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@99ff3d9edd4050d7b5c9d1f51dcf6ebeeb613d15 # v0.16.15
+        uses: cilium/cilium-cli@0d4e1f9275194d6bfcd35bc30f2b3971cbbdc78b # v0.16.21
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -119,6 +111,36 @@ jobs:
           cilium connectivity test ${{ steps.vars.outputs.connectivity_test_defaults }} \
           --junit-file "cilium-junits/${{ env.job_name }}.xml" --junit-property github_job_step="Run connectivity test"
 
+      - name: Features tested
+        uses: ./.github/actions/feature-status
+        with:
+          title: "Summary of all features tested"
+          json-filename: "${{ env.job_name }}"
+
+      - name: Install Cilium with secret sync disabled
+        id: install-cilium-secret-sync-disabled
+        run: |
+          helm upgrade cilium ./install/kubernetes/cilium \
+            --namespace kube-system \
+            --reuse-values \
+            --set=tls.secretSync.enabled=false
+
+          kubectl -n kube-system rollout restart ds/cilium deployment/cilium-operator
+          cilium status --wait --wait-duration=10m
+          kubectl -n kube-system get pods
+
+      - name: Run L7 related connectivity test
+        run: |
+          cilium connectivity test --test="l7|sni|check-log-errors" \
+            --junit-file "cilium-junits/${{ env.job_name }}-without-secret-sync.xml" \
+            --junit-property github_job_step="Run connectivity test with secret sync disabled"
+
+      - name: Features tested
+        uses: ./.github/actions/feature-status
+        with:
+          title: "Summary of all features tested"
+          json-filename: "${{ env.job_name }}-without-secret-sync"
+
       - name: Post-test information gathering
         if: ${{ !success() && steps.install-cilium.outcome != 'skipped' }}
         run: |
@@ -129,7 +151,7 @@ jobs:
 
       - name: Upload artifacts
         if: ${{ !success() }}
-        uses: actions/upload-artifact@834a144ee995460fba8ed112a2fc961b36a5ec5a # v4.3.6
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: cilium-sysdumps
           path: cilium-sysdump-*.zip
@@ -137,11 +159,18 @@ jobs:
 
       - name: Upload JUnits [junit]
         if: ${{ always() }}
-        uses: actions/upload-artifact@834a144ee995460fba8ed112a2fc961b36a5ec5a # v4.3.6
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: cilium-junits
           path: cilium-junits/*.xml
           retention-days: 5
+
+      - name: Upload features tested
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: features-tested
+          path: ${{ env.job_name }}*.json
 
       - name: Publish Test Results As GitHub Summary
         if: ${{ always() }}

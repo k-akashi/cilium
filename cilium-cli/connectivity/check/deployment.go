@@ -6,12 +6,13 @@ package check
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/maps"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -24,14 +25,21 @@ import (
 	"github.com/cilium/cilium/cilium-cli/defaults"
 	"github.com/cilium/cilium/cilium-cli/k8s"
 	"github.com/cilium/cilium/cilium-cli/utils/features"
+	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	slimmetav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
+	policyapi "github.com/cilium/cilium/pkg/policy/api"
 )
 
 const (
 	PerfHostName                          = "-host-net"
 	PerfOtherNode                         = "-other-node"
+	PerfLowPriority                       = "-low-priority"
+	PerfHighPriority                      = "-high-priority"
 	perfClientDeploymentName              = "perf-client"
 	perfClientHostNetDeploymentName       = perfClientDeploymentName + PerfHostName
 	perfClientAcrossDeploymentName        = perfClientDeploymentName + PerfOtherNode
+	perClientLowPriorityDeploymentName    = perfClientDeploymentName + PerfLowPriority
+	perClientHighPriorityDeploymentName   = perfClientDeploymentName + PerfHighPriority
 	perfClientHostNetAcrossDeploymentName = perfClientAcrossDeploymentName + PerfHostName
 	perfServerDeploymentName              = "perf-server"
 	perfServerHostNetDeploymentName       = perfServerDeploymentName + PerfHostName
@@ -64,7 +72,10 @@ const (
 	testConnDisruptClientDeploymentName = "test-conn-disrupt-client"
 	testConnDisruptServerDeploymentName = "test-conn-disrupt-server"
 	testConnDisruptServiceName          = "test-conn-disrupt"
+	testConnDisruptCNPName              = "test-conn-disrupt"
 	KindTestConnDisrupt                 = "test-conn-disrupt"
+
+	bwPrioAnnotationString = "bandwidth.cilium.io/priority"
 )
 
 var (
@@ -309,7 +320,7 @@ var serviceLabels = map[string]string{
 	"kind": kindEchoName,
 }
 
-func newService(name string, selector map[string]string, labels map[string]string, portName string, port int) *corev1.Service {
+func newService(name string, selector map[string]string, labels map[string]string, portName string, port int, serviceType string) *corev1.Service {
 	ipFamPol := corev1.IPFamilyPolicyPreferDualStack
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -317,7 +328,7 @@ func newService(name string, selector map[string]string, labels map[string]strin
 			Labels: labels,
 		},
 		Spec: corev1.ServiceSpec{
-			Type: corev1.ServiceTypeNodePort,
+			Type: corev1.ServiceType(serviceType),
 			Ports: []corev1.ServicePort{
 				{Name: portName, Port: int32(port)},
 			},
@@ -386,12 +397,86 @@ func newIngress(name, backend string) *networkingv1.Ingress {
 	}
 }
 
+func newConnDisruptCNP(ns string) *ciliumv2.CiliumNetworkPolicy {
+	selector := policyapi.EndpointSelector{
+		LabelSelector: &slimmetav1.LabelSelector{
+			MatchLabels: map[string]string{"kind": KindTestConnDisrupt},
+		},
+	}
+
+	ports := []policyapi.PortRule{{
+		Ports: []policyapi.PortProtocol{{
+			Protocol: policyapi.ProtoTCP,
+			Port:     "8000",
+		}},
+	}}
+
+	return &ciliumv2.CiliumNetworkPolicy{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       ciliumv2.CNPKindDefinition,
+			APIVersion: ciliumv2.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: testConnDisruptCNPName, Namespace: ns},
+		Spec: &policyapi.Rule{
+			EndpointSelector: selector,
+			Egress: []policyapi.EgressRule{
+				{
+					EgressCommonRule: policyapi.EgressCommonRule{
+						ToEndpoints: []policyapi.EndpointSelector{selector},
+					},
+					ToPorts: ports,
+				},
+				{
+					// Allow access to DNS for service resolution (we don't care
+					// of being restrictive here, so we just allow all endpoints).
+					ToPorts: []policyapi.PortRule{{
+						Ports: []policyapi.PortProtocol{
+							{Protocol: policyapi.ProtoUDP, Port: "53"},
+							{Protocol: policyapi.ProtoUDP, Port: "5353"},
+						},
+					}},
+				},
+			},
+			Ingress: []policyapi.IngressRule{{
+				IngressCommonRule: policyapi.IngressCommonRule{
+					FromEndpoints: []policyapi.EndpointSelector{selector},
+				},
+				ToPorts: ports,
+			}},
+		},
+	}
+}
+
 func (ct *ConnectivityTest) ingresses() map[string]string {
 	ingresses := map[string]string{"same-node": echoSameNodeDeploymentName}
 	if !ct.Params().SingleNode || ct.Params().MultiCluster != "" {
 		ingresses["other-node"] = echoOtherNodeDeploymentName
 	}
 	return ingresses
+}
+
+// maybeNodeToNodeEncryptionAffinity returns a node affinity term to prefer nodes
+// not being part of the control plane when node to node encryption is enabled,
+// because they are excluded by default from node to node encryption. This logic
+// is currently suboptimal as it only accounts for the default selector, for the
+// sake of simplicity, but it should cover all common use cases.
+func (ct *ConnectivityTest) maybeNodeToNodeEncryptionAffinity() *corev1.NodeAffinity {
+	encryptNode, _ := ct.Feature(features.EncryptionNode)
+	if !encryptNode.Enabled || encryptNode.Mode == "" {
+		return nil
+	}
+
+	return &corev1.NodeAffinity{
+		PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{
+			Weight: 100,
+			Preference: corev1.NodeSelectorTerm{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key:      "node-role.kubernetes.io/control-plane",
+					Operator: corev1.NodeSelectorOpDoesNotExist,
+				}},
+			},
+		}},
+	}
 }
 
 // deploy ensures the test Namespace, Services and Deployments are running on the cluster.
@@ -480,11 +565,21 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 			_, err = client.GetService(ctx, ct.params.TestNamespace, testConnDisruptServiceName, metav1.GetOptions{})
 			if err != nil {
 				ct.Logf("✨ [%s] Deploying %s service...", client.ClusterName(), testConnDisruptServiceName)
-				svc := newService(testConnDisruptServiceName, map[string]string{"app": "test-conn-disrupt-server"}, nil, "http", 8000)
+				svc := newService(testConnDisruptServiceName, map[string]string{"app": "test-conn-disrupt-server"}, nil, "http", 8000, ct.Params().ServiceType)
 				svc.ObjectMeta.Annotations = map[string]string{"service.cilium.io/global": "true"}
 				_, err = client.CreateService(ctx, ct.params.TestNamespace, svc, metav1.CreateOptions{})
 				if err != nil {
 					return fmt.Errorf("unable to create service %s: %w", testConnDisruptServiceName, err)
+				}
+			}
+
+			if enabled, _ := ct.Features.MatchRequirements(features.RequireEnabled(features.CNP)); enabled {
+				for _, client := range ct.Clients() {
+					ct.Logf("✨ [%s] Deploying %s CiliumNetworkPolicy...", client.ClusterName(), testConnDisruptCNPName)
+					_, err = client.ApplyGeneric(ctx, newConnDisruptCNP(ct.params.TestNamespace))
+					if err != nil {
+						return fmt.Errorf("unable to create CiliumNetworkPolicy %s: %w", testConnDisruptCNPName, err)
+					}
 				}
 			}
 		}
@@ -533,7 +628,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 	_, err = ct.clients.src.GetService(ctx, ct.params.TestNamespace, echoSameNodeDeploymentName, metav1.GetOptions{})
 	if err != nil {
 		ct.Logf("✨ [%s] Deploying %s service...", ct.clients.src.ClusterName(), echoSameNodeDeploymentName)
-		svc := newService(echoSameNodeDeploymentName, map[string]string{"name": echoSameNodeDeploymentName}, serviceLabels, "http", 8080)
+		svc := newService(echoSameNodeDeploymentName, map[string]string{"name": echoSameNodeDeploymentName}, serviceLabels, "http", 8080, ct.Params().ServiceType)
 		_, err = ct.clients.src.CreateService(ctx, ct.params.TestNamespace, svc, metav1.CreateOptions{})
 		if err != nil {
 			return err
@@ -542,7 +637,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 
 	if ct.params.MultiCluster != "" {
 		_, err = ct.clients.src.GetService(ctx, ct.params.TestNamespace, echoOtherNodeDeploymentName, metav1.GetOptions{})
-		svc := newService(echoOtherNodeDeploymentName, map[string]string{"name": echoOtherNodeDeploymentName}, serviceLabels, "http", 8080)
+		svc := newService(echoOtherNodeDeploymentName, map[string]string{"name": echoOtherNodeDeploymentName}, serviceLabels, "http", 8080, ct.Params().ServiceType)
 		svc.ObjectMeta.Annotations = map[string]string{}
 		svc.ObjectMeta.Annotations["service.cilium.io/global"] = "true"
 		svc.ObjectMeta.Annotations["io.cilium/global-service"] = "true"
@@ -632,6 +727,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 						},
 					},
 				},
+				NodeAffinity: ct.maybeNodeToNodeEncryptionAffinity(),
 			},
 			ReadinessProbe: newLocalReadinessProbe(containerPort, "/"),
 		}, ct.params.DNSTestServerImage)
@@ -654,6 +750,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 			Image:        ct.params.CurlImage,
 			Command:      []string{"/usr/bin/pause"},
 			Annotations:  ct.params.DeploymentAnnotations.Match(clientDeploymentName),
+			Affinity:     &corev1.Affinity{NodeAffinity: ct.maybeNodeToNodeEncryptionAffinity()},
 			NodeSelector: ct.params.NodeSelector,
 		})
 		_, err = ct.clients.src.CreateServiceAccount(ctx, ct.params.TestNamespace, k8s.NewServiceAccount(clientDeploymentName), metav1.CreateOptions{})
@@ -690,6 +787,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 						},
 					},
 				},
+				NodeAffinity: ct.maybeNodeToNodeEncryptionAffinity(),
 			},
 			NodeSelector: ct.params.NodeSelector,
 		})
@@ -728,6 +826,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 							},
 						},
 					},
+					NodeAffinity: ct.maybeNodeToNodeEncryptionAffinity(),
 				},
 				NodeSelector: ct.params.NodeSelector,
 			})
@@ -773,7 +872,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 	if !ct.params.SingleNode || ct.params.MultiCluster != "" {
 
 		_, err = ct.clients.dst.GetService(ctx, ct.params.TestNamespace, echoOtherNodeDeploymentName, metav1.GetOptions{})
-		svc := newService(echoOtherNodeDeploymentName, map[string]string{"name": echoOtherNodeDeploymentName}, serviceLabels, "http", 8080)
+		svc := newService(echoOtherNodeDeploymentName, map[string]string{"name": echoOtherNodeDeploymentName}, serviceLabels, "http", 8080, ct.Params().ServiceType)
 		if ct.params.MultiCluster != "" {
 			svc.ObjectMeta.Annotations = map[string]string{}
 			svc.ObjectMeta.Annotations["service.cilium.io/global"] = "true"
@@ -831,6 +930,7 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 							},
 						},
 					},
+					NodeAffinity: ct.maybeNodeToNodeEncryptionAffinity(),
 				},
 				NodeSelector:   ct.params.NodeSelector,
 				ReadinessProbe: newLocalReadinessProbe(containerPort, "/"),
@@ -921,9 +1021,8 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 
 				svc := newService(echoExternalNodeDeploymentName,
 					map[string]string{"name": echoExternalNodeDeploymentName, "kind": kindEchoExternalNodeName},
-					map[string]string{"kind": kindEchoExternalNodeName}, "http", port)
+					map[string]string{"kind": kindEchoExternalNodeName}, "http", port, "ClusterIP")
 				svc.Spec.ClusterIP = corev1.ClusterIPNone
-				svc.Spec.Type = corev1.ServiceTypeClusterIP
 				_, err := ct.clients.src.CreateService(ctx, ct.params.TestNamespace, svc, metav1.CreateOptions{})
 				if err != nil {
 					return fmt.Errorf("unable to create service %s: %w", echoExternalNodeDeploymentName, err)
@@ -1021,7 +1120,8 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 		}
 	}
 
-	if ct.Features[features.BGPControlPlane].Enabled && ct.Features[features.NodeWithoutCilium].Enabled {
+	if ct.Features[features.BGPControlPlane].Enabled && ct.Features[features.NodeWithoutCilium].Enabled && ct.params.TestConcurrency == 1 {
+		// BGP tests need to run sequentially, deploy only if BGP CP is enabled and test concurrency is disabled
 		_, err = ct.clients.src.GetDaemonSet(ctx, ct.params.TestNamespace, frrDaemonSetNameName, metav1.GetOptions{})
 		if err != nil {
 			ct.Logf("✨ [%s] Deploying %s daemonset...", ct.clients.src.ClusterName(), frrDaemonSetNameName)
@@ -1042,6 +1142,34 @@ func (ct *ConnectivityTest) deploy(ctx context.Context) error {
 		}
 	}
 
+	if ct.Features[features.Multicast].Enabled {
+		_, err = ct.clients.src.GetDeployment(ctx, ct.params.TestNamespace, socatClientDeploymentName, metav1.GetOptions{})
+		if err != nil {
+			ct.Logf("✨ [%s] Deploying %s deployment...", ct.clients.src.ClusterName(), socatClientDeploymentName)
+			ds := NewSocatClientDeployment(ct.params)
+			_, err = ct.clients.src.CreateServiceAccount(ctx, ct.params.TestNamespace, k8s.NewServiceAccount(socatClientDeploymentName), metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("unable to create service account %s: %w", socatClientDeploymentName, err)
+			}
+			_, err = ct.clients.src.CreateDeployment(ctx, ct.params.TestNamespace, ds, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("unable to create deployment %s: %w", socatClientDeploymentName, err)
+			}
+		}
+	}
+
+	if ct.Features[features.Multicast].Enabled {
+		_, err = ct.clients.src.GetDaemonSet(ctx, ct.params.TestNamespace, socatServerDaemonsetName, metav1.GetOptions{})
+		if err != nil {
+			ct.Logf("✨ [%s] Deploying %s daemonset...", ct.clients.src.ClusterName(), socatServerDaemonsetName)
+			ds := NewSocatServerDaemonSet(ct.params)
+			_, err = ct.clients.src.CreateDaemonSet(ctx, ct.params.TestNamespace, ds, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("unable to create daemonset %s: %w", socatServerDaemonsetName, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1053,7 +1181,7 @@ func (ct *ConnectivityTest) createClientPerfDeployment(ctx context.Context, name
 		Kind:      kindPerfName,
 		NamedPort: "http-80",
 		Port:      80,
-		Image:     ct.params.PerformanceImage,
+		Image:     ct.params.PerfParameters.Image,
 		Labels: map[string]string{
 			"client": "role",
 		},
@@ -1085,7 +1213,7 @@ func (ct *ConnectivityTest) createServerPerfDeployment(ctx context.Context, name
 		},
 		Annotations:                   ct.params.DeploymentAnnotations.Match(name),
 		Port:                          5001,
-		Image:                         ct.params.PerformanceImage,
+		Image:                         ct.params.PerfParameters.Image,
 		Command:                       []string{"/bin/bash", "-c", "netserver;sleep 10000000"},
 		NodeSelector:                  map[string]string{"kubernetes.io/hostname": nodeName},
 		HostNetwork:                   hostNetwork,
@@ -1126,20 +1254,44 @@ func (ct *ConnectivityTest) deployPerf(ctx context.Context) error {
 		ct.Warn("Selected nodes have different zones, tweak nodeSelector if that's not what you intended")
 	}
 
-	if ct.params.PerfPodNet {
-		if err = ct.createClientPerfDeployment(ctx, perfClientDeploymentName, firstNodeName, false); err != nil {
-			ct.Warnf("unable to create deployment: %w", err)
-		}
-		// Create second client on other node
-		if err = ct.createClientPerfDeployment(ctx, perfClientAcrossDeploymentName, secondNodeName, false); err != nil {
-			ct.Warnf("unable to create deployment: %w", err)
-		}
-		if err = ct.createServerPerfDeployment(ctx, perfServerDeploymentName, firstNodeName, false); err != nil {
-			ct.Warnf("unable to create deployment: %w", err)
+	if ct.params.PerfParameters.PodNet {
+		if ct.params.PerfParameters.NetQos {
+			// Disable host net deploys
+			ct.params.PerfParameters.HostNet = false
+			// TODO: Merge with existing annotations
+			var lowPrioDeployAnnotations = annotations{bwPrioAnnotationString: "5"}
+			var highPrioDeployAnnotations = annotations{bwPrioAnnotationString: "6"}
+
+			ct.params.DeploymentAnnotations.Set(`{
+				"` + perClientLowPriorityDeploymentName + `": ` + lowPrioDeployAnnotations.String() + `,
+			    "` + perClientHighPriorityDeploymentName + `": ` + highPrioDeployAnnotations.String() + `
+			}`)
+			if err = ct.createServerPerfDeployment(ctx, perfServerDeploymentName, firstNodeName, false); err != nil {
+				ct.Warnf("unable to create deployment: %w", err)
+			}
+			// Create low priority client on other node
+			if err = ct.createClientPerfDeployment(ctx, perClientLowPriorityDeploymentName, secondNodeName, false); err != nil {
+				ct.Warnf("unable to create deployment: %w", err)
+			}
+			// Create high priority client on other node
+			if err = ct.createClientPerfDeployment(ctx, perClientHighPriorityDeploymentName, secondNodeName, false); err != nil {
+				ct.Warnf("unable to create deployment: %w", err)
+			}
+		} else {
+			if err = ct.createClientPerfDeployment(ctx, perfClientDeploymentName, firstNodeName, false); err != nil {
+				ct.Warnf("unable to create deployment: %w", err)
+			}
+			// Create second client on other node
+			if err = ct.createClientPerfDeployment(ctx, perfClientAcrossDeploymentName, secondNodeName, false); err != nil {
+				ct.Warnf("unable to create deployment: %w", err)
+			}
+			if err = ct.createServerPerfDeployment(ctx, perfServerDeploymentName, firstNodeName, false); err != nil {
+				ct.Warnf("unable to create deployment: %w", err)
+			}
 		}
 	}
 
-	if ct.params.PerfHostNet {
+	if ct.params.PerfParameters.HostNet {
 		if err = ct.createClientPerfDeployment(ctx, perfClientHostNetDeploymentName, firstNodeName, true); err != nil {
 			ct.Warnf("unable to create deployment: %w", err)
 		}
@@ -1157,23 +1309,31 @@ func (ct *ConnectivityTest) deployPerf(ctx context.Context) error {
 
 // deploymentList returns 2 lists of Deployments to be used for running tests with.
 func (ct *ConnectivityTest) deploymentList() (srcList []string, dstList []string) {
-	if !ct.params.Perf {
-		srcList = []string{clientDeploymentName, client2DeploymentName, echoSameNodeDeploymentName}
-		if ct.params.MultiCluster == "" && !ct.params.SingleNode {
-			srcList = append(srcList, client3DeploymentName)
+	if ct.params.Perf && ct.params.TestNamespaceIndex == 0 {
+		if ct.params.PerfParameters.PodNet {
+			if ct.params.PerfParameters.NetQos {
+				srcList = append(srcList, perClientLowPriorityDeploymentName)
+				srcList = append(srcList, perClientHighPriorityDeploymentName)
+				srcList = append(srcList, perfServerDeploymentName)
+			} else {
+				srcList = append(srcList, perfClientDeploymentName)
+				srcList = append(srcList, perfClientAcrossDeploymentName)
+				srcList = append(srcList, perfServerDeploymentName)
+			}
 		}
-	} else if ct.params.TestNamespaceIndex == 0 {
-		srcList = []string{}
-		if ct.params.PerfPodNet {
-			srcList = append(srcList, perfClientDeploymentName)
-			srcList = append(srcList, perfClientAcrossDeploymentName)
-			srcList = append(srcList, perfServerDeploymentName)
-		}
-		if ct.params.PerfHostNet {
+		if ct.params.PerfParameters.HostNet {
 			srcList = append(srcList, perfClientHostNetDeploymentName)
 			srcList = append(srcList, perfClientHostNetAcrossDeploymentName)
 			srcList = append(srcList, perfServerHostNetDeploymentName)
 		}
+		// Return early, we can't run regular connectivity tests
+		// along perf test
+		return
+	}
+
+	srcList = []string{clientDeploymentName, client2DeploymentName, echoSameNodeDeploymentName}
+	if ct.params.MultiCluster == "" && !ct.params.SingleNode {
+		srcList = append(srcList, client3DeploymentName)
 	}
 
 	if ct.params.IncludeConnDisruptTest && ct.params.TestNamespaceIndex == 0 {
@@ -1187,7 +1347,7 @@ func (ct *ConnectivityTest) deploymentList() (srcList []string, dstList []string
 		dstList = append(dstList, testConnDisruptClientDeploymentName)
 	}
 
-	if (ct.params.MultiCluster != "" || !ct.params.SingleNode) && !ct.params.Perf {
+	if ct.params.MultiCluster != "" || !ct.params.SingleNode {
 		dstList = append(dstList, echoOtherNodeDeploymentName)
 	}
 
@@ -1200,6 +1360,10 @@ func (ct *ConnectivityTest) deploymentList() (srcList []string, dstList []string
 		srcList = append(srcList, lrpBackendDeploymentName)
 	}
 
+	if ct.Features[features.Multicast].Enabled {
+		srcList = append(srcList, socatClientDeploymentName)
+	}
+
 	return srcList, dstList
 }
 
@@ -1210,6 +1374,8 @@ func (ct *ConnectivityTest) deleteDeployments(ctx context.Context, client *k8s.C
 	_ = client.DeleteDeployment(ctx, ct.params.TestNamespace, clientDeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteDeployment(ctx, ct.params.TestNamespace, client2DeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteDeployment(ctx, ct.params.TestNamespace, client3DeploymentName, metav1.DeleteOptions{})
+	_ = client.DeleteDeployment(ctx, ct.params.TestNamespace, socatClientDeploymentName, metav1.DeleteOptions{})
+	_ = client.DeleteDeployment(ctx, ct.params.TestNamespace, socatServerDaemonsetName, metav1.DeleteOptions{}) // Q:Daemonset in here is OK?
 	_ = client.DeleteServiceAccount(ctx, ct.params.TestNamespace, echoSameNodeDeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteServiceAccount(ctx, ct.params.TestNamespace, echoOtherNodeDeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteServiceAccount(ctx, ct.params.TestNamespace, clientDeploymentName, metav1.DeleteOptions{})
@@ -1243,6 +1409,7 @@ func (ct *ConnectivityTest) DeleteConnDisruptTestDeployment(ctx context.Context,
 	_ = client.DeleteServiceAccount(ctx, ct.params.TestNamespace, testConnDisruptClientDeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteServiceAccount(ctx, ct.params.TestNamespace, testConnDisruptServerDeploymentName, metav1.DeleteOptions{})
 	_ = client.DeleteService(ctx, ct.params.TestNamespace, testConnDisruptServiceName, metav1.DeleteOptions{})
+	_ = client.DeleteCiliumNetworkPolicy(ctx, ct.params.TestNamespace, testConnDisruptCNPName, metav1.DeleteOptions{})
 
 	return nil
 }
@@ -1401,7 +1568,7 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 		}
 	}
 
-	if ct.Features[features.BGPControlPlane].Enabled && ct.Features[features.NodeWithoutCilium].Enabled {
+	if ct.Features[features.BGPControlPlane].Enabled && ct.Features[features.NodeWithoutCilium].Enabled && ct.params.TestConcurrency == 1 {
 		if err := WaitForDaemonSet(ctx, ct, ct.clients.src, ct.Params().TestNamespace, frrDaemonSetNameName); err != nil {
 			return err
 		}
@@ -1411,6 +1578,35 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 		}
 		for _, pod := range frrPods.Items {
 			ct.frrPods = append(ct.frrPods, Pod{
+				K8sClient: ct.client,
+				Pod:       pod.DeepCopy(),
+			})
+		}
+	}
+
+	if ct.Features[features.Multicast].Enabled {
+		// socat client pods
+		socatCilentPods, err := ct.clients.src.ListPods(ctx, ct.params.TestNamespace, metav1.ListOptions{LabelSelector: "name=" + socatClientDeploymentName})
+		if err != nil {
+			return fmt.Errorf("unable to list socat client pods: %w", err)
+		}
+		for _, pod := range socatCilentPods.Items {
+			ct.socatClientPods = append(ct.socatClientPods, Pod{
+				K8sClient: ct.client,
+				Pod:       pod.DeepCopy(),
+			})
+		}
+
+		// socat server pods
+		if err := WaitForDaemonSet(ctx, ct, ct.clients.src, ct.Params().TestNamespace, socatServerDaemonsetName); err != nil {
+			return err
+		}
+		socatServerPods, err := ct.clients.src.ListPods(ctx, ct.params.TestNamespace, metav1.ListOptions{LabelSelector: "name=" + socatServerDaemonsetName})
+		if err != nil {
+			return fmt.Errorf("unable to list socat server pods: %w", err)
+		}
+		for _, pod := range socatServerPods.Items {
+			ct.socatServerPods = append(ct.socatServerPods, Pod{
 				K8sClient: ct.client,
 				Pod:       pod.DeepCopy(),
 			})
@@ -1590,7 +1786,7 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 	if ct.params.SkipIPCacheCheck {
 		ct.Infof("Skipping IPCache check")
 	} else {
-		pods := append(maps.Values(ct.clientPods), maps.Values(ct.echoPods)...)
+		pods := append(slices.Collect(maps.Values(ct.clientPods)), slices.Collect(maps.Values(ct.echoPods))...)
 		// Set the timeout for all IP cache lookup retries
 		for _, cp := range ct.ciliumPods {
 			if err := WaitForIPCache(ctx, ct, cp, pods); err != nil {

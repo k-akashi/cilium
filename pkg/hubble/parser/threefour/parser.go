@@ -8,9 +8,10 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	"github.com/sirupsen/logrus"
+	"go4.org/netipx"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	pb "github.com/cilium/cilium/api/v1/flow"
@@ -18,7 +19,6 @@ import (
 	"github.com/cilium/cilium/pkg/hubble/parser/common"
 	"github.com/cilium/cilium/pkg/hubble/parser/errors"
 	"github.com/cilium/cilium/pkg/hubble/parser/getters"
-	ippkg "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/monitor"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
@@ -108,12 +108,12 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 
 	switch eventType {
 	case monitorAPI.MessageTypeDrop:
-		packetOffset = monitor.DropNotifyLen
 		dn = &monitor.DropNotify{}
 		if err := monitor.DecodeDropNotify(data, dn); err != nil {
 			return fmt.Errorf("failed to parse drop: %w", err)
 		}
 		eventSubType = dn.SubType
+		packetOffset = (int)(dn.DataOffset())
 	case monitorAPI.MessageTypeTrace:
 		tn = &monitor.TraceNotify{}
 		if err := monitor.DecodeTraceNotify(data, tn); err != nil {
@@ -173,7 +173,7 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	if tn != nil && ip != nil {
 		if !tn.OriginalIP().IsUnspecified() {
 			// Ignore invalid IP - getters will handle invalid value.
-			srcIP, _ = ippkg.AddrFromIP(tn.OriginalIP())
+			srcIP, _ = netipx.FromStdIP(tn.OriginalIP())
 			// On SNAT the trace notification has OrigIP set to the pre
 			// translation IP and the source IP parsed from the header is the
 			// post translation IP. The check is here because sometimes we get
@@ -208,6 +208,7 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	decoded.AuthType = authType
 	decoded.DropReason = decodeDropReason(dn, pvn)
 	decoded.DropReasonDesc = pb.DropReason(decoded.DropReason)
+	decoded.File = decodeFileInfo(dn)
 	decoded.Ethernet = ether
 	decoded.IP = ip
 	decoded.L4 = l4
@@ -312,6 +313,17 @@ func decodeDropReason(dn *monitor.DropNotify, pvn *monitor.PolicyVerdictNotify) 
 	return 0
 }
 
+func decodeFileInfo(dn *monitor.DropNotify) *pb.FileInfo {
+	switch {
+	case dn != nil:
+		return &pb.FileInfo{
+			Name: monitorAPI.BPFFileName(dn.File),
+			Line: uint32(dn.Line),
+		}
+	}
+	return nil
+}
+
 func decodePolicyMatchType(pvn *monitor.PolicyVerdictNotify) uint32 {
 	if pvn != nil {
 		return uint32((pvn.Flags & monitor.PolicyVerdictNotifyFlagMatchType) >>
@@ -330,8 +342,8 @@ func decodeEthernet(ethernet *layers.Ethernet) *pb.Ethernet {
 func decodeIPv4(ipv4 *layers.IPv4) (ip *pb.IP, src, dst netip.Addr) {
 	// Ignore invalid IPs - getters will handle invalid values.
 	// IPs can be empty for Ethernet-only packets.
-	src, _ = ippkg.AddrFromIP(ipv4.SrcIP)
-	dst, _ = ippkg.AddrFromIP(ipv4.DstIP)
+	src, _ = netipx.FromStdIP(ipv4.SrcIP)
+	dst, _ = netipx.FromStdIP(ipv4.DstIP)
 	return &pb.IP{
 		Source:      ipv4.SrcIP.String(),
 		Destination: ipv4.DstIP.String(),
@@ -342,8 +354,8 @@ func decodeIPv4(ipv4 *layers.IPv4) (ip *pb.IP, src, dst netip.Addr) {
 func decodeIPv6(ipv6 *layers.IPv6) (ip *pb.IP, src, dst netip.Addr) {
 	// Ignore invalid IPs - getters will handle invalid values.
 	// IPs can be empty for Ethernet-only packets.
-	src, _ = ippkg.AddrFromIP(ipv6.SrcIP)
-	dst, _ = ippkg.AddrFromIP(ipv6.DstIP)
+	src, _ = netipx.FromStdIP(ipv6.SrcIP)
+	dst, _ = netipx.FromStdIP(ipv6.DstIP)
 	return &pb.IP{
 		Source:      ipv6.SrcIP.String(),
 		Destination: ipv6.DstIP.String(),

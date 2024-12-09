@@ -39,40 +39,53 @@ func (r *Registry) Register(name string, p Plugin) {
 }
 
 type NamedHandler struct {
-	Name    string
-	Options Options
-	Handler Handler
+	Name         string
+	Handler      Handler
+	MetricConfig *MetricConfig
 }
 
 // ConfigureHandlers enables a set of metric handlers and initializes them.
 // Only metrics handlers which have been previously registered via the
 // Register() function can be configured.
-func (r *Registry) ConfigureHandlers(registry *prometheus.Registry, enabled Map) (*Handlers, error) {
+func (r *Registry) ConfigureHandlers(registry *prometheus.Registry, enabled *Config) (*[]NamedHandler, error) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
 	var enabledHandlers []NamedHandler
-	for name, opts := range enabled {
-		plugin, ok := r.handlers[name]
-		if !ok {
-			return nil, fmt.Errorf("metric '%s' does not exist", name)
+	metricNames := enabled.GetMetricNames()
+	for _, metricsConfig := range enabled.Metrics {
+		h, err := r.ValidateAndCreateHandler(registry, metricsConfig, &metricNames)
+		if err != nil {
+			return nil, err
 		}
-
-		if cp, ok := plugin.(PluginConflicts); ok {
-			for _, conflict := range cp.ConflictingPlugins() {
-				if _, conflictExists := enabled[conflict]; conflictExists {
-					return nil, fmt.Errorf("plugin %s conflicts with plugin %s", name, conflict)
-				}
-			}
-		}
-
-		h := NamedHandler{
-			Name:    name,
-			Options: opts,
-			Handler: plugin.NewHandler(),
-		}
-		enabledHandlers = append(enabledHandlers, h)
+		enabledHandlers = append(enabledHandlers, *h)
 	}
 
-	return NewHandlers(r.log, registry, enabledHandlers)
+	return InitHandlers(r.log, registry, &enabledHandlers)
+}
+
+func (r *Registry) ValidateAndCreateHandler(registry *prometheus.Registry, metricsConfig *MetricConfig, metricNames *map[string]*MetricConfig) (*NamedHandler, error) {
+	// r.mutex.Lock()
+	// defer r.mutex.Unlock()
+
+	plugin, ok := r.handlers[metricsConfig.Name]
+	if !ok {
+		return nil, fmt.Errorf("metric '%s' does not exist", metricsConfig.Name)
+	}
+
+	if cp, ok := plugin.(PluginConflicts); ok {
+		for _, conflict := range cp.ConflictingPlugins() {
+			if _, conflictExists := (*metricNames)[conflict]; conflictExists {
+				return nil, fmt.Errorf("plugin %s conflicts with plugin %s", metricsConfig.Name, conflict)
+			}
+		}
+	}
+
+	h := NamedHandler{
+		Name:         metricsConfig.Name,
+		Handler:      plugin.NewHandler(),
+		MetricConfig: metricsConfig,
+	}
+
+	return &h, nil
 }

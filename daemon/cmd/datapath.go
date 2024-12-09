@@ -5,7 +5,9 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/endpointmanager"
@@ -30,7 +33,7 @@ import (
 	"github.com/cilium/cilium/pkg/maps/nat"
 	"github.com/cilium/cilium/pkg/maps/neighborsmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
-	"github.com/cilium/cilium/pkg/maps/ratelimitmetricsmap"
+	"github.com/cilium/cilium/pkg/maps/ratelimitmap"
 	"github.com/cilium/cilium/pkg/maps/tunnel"
 	"github.com/cilium/cilium/pkg/maps/vtep"
 	"github.com/cilium/cilium/pkg/maps/worldcidrsmap"
@@ -42,7 +45,7 @@ import (
 // The filter should take a link and, if found, return the index of that
 // interface, if not found return -1.
 func listFilterIfs(filter func(netlink.Link) int) (map[int]netlink.Link, error) {
-	ifs, err := netlink.LinkList()
+	ifs, err := safenetlink.LinkList()
 	if err != nil {
 		return nil, err
 	}
@@ -152,13 +155,20 @@ func (d *Daemon) initMaps() error {
 		return fmt.Errorf("initializing metrics map: %w", err)
 	}
 
-	if err := ratelimitmetricsmap.RatelimitMetrics.OpenOrCreate(); err != nil {
-		return fmt.Errorf("initializing ratelimit metrics map: %w", err)
+	if err := ratelimitmap.InitMaps(); err != nil {
+		return fmt.Errorf("initializing ratelimit maps: %w", err)
 	}
 
 	if option.Config.TunnelingEnabled() {
 		if err := tunnel.TunnelMap().Recreate(); err != nil {
 			return fmt.Errorf("initializing tunnel map: %w", err)
+		}
+	} else {
+		// Make sure that the tunnel map gets unpinned when running in native
+		// routing mode, to prevent stale leftover entries when changing mode.
+		err := tunnel.TunnelMap().Unpin()
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("removing tunnel map: %w", err)
 		}
 	}
 
@@ -285,8 +295,9 @@ func (d *Daemon) initMaps() error {
 		}
 	}
 
-	if option.Config.NodePortAlg == option.NodePortAlgMaglev {
-		if err := lbmap.InitMaglevMaps(option.Config.EnableIPv4, option.Config.EnableIPv6, uint32(option.Config.MaglevTableSize)); err != nil {
+	if option.Config.NodePortAlg == option.NodePortAlgMaglev ||
+		option.Config.LoadBalancerAlgorithmAnnotation {
+		if err := lbmap.InitMaglevMaps(option.Config.EnableIPv4, option.Config.EnableIPv6, uint32(d.maglevConfig.MaglevTableSize)); err != nil {
 			return fmt.Errorf("initializing maglev maps: %w", err)
 		}
 	}
@@ -334,7 +345,7 @@ func setupRouteToVtepCidr() error {
 		Table: linux_defaults.RouteTableVtep,
 	}
 
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
+	routes, err := safenetlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return fmt.Errorf("failed to list routes: %w", err)
 	}

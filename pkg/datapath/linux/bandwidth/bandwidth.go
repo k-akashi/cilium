@@ -10,6 +10,7 @@ package bandwidth
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -17,9 +18,11 @@ import (
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
+	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/bwmap"
+	"github.com/cilium/cilium/pkg/node"
 )
 
 const (
@@ -27,6 +30,8 @@ const (
 	EgressBandwidth = "kubernetes.io/egress-bandwidth"
 	// IngressBandwidth is the K8s Pod annotation.
 	IngressBandwidth = "kubernetes.io/ingress-bandwidth"
+	// Priority is the Cilium Pod priority annotation.
+	Priority = "bandwidth.cilium.io/priority"
 
 	// FqDefaultHorizon represents maximum allowed departure
 	// time delta in future. Given applications can set SO_TXTIME
@@ -36,10 +41,23 @@ const (
 	// FqDefaultBuckets is the default 32k (2^15) bucket limit for bwm.
 	// Too low bucket limit can cause scalability issue.
 	FqDefaultBuckets = 15
+
+	// FQ priomap starting from index 0 is 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+	// Constants below map priority levels to bands high, medium and low.
+	// TODO: These are picked arbitrarily for each QoS class amongst different possible
+	// values. Revisit to see if picking these values would have any unintended side effects.
+	// HACK: Increment prio values by 1 to allow for distinguishing between 0 prio and no prio set.
+
+	// GuaranteedQoSDefaultPriority prio value to classify packets to high prio band
+	GuaranteedQoSDefaultPriority = 6 + 1
+	// BurstableQoSDefaultPriority prio value to classify packets to medium prio band
+	BurstableQoSDefaultPriority = 8 + 1
+	// BestEffortQoSDefaultPriority prio value to classify packets to medium prio band
+	BestEffortQoSDefaultPriority = 5 + 1
 )
 
 type manager struct {
-	resetQueues, enabled bool
+	enabled bool
 
 	params bandwidthManagerParams
 }
@@ -54,9 +72,6 @@ func (m *manager) BBREnabled() bool {
 
 func (m *manager) defines() (defines.Map, error) {
 	cDefinesMap := make(defines.Map)
-	if m.resetQueues {
-		cDefinesMap["RESET_QUEUES"] = "1"
-	}
 
 	if m.Enabled() {
 		cDefinesMap["ENABLE_BANDWIDTH_MANAGER"] = "1"
@@ -67,12 +82,26 @@ func (m *manager) defines() (defines.Map, error) {
 	return cDefinesMap, nil
 }
 
-func (m *manager) UpdateBandwidthLimit(epID uint16, bytesPerSecond uint64) {
+func (m *manager) UpdateBandwidthLimit(epID uint16, bytesPerSecond uint64, prio uint32) {
 	if m.enabled {
 		txn := m.params.DB.WriteTxn(m.params.EdtTable)
+
+		// Set host endpoint to guaranteed QoS class
+		// TODO: This attempts to lookup host endpoint for every BW manager update event.
+		// Find a way to get host endpoint ID during BW manager initialization and move this section to init().
+		// * init() seems to be too early to call node.GetEndpointID()
+		// * Adding a dependency to node manager to call GetHostEndpoint() introduces a nested import.
+		hostEpID := uint16(node.GetEndpointID())
+		_, _, found := m.params.EdtTable.Get(txn, bwmap.EdtIDIndex.Query(hostEpID))
+		if !found {
+			m.params.EdtTable.Insert(
+				txn,
+				bwmap.NewEdt(hostEpID, 0, GuaranteedQoSDefaultPriority),
+			)
+		}
 		m.params.EdtTable.Insert(
 			txn,
-			bwmap.NewEdt(epID, bytesPerSecond),
+			bwmap.NewEdt(epID, bytesPerSecond, prio),
 		)
 		txn.Commit()
 	}
@@ -100,20 +129,11 @@ func GetBytesPerSec(bandwidth string) (uint64, error) {
 // probe checks the various system requirements of the bandwidth manager and disables it if they are
 // not met.
 func (m *manager) probe() error {
-	// We at least need 5.1 kernel for native TCP EDT integration
-	// and writable queue_mapping that we use. Below helper is
-	// available for 5.1 kernels and onwards.
-	kernelGood := probes.HaveProgramHelper(ebpf.SchedCLS, asm.FnSkbEcnSetCe) == nil
-	m.resetQueues = kernelGood
 	if !m.params.Config.EnableBandwidthManager {
 		return nil
 	}
-	if _, err := m.params.Sysctl.Read("net.core.default_qdisc"); err != nil {
+	if _, err := m.params.Sysctl.Read([]string{"net", "core", "default_qdisc"}); err != nil {
 		m.params.Log.Warn("BPF bandwidth manager could not read procfs. Disabling the feature.", logfields.Error, err)
-		return nil
-	}
-	if !kernelGood {
-		m.params.Log.Warn("BPF bandwidth manager needs kernel 5.1 or newer. Disabling the feature.")
 		return nil
 	}
 	if m.params.Config.EnableBBR {
@@ -158,32 +178,35 @@ func (m *manager) init() error {
 
 func setBaselineSysctls(p bandwidthManagerParams) error {
 	// Ensure interger type sysctls are no smaller than our baseline settings
-	baseIntSettings := map[string]int64{
-		"net.core.netdev_max_backlog":  1000,
-		"net.core.somaxconn":           4096,
-		"net.ipv4.tcp_max_syn_backlog": 4096,
+	baseIntSettings := []struct {
+		name []string
+		val  int64
+	}{
+		{[]string{"net", "core", "netdev_max_backlog"}, 1000},
+		{[]string{"net", "core", "somaxconn"}, 4096},
+		{[]string{"net", "ipv4", "tcp_max_syn_backlog"}, 4096},
 	}
 
-	for name, value := range baseIntSettings {
-		currentValue, err := p.Sysctl.ReadInt(name)
+	for _, setting := range baseIntSettings {
+		currentValue, err := p.Sysctl.ReadInt(setting.name)
 		if err != nil {
-			return fmt.Errorf("read sysctl %s failed: %w", name, err)
+			return fmt.Errorf("read sysctl %s failed: %w", strings.Join(setting.name, "."), err)
 		}
 
 		scopedLog := p.Log.With(
-			logfields.SysParamName, name,
+			logfields.SysParamName, strings.Join(setting.name, "."),
 			logfields.SysParamValue, currentValue,
-			"baselineValue", value,
+			"baselineValue", setting.val,
 		)
 
-		if currentValue >= value {
+		if currentValue >= setting.val {
 			scopedLog.Info("Skip setting sysctl as it already meets baseline")
 			continue
 		}
 
 		scopedLog.Info("Setting sysctl to baseline for BPF bandwidth manager")
-		if err := p.Sysctl.WriteInt(name, value); err != nil {
-			return fmt.Errorf("set sysctl %s=%d failed: %w", name, value, err)
+		if err := p.Sysctl.WriteInt(setting.name, setting.val); err != nil {
+			return fmt.Errorf("set sysctl %s=%d failed: %w", strings.Join(setting.name, "."), setting.val, err)
 		}
 	}
 
@@ -193,40 +216,21 @@ func setBaselineSysctls(p bandwidthManagerParams) error {
 		congctl = "bbr"
 	}
 
-	baseStringSettings := map[string]string{
-		"net.core.default_qdisc":          "fq",
-		"net.ipv4.tcp_congestion_control": congctl,
-	}
-
-	for name, value := range baseStringSettings {
-		p.Log.Info("Setting sysctl to baseline for BPF bandwidth manager",
-			logfields.SysParamName, name,
-			"baselineValue", value,
-		)
-
-		if err := p.Sysctl.Write(name, value); err != nil {
-			return fmt.Errorf("set sysctl %s=%s failed: %w", name, value, err)
-		}
-	}
-
-	// Extra settings
-	extraSettings := map[string]int64{
-		"net.ipv4.tcp_slow_start_after_idle": 0,
+	sysctls := []tables.Sysctl{
+		{Name: []string{"net", "core", "default_qdisc"}, Val: "fq"},
+		{Name: []string{"net", "ipv4", "tcp_congestion_control"}, Val: congctl},
 	}
 
 	// Few extra knobs which can be turned on along with pacing. EnableBBR
 	// also provides the right kernel dependency implicitly as well.
 	if p.Config.EnableBBR {
-		for name, value := range extraSettings {
-			p.Log.Info("Setting sysctl to baseline for BPF bandwidth manager",
-				logfields.SysParamName, name,
-				"baselineValue", value,
-			)
+		sysctls = append(sysctls, tables.Sysctl{
+			Name: []string{"net", "ipv4", "tcp_slow_start_after_idle"}, Val: "0",
+		})
+	}
 
-			if err := p.Sysctl.WriteInt(name, value); err != nil {
-				return fmt.Errorf("set sysctl %s=%d failed: %w", name, value, err)
-			}
-		}
+	if err := p.Sysctl.ApplySettings(sysctls); err != nil {
+		return fmt.Errorf("failed to apply sysctls: %w", err)
 	}
 
 	return nil

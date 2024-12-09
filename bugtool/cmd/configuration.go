@@ -129,6 +129,7 @@ func defaultCommands(confDir string, cmdDir string, k8sPods []string) []string {
 		"tc/globals/cilium_auth_map",
 		"tc/globals/cilium_call_policy",
 		"tc/globals/cilium_calls_overlay_2",
+		"tc/globals/cilium_calls_wireguard_2",
 		"tc/globals/cilium_calls_xdp",
 		"tc/globals/cilium_capture_cache",
 		"tc/globals/cilium_runtime_config",
@@ -394,6 +395,7 @@ func ciliumInfoCommands(cmdDir string, k8sPods []string) []string {
 	commands := []string{
 		fmt.Sprintf("cilium-dbg debuginfo --output=markdown,json -f --output-directory=%s", cmdDir),
 		"cilium-dbg metrics list",
+		"cilium-dbg shell -- metrics/html",
 		"cilium-dbg bpf metrics list",
 		"cilium-dbg fqdn cache list",
 		"cilium-dbg config -a",
@@ -436,8 +438,8 @@ func ciliumInfoCommands(cmdDir string, k8sPods []string) []string {
 		"cilium-dbg recorder list",
 		"cilium-dbg status --verbose",
 		"cilium-dbg identity list",
-		"cilium-dbg-health status --verbose",
-		"cilium-dbg-health status -o json",
+		"cilium-health status --verbose",
+		"cilium-health status -o json",
 		"cilium-dbg policy get",
 		"cilium-dbg policy selectors -o json",
 		"cilium-dbg node list",
@@ -454,6 +456,7 @@ func ciliumInfoCommands(cmdDir string, k8sPods []string) []string {
 		"cilium-dbg bgp route-policies",
 		"cilium-dbg troubleshoot kvstore",
 		"cilium-dbg troubleshoot clustermesh",
+		"cilium-dbg bpf frag list",
 	}
 
 	return append(k8sPerPodCopyCommands(commands, k8sPods), k8sPerPodCopyStateDir(cmdDir, k8sPods)...)

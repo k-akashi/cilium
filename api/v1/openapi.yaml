@@ -47,6 +47,13 @@ paths:
         in: header
         required: false
         type: boolean
+      - name: require-k8s-connectivity
+        description: |
+          If set to true, failure of the agent to connect to the Kubernetes control plane will cause the agent's health status to also fail.
+        in: header
+        required: false
+        type: boolean
+        default: true
       responses:
         '200':
           description: Success
@@ -915,21 +922,6 @@ paths:
             format: binary
         '404':
           description: Map not found
-  "/metrics/":
-    get:
-      summary: Retrieve cilium metrics
-      tags:
-      - metrics
-      parameters: []
-      responses:
-        '200':
-          description: Success
-          schema:
-            type: array
-            items:
-              "$ref": "#/definitions/Metric"
-        '500':
-          description: Metrics cannot be retrieved
 
   "/fqdn/cache":
     get:
@@ -1030,6 +1022,7 @@ paths:
       - policy
       parameters:
       - "$ref": "#/parameters/cidr"
+      - "$ref": "#/parameters/labels"
       responses:
         '200':
           description: Success
@@ -1394,6 +1387,11 @@ definitions:
         type: string
       interface-index:
         description: Index of network device in host netns
+        type: integer
+      parent-interface-index:
+        description: >-
+          Index of network device from which an IP was used as endpoint IP.
+          Only relevant for ENI environments.
         type: integer
       container-interface-name:
         description: Name of network device in container netns
@@ -2432,6 +2430,10 @@ definitions:
           bpfSocketLBHostnsOnly:
             description: flag bpf-lb-sock-hostns-only
             type: boolean
+          annotations:
+            type: array
+            items:
+              type: string
   AllocationMap:
     description: |
       Map of allocated IPs
@@ -2712,6 +2714,11 @@ definitions:
       egress-multi-home-ip-rule-compat:
         description: Configured compatibility mode for --egress-multi-home-ip-rule-compat
         type: boolean
+      installUplinkRoutesForDelegatedIPAM:
+        description: |
+          Install ingress/egress routes through uplink on host for Pods when working with
+          delegated IPAM plugin.
+        type: boolean
       daemonConfigurationMap:
         description: Config map which contains all the active daemon configurations
         additionalProperties:
@@ -2974,6 +2981,9 @@ definitions:
     properties:
       ip:
         description: Layer 3 address
+        type: string
+      protocol:
+        description: Layer 4 protocol (TCP, UDP, etc)
         type: string
       port:
         description: Layer 4 port number
@@ -4097,6 +4107,11 @@ definitions:
         type: array
         items:
           type: string
+      match-families:
+        description:  Matches any of the provided address families. If empty matches all address families.
+        type: array
+        items:
+          "$ref": "#/definitions/BgpFamily"
       match-prefixes:
         description:  Matches any of the provided prefixes. If empty matches all prefixes.
         type: array

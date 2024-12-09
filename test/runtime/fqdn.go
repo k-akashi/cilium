@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -164,6 +164,8 @@ var _ = Describe("RuntimeAgentFQDNPolicies", func() {
 
 	BeforeAll(func() {
 		vm = helpers.InitRuntimeHelper(helpers.Runtime, logger)
+		err := vm.SetUpCilium()
+		Expect(err).Should(BeNil(), "Cilium failed to start")
 		ExpectCiliumReady(vm)
 
 		By("Create sample containers in %q docker network", helpers.WorldDockerNetwork)
@@ -187,7 +189,7 @@ var _ = Describe("RuntimeAgentFQDNPolicies", func() {
 		}
 
 		bindConfig := fmt.Sprintf(bindCiliumTestTemplate, getMapValues(worldIps)...)
-		err := vm.RenderTemplateToFile(bindDBCilium, bindConfig, os.ModePerm)
+		err = vm.RenderTemplateToFile(bindDBCilium, bindConfig, os.ModePerm)
 		Expect(err).To(BeNil(), "bind file can't be created")
 
 		// // Installed DNSSEC domain
@@ -1165,7 +1167,7 @@ func getMapValues(m map[string]string) []interface{} {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	for i, k := range keys {
 		values[i] = m[k]
 	}

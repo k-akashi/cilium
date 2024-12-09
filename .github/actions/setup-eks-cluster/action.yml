@@ -44,7 +44,7 @@ runs:
           spot: ${{ inputs.spot }}
           privateNetworking: true
           volumeType: "gp3"
-          volumeSize: 10
+          volumeSize: 20
           taints:
            - key: "node.cilium.io/agent-not-ready"
              value: "true"
@@ -52,11 +52,11 @@ runs:
         - name: ng-arm64
           instanceTypes:
            - t4g.medium
-          desiredCapacity: 1
+          desiredCapacity: 2
           spot: ${{ inputs.spot }}
           privateNetworking: true
           volumeType: "gp3"
-          volumeSize: 10
+          volumeSize: 20
           taints:
            - key: "node.cilium.io/agent-not-ready"
              value: "true"

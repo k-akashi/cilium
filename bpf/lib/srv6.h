@@ -64,9 +64,9 @@ srv6_lookup_policy4(__u32 vrf_id, __be32 dip)
  */
 #  define SRV6_VRF_STATIC_PREFIX6						\
 	(8 * (sizeof(struct srv6_vrf_key6) - sizeof(struct bpf_lpm_trie_key)\
-	      - 4))
+	      - 16))
 #  define SRV6_VRF_PREFIX6_LEN(PREFIX) (SRV6_VRF_STATIC_PREFIX6 + (PREFIX))
-#  define SRV6_VRF_IPV6_PREFIX SRV6_VRF_PREFIX6_LEN(32)
+#  define SRV6_VRF_IPV6_PREFIX SRV6_VRF_PREFIX6_LEN(128)
 static __always_inline __u32*
 srv6_lookup_vrf6(const struct in6_addr *sip, const struct in6_addr *dip)
 {
@@ -83,7 +83,7 @@ srv6_lookup_vrf6(const struct in6_addr *sip, const struct in6_addr *dip)
  */
 # define SRV6_POLICY_STATIC_PREFIX6						\
 	(8 * (sizeof(struct srv6_policy_key6) - sizeof(struct bpf_lpm_trie_key)	\
-	      - 4))
+	      - 16))
 # define SRV6_POLICY_PREFIX6_LEN(PREFIX) (SRV6_POLICY_STATIC_PREFIX6 + (PREFIX))
 # define SRV6_POLICY_IPV6_PREFIX SRV6_POLICY_PREFIX6_LEN(128)
 
@@ -126,12 +126,18 @@ srv6_encapsulation(struct __ctx_buff *ctx, int growth, __u16 new_payload_len,
 		   __u8 nexthdr, union v6addr *saddr, struct in6_addr *sid)
 {
 	__u32 len = sizeof(struct ipv6hdr) - 2 * sizeof(struct in6_addr);
+	__u32 hash;
+
 	struct ipv6hdr new_ip6 = {
 		.version     = 0x6,
 		.payload_len = bpf_htons(new_payload_len),
 		.nexthdr     = nexthdr,
 		.hop_limit   = IPDEFTTL,
 	};
+
+	hash = get_hash_recalc(ctx);
+	new_ip6.flow_lbl[1] = (hash >> 16) & 0xff;
+	new_ip6.flow_lbl[2] = (hash >> 24) & 0xff;
 
 #ifdef ENABLE_SRV6_SRH_ENCAP
 	/* If reduced encapsulation is disabled, the next header will be the
@@ -183,7 +189,7 @@ srv6_encapsulation(struct __ctx_buff *ctx, int growth, __u16 new_payload_len,
 }
 
 static __always_inline int
-srv6_decapsulation(struct __ctx_buff *ctx)
+srv6_decapsulation(struct __ctx_buff *ctx, __u8 *nexthdr)
 {
 	__u16 new_proto = bpf_htons(ETH_P_IP);
 	void *data, *data_end;
@@ -230,10 +236,12 @@ parse_outer_ipv4: __maybe_unused;
 		 * Thus, deduce this space from the next packet shrinking.
 		 */
 		shrink += sizeof(struct iphdr);
+		*nexthdr = IPPROTO_IPIP;
 		break;
 	case IPPROTO_IPV6:
 parse_outer_ipv6: __maybe_unused;
 		shrink += sizeof(struct ipv6hdr);
+		*nexthdr = IPPROTO_IPV6;
 		break;
 	default:
 		return DROP_INVALID;
@@ -383,18 +391,45 @@ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_SRV6_DECAP)
 int tail_srv6_decap(struct __ctx_buff *ctx)
 {
 	int ret = 0;
+	__u8 nexthdr = 0;
+	__s8 ext_err = 0;
 
-	ret = srv6_decapsulation(ctx);
+	ret = srv6_decapsulation(ctx, &nexthdr);
 	if (ret < 0)
 		goto error_drop;
 
-	send_trace_notify(ctx, TRACE_TO_STACK, SECLABEL_IPV6, UNKNOWN_ID,
-			  TRACE_EP_ID_UNKNOWN,
-			  TRACE_IFINDEX_UNKNOWN, TRACE_REASON_SRV6_DECAP, 0);
-	return CTX_ACT_OK;
+	/* Clear all metadata before recirculation to avoid the accidental use. */
+	ctx_store_meta(ctx, 0, 0);
+	ctx_store_meta(ctx, 1, 0);
+	ctx_store_meta(ctx, 2, 0);
+	ctx_store_meta(ctx, 3, 0);
+	ctx_store_meta(ctx, 4, 0);
+
+	switch (nexthdr) {
+#ifdef ENABLE_IPV4
+	case IPPROTO_IPIP:
+		send_trace_notify(ctx, TRACE_FROM_NETWORK, SECLABEL_IPV4, UNKNOWN_ID,
+				  TRACE_EP_ID_UNKNOWN, TRACE_IFINDEX_UNKNOWN,
+				  TRACE_REASON_SRV6_DECAP, 0);
+		ret = tail_call_internal(ctx, CILIUM_CALL_IPV4_FROM_NETDEV, &ext_err);
+		return send_drop_notify_error_ext(ctx, SECLABEL_IPV6, ret, ext_err,
+						  CTX_ACT_DROP, METRIC_INGRESS);
+#endif /* ENABLE_IPV4 */
+#ifdef ENABLE_IPV6
+	case IPPROTO_IPV6:
+		send_trace_notify(ctx, TRACE_FROM_NETWORK, SECLABEL_IPV6, UNKNOWN_ID,
+				  TRACE_EP_ID_UNKNOWN, TRACE_IFINDEX_UNKNOWN,
+				  TRACE_REASON_SRV6_DECAP, 0);
+		ret = tail_call_internal(ctx, CILIUM_CALL_IPV6_FROM_NETDEV, &ext_err);
+		return send_drop_notify_error_ext(ctx, SECLABEL_IPV6, ret, ext_err,
+						  CTX_ACT_DROP, METRIC_INGRESS);
+#endif /* ENABLE_IPV6 */
+	default:
+		ret = DROP_UNKNOWN_L3;
+	}
 error_drop:
-		return send_drop_notify_error(ctx, SECLABEL_IPV6, ret, CTX_ACT_DROP,
-					      METRIC_EGRESS);
+	return send_drop_notify_error(ctx, SECLABEL_IPV6, ret, CTX_ACT_DROP,
+				      METRIC_EGRESS);
 }
 # endif /* SKIP_SRV6_HANDLING */
 #endif /* ENABLE_SRV6 */
